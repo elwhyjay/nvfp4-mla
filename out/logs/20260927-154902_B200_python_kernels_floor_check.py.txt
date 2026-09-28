@@ -1,0 +1,59 @@
+$ python kernels/floor_check.py
+# B200  20260927-154902
+
+NVIDIA B200
+/usr/local/lib/python3.13/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+
+H16 B1 S1024 dense:fp8: event    86.1 us | graph    10.2 us | host/call  131.6 us
+     1.0x/call      8.9 us  fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta128PagedKvDenseP64MultiCtasKvVarSeqQ16Kv256StaticSwapsAbFo
+     1.0x/call      1.6 us  void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1u
+
+H16 B1 S1024 dense:bf16: event    98.6 us | graph    12.2 us | host/call  137.8 us
+     1.0x/call     10.4 us  fmhaSm100fKernel_QkvBfloat16OBfloat16HQk576HV512HVPerCta128PagedKvDenseP64MultiCtasKvVarSeqQ16Kv256StaticSwaps
+     1.0x/call      1.6 us  void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1u
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:10 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:11 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:11 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:49:13 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:49:13 28:28 ActivityProfilerController.cpp:455] profiler_stop
+
+H16 B1 S1024 wrapper:fa2: event    25.5 us | graph    17.9 us | host/call   25.7 us
+     1.0x/call     17.8 us  void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 2u, true, 512u, 64u, 6
+
+H16 B1 S65536 dense:fp8: event   105.0 us | graph    26.2 us | host/call  138.3 us
+     1.0x/call     24.6 us  fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256PagedKvDenseP64MultiCtasKvVarSeqQ16Kv256StaticSwapsAbFo
+     1.0x/call      1.6 us  void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1u
+
+H16 B1 S65536 dense:bf16: event   101.4 us | graph    32.9 us | host/call  137.3 us
+     1.0x/call     31.0 us  fmhaSm100fKernel_QkvBfloat16OBfloat16HQk576HV512HVPerCta256PagedKvDenseP64MultiCtasKvVarSeqQ16Kv256StaticSwaps
+     1.0x/call      1.6 us  void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1u
+
+H16 B1 S65536 wrapper:fa2: event    85.0 us | graph    75.0 us | host/call   26.8 us
+     1.0x/call     75.8 us  void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 2u, true, 512u, 64u, 6
+
+H16 B64 S65536 dense:fp8: event   386.1 us | graph   384.1 us | host/call  142.4 us
+     1.0x/call    389.5 us  fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512PagedKvDenseP64MultiCtasKvVarSeqQ16Kv256StaticSwapsAbForGen
+     1.0x/call      2.0 us  void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1u
+
+H16 B64 S65536 dense:bf16: event   882.7 us | graph   859.8 us | host/call  141.2 us
+     1.0x/call    857.9 us  fmhaSm100fKernel_QkvBfloat16OBfloat16HQk576HV512PagedKvDenseP64MultiCtasKvVarSeqQ16Kv256StaticSwapsAbForGen
+     1.0x/call      1.9 us  void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1u
+
+H16 B64 S65536 wrapper:fa2: event  2494.9 us | graph  2486.2 us | host/call   28.8 us
+     1.0x/call   2488.5 us  void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 2u, true, 512u, 64u, 6
+
+# exit 0

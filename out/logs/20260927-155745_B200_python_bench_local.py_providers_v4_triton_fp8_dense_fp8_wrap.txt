@@ -1,0 +1,47 @@
+$ python bench_local.py --providers v4,triton:fp8,dense:fp8,wrapper:fa2 --batch 1,64 --s-kv 1024,65536 --heads 16 --csv-dir /tmp
+# B200  20260927-155745
+
+NVIDIA_B200  step0 BW 7300 GB/s  page_size=64
+   H   B   s_kv |            v4 ms/GBs/%    triton:fp8 ms/GBs/%     dense:fp8 ms/GBs/%   wrapper:fa2 ms/GBs/%
+-------------------------------------------------------------------------------------------------------------
+/usr/local/lib/python3.13/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-27 15:57:51 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:51 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:455] profiler_stop
+  16   1   1024 |     0.021/   17/  0%     0.027/   22/  0%     0.011/   54/  1%     0.020/   59/  1%
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:52 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+  16   1  65536 |     0.040/  582/  8%     0.111/  340/  5%     0.031/ 1231/ 17%     0.080/  947/ 13%
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+  16  64   1024 |     0.034/  687/  9%     0.080/  473/  6%     0.020/ 1849/ 25%     0.049/ 1549/ 21%
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 15:57:53 28:28 ActivityProfilerController.cpp:455] profiler_stop
+  16  64  65536 |     0.954/ 1548/ 21%     1.905/ 1268/ 17%     0.386/ 6263/ 86%     2.488/ 1942/ 27%
+wrote /tmp/bench_NVIDIA_B200_20260927-1557.csv
+
+# exit 0

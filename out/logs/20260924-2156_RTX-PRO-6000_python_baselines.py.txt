@@ -1,0 +1,70 @@
+✓ Initialized. View run at 
+https://modal.com/apps/jqueen-astro/main/ap-nwgNWmw0McVNbyBOOsA2oR
+✓ Created objects.
+├── 🔨 Created mount /Users/yj/Desktop/modal_benchmark/bench.py
+├── 🔨 Created mount /Users/yj/Desktop/modal_benchmark
+├── 🔨 Created function profile.
+└── 🔨 Created function run.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.3.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition CC12.0 page_size=64 q_len=1 iters=30
+  cos(wrapper:fa2 vs fa2) = 1.00000
+  wrapper:cutlass: ValueError: cutlass backend requires a packed query view; representative query is independent split-only.
+  cos(dense:bf16 vs fa2) = 1.00000
+  cos(dense:fp8 vs fa2) = 0.99835
+   H batch   s_kv | wrapper:fa2 ms/GBs wrapper:cutlass ms/GBs dense:bf16 ms/GBs dense:fp8 ms/GBs
+------------------------------------------------------------------------------------------------
+  [wrapper:cutlass H=16] ValueError: cutlass backend requires a packed query view; representative query is independent split-only.
+  [dense:bf16 H=16] ValueError: XQA MLA only supports 128 query heads (head_group_ratio=128), got 16 query heads
+  [dense:fp8 H=16] ValueError: XQA MLA only supports 128 query heads (head_group_ratio=128), got 16 query heads
+  16     1   1024 |     0.023/    52               --               --               --
+  16     1   4096 |     0.037/   127               --               --               --
+  16     1  16384 |     0.071/   267               --               --               --
+  16     1  65536 |     0.131/   576               --               --               --
+  16     4   1024 |     0.033/   144               --               --               --
+  16     4   4096 |     0.061/   307               --               --               --
+  16     4  16384 |     0.111/   681               --               --               --
+  16     4  65536 |     0.313/   964               --               --               --
+  16    16   1024 |     0.059/   318               --               --               --
+  16    16   4096 |     0.106/   709               --               --               --
+  16    16  16384 |     0.306/   986               --               --               --
+  16    16  65536 |     1.527/   791               --               --               --
+  16    64   1024 |     0.106/   709               --               --               --
+  16    64   4096 |     0.470/   643               --               --               --
+  16    64  16384 |     1.773/   681               --               --               --
+  16    64  65536 |     6.928/   697               --               --               --
+  [wrapper:cutlass H=128] ValueError: cutlass backend requires a packed query view; representative query is independent split-only.
+ 128     1   1024 |     0.029/    41               --     0.335/     4     0.031/    19
+ 128     1   4096 |     0.049/    96               --     1.143/     4     0.082/    29
+ 128     1  16384 |     0.078/   243               --     4.260/     4     0.287/    33
+ 128     1  65536 |     0.168/   449               --    16.667/     5     1.107/    34
+ 128     4   1024 |     0.051/    92               --     0.335/    14     0.033/    72
+ 128     4   4096 |     0.070/   271               --     1.151/    16     0.084/   112
+ 128     4  16384 |     0.156/   485               --     4.299/    18     0.289/   131
+ 128     4  65536 |     0.614/   492               --    16.811/    18     1.108/   136
+ 128    16   1024 |     0.071/   266               --     0.348/    54     0.045/   210
+ 128    16   4096 |     0.201/   376               --     1.173/    64     0.092/   410
+ 128    16  16384 |     0.850/   355               --     4.346/    69     0.295/   511
+ 128    16  65536 |     3.242/   373               --    16.978/    71     1.117/   541
+ 128    64   1024 |     0.209/   361               --     0.713/   106     0.081/   464
+ 128    64   4096 |     0.707/   427               --     2.383/   127     0.211/   716
+ 128    64  16384 |     2.547/   474               --     8.894/   136     0.639/   945
+ 128    64  65536 |     9.984/   484               --    34.757/   139     2.296/  1052
+wrote /root/.cache/results/baselines_NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition.csv
+Stopping app - local entrypoint completed.
+Runner terminated.
+✓ App completed. View run at 
+https://modal.com/apps/jqueen-astro/main/ap-nwgNWmw0McVNbyBOOsA2oR

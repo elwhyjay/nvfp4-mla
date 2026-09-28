@@ -1,0 +1,53 @@
+$ python kernels/step0.py
+# B200  20260927-142556
+
+NVIDIA B200  CC100  SMs=148
+  read 1GB unroll=1 blocks/SM=2 threads=256:    2554 GB/s
+  read 1GB unroll=1 blocks/SM=2 threads=512:    4629 GB/s
+  read 1GB unroll=1 blocks/SM=4 threads=256:    4629 GB/s
+  read 1GB unroll=1 blocks/SM=4 threads=512:    6612 GB/s
+  read 1GB unroll=1 blocks/SM=8 threads=256:    6599 GB/s
+  read 1GB unroll=1 blocks/SM=8 threads=512:    6614 GB/s
+  read 1GB unroll=4 blocks/SM=2 threads=256:    6076 GB/s
+  read 1GB unroll=4 blocks/SM=2 threads=512:    7056 GB/s
+  read 1GB unroll=4 blocks/SM=4 threads=256:    7053 GB/s
+  read 1GB unroll=4 blocks/SM=4 threads=512:    7021 GB/s
+  read 1GB unroll=4 blocks/SM=8 threads=256:    6974 GB/s
+  read 1GB unroll=4 blocks/SM=8 threads=512:    7154 GB/s
+  read 1GB unroll=8 blocks/SM=2 threads=256:    6223 GB/s
+  read 1GB unroll=8 blocks/SM=2 threads=512:    7061 GB/s
+  read 1GB unroll=8 blocks/SM=4 threads=256:    7059 GB/s
+  read 1GB unroll=8 blocks/SM=4 threads=512:    7063 GB/s
+  read 1GB unroll=8 blocks/SM=8 threads=256:    7060 GB/s
+  read 1GB unroll=8 blocks/SM=8 threads=512:    7253 GB/s
+  torch copy_ 1GB (r+w):    6544 GB/s
+  read 4GB unroll=1 blocks/SM=2 threads=256:    2597 GB/s
+  read 4GB unroll=1 blocks/SM=2 threads=512:    4759 GB/s
+  read 4GB unroll=1 blocks/SM=4 threads=256:    4765 GB/s
+  read 4GB unroll=1 blocks/SM=4 threads=512:    6848 GB/s
+  read 4GB unroll=1 blocks/SM=8 threads=256:    6855 GB/s
+  read 4GB unroll=1 blocks/SM=8 threads=512:    6866 GB/s
+  read 4GB unroll=4 blocks/SM=2 threads=256:    6274 GB/s
+  read 4GB unroll=4 blocks/SM=2 threads=512:    7273 GB/s
+  read 4GB unroll=4 blocks/SM=4 threads=256:    7276 GB/s
+  read 4GB unroll=4 blocks/SM=4 threads=512:    7176 GB/s
+  read 4GB unroll=4 blocks/SM=8 threads=256:    7201 GB/s
+  read 4GB unroll=4 blocks/SM=8 threads=512:    7272 GB/s
+  read 4GB unroll=8 blocks/SM=2 threads=256:    6428 GB/s
+  read 4GB unroll=8 blocks/SM=2 threads=512:    7298 GB/s
+  read 4GB unroll=8 blocks/SM=4 threads=256:    7300 GB/s
+  read 4GB unroll=8 blocks/SM=4 threads=512:    7194 GB/s
+  read 4GB unroll=8 blocks/SM=8 threads=256:    7202 GB/s
+  read 4GB unroll=8 blocks/SM=8 threads=512:    7257 GB/s
+  torch copy_ 4GB (r+w):    6661 GB/s
+  mma.sync bf16 m16n8k16 blocks/SM=1 threads=128:   524.0 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=1 threads=256:   549.1 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=2 threads=128:   549.2 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=2 threads=256:   554.5 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=4 threads=128:   553.8 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=4 threads=256:   556.2 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=8 threads=128:   556.4 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=8 threads=256:   557.6 TFLOPS
+best read BW 7300 GB/s | best mma.sync BF16 557.6 TFLOPS | ridge 76 flop/B -> NVFP4 decode (6.2*H*q_len flop/B) is memory-bound for H*q_len < 12
+
+# exit 0

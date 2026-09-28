@@ -1,0 +1,45 @@
+$ python kernels/_dbg.py
+# RTX-PRO-6000  20260927-155627
+
+Traceback (most recent call last):
+  File "/root/proj/kernels/_dbg.py", line 9, in <module>
+    fn(); torch.cuda.synchronize()
+    ~~^^
+  File "/root/proj/baselines.py", line 86, in <lambda>
+    return lambda: trtllm_batch_decode_with_kv_cache_mla(
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        query=q, kv_cache=kv, workspace_buffer=WS, qk_nope_head_dim=QK_NOPE,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        kv_lora_rank=CKV, qk_rope_head_dim=KPE, block_tables=inp.page_table,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        seq_lens=inp.kv_lens, max_seq_len=inp.s_kv, bmm1_scale=SM_SCALE, bmm2_scale=1.0)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/site-packages/flashinfer/api_logging.py", line 2348, in _auto_dump_wrapper
+    return _inner(*args, **kwargs)
+  File "/usr/local/lib/python3.13/site-packages/flashinfer/mla/_core.py", line 3799, in trtllm_batch_decode_with_kv_cache_mla
+    return xqa_batch_decode_with_kv_cache_mla(
+        query,
+    ...<12 lines>...
+        enable_pdl,
+    )
+  File "/usr/local/lib/python3.13/site-packages/flashinfer/api_logging.py", line 2348, in _auto_dump_wrapper
+    return _inner(*args, **kwargs)
+  File "/usr/local/lib/python3.13/site-packages/flashinfer/mla/_core.py", line 4458, in xqa_batch_decode_with_kv_cache_mla
+    xqa_mla(
+    ~~~~~~~^
+        query,
+        ^^^^^^
+    ...<11 lines>...
+        enable_pdl=enable_pdl,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/usr/local/lib/python3.13/site-packages/flashinfer/api_logging.py", line 2348, in _auto_dump_wrapper
+    return _inner(*args, **kwargs)
+  File "/usr/local/lib/python3.13/site-packages/flashinfer/xqa.py", line 622, in xqa_mla
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: XQA MLA only supports 128 query heads (head_group_ratio=128), got 16 query heads
+
+# exit 1

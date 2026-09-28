@@ -1,0 +1,53 @@
+$ python kernels/step0.py
+# RTX-PRO-6000  20260927-142600
+
+NVIDIA RTX PRO 6000 Blackwell Server Edition  CC120  SMs=188
+  read 1GB unroll=1 blocks/SM=2 threads=256:    1516 GB/s
+  read 1GB unroll=1 blocks/SM=2 threads=512:    1527 GB/s
+  read 1GB unroll=1 blocks/SM=4 threads=256:    1529 GB/s
+  read 1GB unroll=1 blocks/SM=4 threads=512:    1526 GB/s
+  read 1GB unroll=1 blocks/SM=8 threads=256:    1527 GB/s
+  read 1GB unroll=1 blocks/SM=8 threads=512:    1532 GB/s
+  read 1GB unroll=4 blocks/SM=2 threads=256:    1534 GB/s
+  read 1GB unroll=4 blocks/SM=2 threads=512:    1536 GB/s
+  read 1GB unroll=4 blocks/SM=4 threads=256:    1538 GB/s
+  read 1GB unroll=4 blocks/SM=4 threads=512:    1547 GB/s
+  read 1GB unroll=4 blocks/SM=8 threads=256:    1545 GB/s
+  read 1GB unroll=4 blocks/SM=8 threads=512:    1573 GB/s
+  read 1GB unroll=8 blocks/SM=2 threads=256:    1534 GB/s
+  read 1GB unroll=8 blocks/SM=2 threads=512:    1552 GB/s
+  read 1GB unroll=8 blocks/SM=4 threads=256:    1552 GB/s
+  read 1GB unroll=8 blocks/SM=4 threads=512:    1573 GB/s
+  read 1GB unroll=8 blocks/SM=8 threads=256:    1580 GB/s
+  read 1GB unroll=8 blocks/SM=8 threads=512:    1645 GB/s
+  torch copy_ 1GB (r+w):    1461 GB/s
+  read 4GB unroll=1 blocks/SM=2 threads=256:    1529 GB/s
+  read 4GB unroll=1 blocks/SM=2 threads=512:    1535 GB/s
+  read 4GB unroll=1 blocks/SM=4 threads=256:    1535 GB/s
+  read 4GB unroll=1 blocks/SM=4 threads=512:    1535 GB/s
+  read 4GB unroll=1 blocks/SM=8 threads=256:    1535 GB/s
+  read 4GB unroll=1 blocks/SM=8 threads=512:    1537 GB/s
+  read 4GB unroll=4 blocks/SM=2 threads=256:    1539 GB/s
+  read 4GB unroll=4 blocks/SM=2 threads=512:    1542 GB/s
+  read 4GB unroll=4 blocks/SM=4 threads=256:    1542 GB/s
+  read 4GB unroll=4 blocks/SM=4 threads=512:    1538 GB/s
+  read 4GB unroll=4 blocks/SM=8 threads=256:    1538 GB/s
+  read 4GB unroll=4 blocks/SM=8 threads=512:    1539 GB/s
+  read 4GB unroll=8 blocks/SM=2 threads=256:    1541 GB/s
+  read 4GB unroll=8 blocks/SM=2 threads=512:    1541 GB/s
+  read 4GB unroll=8 blocks/SM=4 threads=256:    1541 GB/s
+  read 4GB unroll=8 blocks/SM=4 threads=512:    1539 GB/s
+  read 4GB unroll=8 blocks/SM=8 threads=256:    1527 GB/s
+  read 4GB unroll=8 blocks/SM=8 threads=512:    1559 GB/s
+  torch copy_ 4GB (r+w):    1462 GB/s
+  mma.sync bf16 m16n8k16 blocks/SM=1 threads=128:   441.0 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=1 threads=256:   450.5 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=2 threads=128:   450.5 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=2 threads=256:   453.4 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=4 threads=128:   452.9 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=4 threads=256:   454.2 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=8 threads=128:   454.0 TFLOPS
+  mma.sync bf16 m16n8k16 blocks/SM=8 threads=256:   454.7 TFLOPS
+best read BW 1645 GB/s | best mma.sync BF16 454.7 TFLOPS | ridge 276 flop/B -> NVFP4 decode (6.2*H*q_len flop/B) is memory-bound for H*q_len < 45
+
+# exit 0

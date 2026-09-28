@@ -1,0 +1,30 @@
+$ python bench_local.py --batch 1,64 --s-kv 65536 --heads 16 --csv-dir /tmp
+# RTX-PRO-6000  20260927-160005
+
+NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition  step0 BW 1559 GB/s  page_size=64
+   H   B   s_kv |            v4 ms/GBs/%    triton:fp8 ms/GBs/%       deq+fa2 ms/GBs/%   wrapper:fa2 ms/GBs/%     dense:fp8 ms/GBs/%
+------------------------------------------------------------------------------------------------------------------------------------
+/usr/local/lib/python3.13/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:12 28:28 ActivityProfilerController.cpp:455] profiler_stop
+  [dense:fp8 H=16] ValueError: XQA MLA only supports 128 query heads (head_group_ratio=128), got 16 query heads
+  16   1  65536 |     0.045/  511/ 33%     0.115/  328/ 21%     0.191/  121/  8%     0.129/  584/ 37%                     --
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:455] profiler_stop
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-27 16:00:13 28:28 ActivityProfilerController.cpp:455] profiler_stop
+  16  64  65536 |     1.111/ 1328/ 85%     1.847/ 1308/ 84%    11.398/  130/  8%     6.961/  694/ 45%                     --
+wrote /tmp/bench_NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition_20260927-1600.csv
+
+# exit 0

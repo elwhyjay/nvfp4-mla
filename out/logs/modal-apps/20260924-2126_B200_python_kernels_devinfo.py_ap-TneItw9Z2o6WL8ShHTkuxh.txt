@@ -1,0 +1,29 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.3.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+name                               NVIDIA B200
+major                              10
+minor                              0
+multi_processor_count              148
+total_memory                       191503138816
+L2_cache_size                      132644864
+shared_memory_per_multiprocessor   233472
+shared_memory_per_block_optin      232448
+regs_per_multiprocessor            65536
+max_threads_per_multi_processor    2048
+name, memory.total [MiB], clocks.max.sm [MHz], clocks.max.memory [MHz]
+NVIDIA B200, 183359 MiB, 1965 MHz, 3996 MHz
+
+Stopping app - local entrypoint completed.

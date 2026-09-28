@@ -1,0 +1,8 @@
+$ python ref.py
+# RTX-PRO-6000  20260927-142238
+
+2026-09-27 14:22:47,824 - INFO - core.py:564 - flashinfer.jit: Building JIT module page; this can take several minutes on first use.
+H= 16  rel-L2 nvfp4 vs bf16 = 0.1025   fa2(dequant) vs fp32 ref = 5.95e-04
+H=128  rel-L2 nvfp4 vs bf16 = 0.1003   fa2(dequant) vs fp32 ref = 5.90e-04
+
+# exit 0

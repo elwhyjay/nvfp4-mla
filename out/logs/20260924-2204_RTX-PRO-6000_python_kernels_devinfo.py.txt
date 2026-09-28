@@ -1,0 +1,18 @@
+$ python kernels/devinfo.py
+# RTX-PRO-6000-Blackwell-Server-Edition  20260924-130420
+
+name                               NVIDIA RTX PRO 6000 Blackwell Server Edition
+major                              12
+minor                              0
+multi_processor_count              188
+total_memory                       101974081536
+L2_cache_size                      134217728
+shared_memory_per_multiprocessor   102400
+shared_memory_per_block_optin      101376
+regs_per_multiprocessor            65536
+max_threads_per_multi_processor    1536
+name, memory.total [MiB], clocks.max.sm [MHz], clocks.max.memory [MHz]
+NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 2430 MHz, 12481 MHz
+
+
+# exit 0
