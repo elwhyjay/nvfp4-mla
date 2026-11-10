@@ -316,12 +316,46 @@ Measured (RTX PRO 6000; v5 and v6 in the same run):
   went from 48% to 53% and the stall mix barely changed.
 - The 17% gain at 4K comes from wave quantization, not latency hiding: 512 CTAs fit in one wave at 3 per SM and
   need two at 2 per SM.
-- At 64K the kernel gain was eaten by the split policy. A larger wave made the policy choose 11 splits instead of 8,
-  which adds about 50 MB of fp32 partial results written and read by the combine kernel. The policy's cost model
-  has no term for combine traffic, which grows with the number of rows (8x larger at H=128 than at H=16).
+- At 64K a larger wave made the policy choose 11 splits instead of 8, which adds about 50 MB of fp32 partial results
+  written and read by the combine kernel. The policy's cost model has no term for combine traffic, which grows with
+  the number of rows (8x larger at H=128 than at H=16). Whether this ate the kernel gain is not established: the
+  -5.4% is ncu kernel time and the -0.7% is the benchmark total, and the two tools differ by about 5% on the same
+  kernel.
 - Decision: keep 3 stages (the rule asked for 10% at the target shape). Two findings carry forward: the split
   policy should count combine traffic, and the non-tensor instruction stream (679 instructions per warp per tile
   against 36 MMA) is the limit, not the number of warps.
+
+### Split policy: hypothesis
+
+The KV split count is chosen on the host by minimizing `waves x (chunk + C0)` with `C0 = 256` tokens and
+`chunk >= sqrt(L)`. It was fitted to split sweeps of the BF16 path in v5.
+
+- Hypothesis: the policy ignores the combine kernel's cost. The partial outputs are fp32, 2 KB per row and split,
+  written once and read once, so that cost grows with rows x splits and is 8x larger at H=128 than at H=16.
+  The v5 fit absorbed it into `C0` for the shapes it was fitted on; the FP8 path and a different wave size move
+  the optimum.
+- Measurement first, with one timer: for each shape and each split count, the decode and combine kernel times
+  separately (CUPTI), for the FP8 path with 2 and 3 stages and for the BF16 path. Then compare the best split
+  count with the policy's choice.
+- Prediction: at H=128 with batch 16-64, the best split count is lower than the policy's choice and saves at least
+  3%; at H=16 the policy stays within 3% of the best.
+
+### Split policy: result
+
+[`split_sweep.py`](../benchmarks/split_sweep.py): 11 shapes x 3 configurations (FP8 with 3 and 2 stages, BF16 with 3 stages), every split count
+from 1 to 128, decode and combine time each measured with CUPTI.
+
+- The prediction is wrong for the target. For the FP8 path with 3 stages at H=128 the policy picks the best split
+  count or one within 0.2% (H=128 B64 64K: 8 splits, the best).
+- Combine is real but small: about 0.012 ms per split at H=128 batch 64 (8 splits = 2.5% of the total).
+- Over all 33 cases the policy is 1.5% slower than the best split count on average and 7.1% in the worst case.
+  The worst cases are memory-bound H=16 shapes, where the policy splits batch 64 into 11-17 parts and 3-8 is best:
+  bandwidth is already saturated with fewer CTAs than SMs, so the policy's wave model over-splits.
+- A cost model with a combine term (`K x splits x rows / wave`, refit together with `C0` and the `sqrt(L)` floor,
+  84 combinations) does no better than the current one on these 33 cases.
+- Decision: keep the policy. Fixing the memory-bound case needs a second model for little gain.
+- Side result for the FP8 path: with the policy's own choices, 2 stages beat 3 stages on 8 of 11 shapes (geometric
+  mean -3.2%; H=128 B64 4K -17%, H=128 B1 64K +4.9%). This matters when the FP8 path becomes the default.
 
 ### Later: B200
 
