@@ -10,21 +10,24 @@ accumulation.
 It is written from scratch in CUDA (`mma.sync`, `cp.async`, split-KV) and uses one code path for both
 **SM120 (RTX PRO 6000)** and **SM100 (B200)**.
 
-Status: dense decode, one query token per request (see [Roadmap](#roadmap)).
+Status: dense decode, one query token per request (see [Roadmap](#roadmap)). How the kernel got from a CUDA-core
+version to 85% of DRAM bandwidth, step by step with the profiles behind each change:
+[docs/optimization-log.md](docs/optimization-log.md).
 
 ## Why
 
 FlashInfer can write an MLA KV cache in NVFP4 (#4676). Who can read it back for dense decode, as of 2026-11-10
-(FlashInfer v0.7.3, vLLM v0.33.0, SGLang v0.5.23, TensorRT-LLM v1.4.0rc3):
+(FlashInfer v0.7.3 and v0.7.4rc1, vLLM v0.33.0, SGLang v0.5.23, TensorRT-LLM v1.4.0rc3):
 
 - **SM12x** (RTX PRO 6000 and RTX 50 series are SM120, DGX Spark is SM121): FlashInfer, vLLM and SGLang have no
   dense NVFP4 MLA decode. vLLM's dense MLA backends take BF16 or FP8 KV only, and its NVFP4 MLA cache
   (`nvfp4_ds_mla`) is for sparse MLA on SM100 only. SGLang's FP4 MLA cache uses its own layout and is dequantized to
   BF16 before attention. TensorRT-LLM's `fp4_mla` (FP4 query, KV and P, its own cache layout) is validated on SM100
   and SM107 only.
-- **SM100:** FlashInfer v0.7.3 added `cake_mla_nvfp4_paged_decode` (experimental), which reads this cache with
-  `tcgen05` MMA and an NVFP4 query. An open vLLM PR ([#63203](https://github.com/vllm-project/vllm/pull/63203))
-  uses it for `--kv-cache-dtype nvfp4` on dense MLA models.
+- **SM100:** FlashInfer v0.7.3 added `cake_mla_nvfp4_paged_decode` (experimental, needs CUDA 13.4), which reads
+  this cache with `tcgen05` MMA and an NVFP4 query. It is faster than this kernel on B200 (see
+  [Performance](#performance)). An open vLLM PR ([#63203](https://github.com/vllm-project/vllm/pull/63203)) uses it
+  for `--kv-cache-dtype nvfp4` on dense MLA models.
 - FlashInfer's generic MLA decode (`trtllm_batch_decode_with_kv_cache_mla`) still raises for this cache.
 
 This kernel reads the cache on SM120 and SM100 and keeps the query in BF16.
@@ -38,8 +41,9 @@ This kernel reads the cache on SM120 and SM100 and keeps the query in BF16.
 - PyTorch 2.7 or newer for the same CUDA major version, and `ninja`.
 - `flashinfer-python >= 0.7.0` to write the cache (and for the tests and benchmarks).
 
-Tested with CUDA 13.3, PyTorch 2.12.0 and Python 3.13 on RTX PRO 6000 Blackwell Server Edition and B200. The
-benchmarks below use FlashInfer 0.7.0; the tests and the baseline checks also pass with FlashInfer 0.7.3.
+Tested with CUDA 13.4.2, PyTorch 2.12.0, Python 3.13 and FlashInfer 0.7.4rc1 on RTX PRO 6000 Blackwell Server
+Edition and B200; the benchmarks below use this setup. The tests also pass with CUDA 13.3 and FlashInfer 0.7.0 and
+0.7.3.
 
 ## Install
 
@@ -87,8 +91,10 @@ head dims 512 + 64 (DeepSeek-V2/V3/R1, Kimi-K2).
 - Kernel vs an FP32 PyTorch reference on the same dequantized cache: relative L2 error at most 1.9e-3, from rounding
   the output and P to BF16.
 - The in-kernel dequantization is bitwise equal to the PyTorch reference, also with `--use_fast_math`.
-- Quantization error of the format itself (random data, NVFP4 cache vs BF16 cache): relative L2 0.10, cosine about
-  0.995. For comparison, FP8 KV with FP8 Q (Triton FP8, XQA) has cosine 0.998 against BF16.
+- Quantization error of the format itself (random data, NVFP4 cache vs BF16 cache): relative L2 0.08-0.12, cosine
+  about 0.995. For comparison, FP8 KV with FP8 Q (Triton FP8, XQA) has cosine 0.998 against BF16.
+- FlashInfer Cake also quantizes the query to NVFP4. On the same caches its relative L2 error against BF16 is
+  0.13-0.17, 1.4-1.7x the error of this kernel (`benchmarks/accuracy.py` on B200, three shapes).
 
 ## Performance
 
@@ -98,48 +104,81 @@ random data. Full sweeps (H 16/128, batch 1-64, 1K-64K tokens): [rtx_pro_6000.cs
 [b200.csv](benchmarks/results/b200.csv).
 
 Baselines: FlashInfer `BatchMLAPagedAttentionWrapper` (fa2, BF16 KV); FlashInfer
-`trtllm_batch_decode_with_kv_cache_mla` (XQA on SM120, trtllm-gen on SM100); SGLang's Triton MLA decode
-(the vLLM/SGLang default on SM120, vendored in `benchmarks/triton_mla.py`); and "dequantize + fa2"
-(`nvfp4_mla.dequantize` to BF16, then fa2).
+`trtllm_batch_decode_with_kv_cache_mla` (XQA on SM120, trtllm-gen on SM100); FlashInfer `cake_mla_nvfp4_paged_decode`
+(SM100, same NVFP4 cache, NVFP4 query); SGLang's Triton MLA decode (the vLLM/SGLang default on SM120, vendored in
+`benchmarks/triton_mla.py`); and "dequantize + fa2" (`nvfp4_mla.dequantize` to BF16, then fa2).
 
 **RTX PRO 6000 (SM120)**
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/compare-rtx-pro-6000-dark.svg">
+  <img alt="Latency of nvfp4-mla and other MLA decode kernels on RTX PRO 6000 for four shapes" src="docs/img/compare-rtx-pro-6000-light.svg">
+</picture>
+
 | heads | batch x kv_len | nvfp4 | Triton FP8 | fa2 BF16 | dequantize + fa2 | XQA FP8 |
 |---|---|---|---|---|---|---|
-| 16 | 1 x 4K | **0.018** | 0.046 | 0.037 | 0.038 | n/a (needs 128 heads) |
-| 16 | 1 x 64K | **0.043** | 0.115 | 0.130 | 0.181 | n/a |
-| 16 | 16 x 64K | **0.333** | 0.573 | 1.554 | 2.661 | n/a |
-| 16 | 64 x 64K | **1.109** | 1.850 | 7.057 | 11.49 | n/a |
-| 128 | 1 x 64K | **0.105** | 0.226 | 0.166 | 0.215 | 1.135 |
-| 128 | 16 x 64K | 1.366 | 2.197 | 3.322 | 4.428 | **1.136** |
-| 128 | 64 x 64K | 5.143 | 8.521 | 10.52 | 14.93 | **2.440** |
+| 16 | 1 x 4K | **0.018** | 0.045 | 0.036 | 0.038 | n/a (needs 128 heads) |
+| 16 | 1 x 64K | **0.043** | 0.115 | 0.127 | 0.180 | n/a |
+| 16 | 16 x 64K | **0.330** | 0.574 | 1.507 | 2.603 | n/a |
+| 16 | 64 x 64K | **1.119** | 1.850 | 6.780 | 11.23 | n/a |
+| 128 | 1 x 64K | **0.103** | 0.225 | 0.161 | 0.213 | 1.113 |
+| 128 | 16 x 64K | 1.336 | 2.198 | 3.168 | 4.272 | **1.127** |
+| 128 | 64 x 64K | 4.995 | 8.387 | 10.04 | 14.39 | **2.360** |
 
 **B200 (SM100)**
 
-| heads | batch x kv_len | nvfp4 | Triton FP8 | fa2 BF16 | trtllm-gen BF16 | trtllm-gen FP8 |
-|---|---|---|---|---|---|---|
-| 16 | 1 x 4K | 0.013 | 0.050 | 0.025 | 0.016 | **0.012** |
-| 16 | 1 x 64K | 0.036 | 0.111 | 0.081 | 0.044 | **0.030** |
-| 16 | 16 x 64K | 0.204 | 0.536 | 0.563 | 0.236 | **0.116** |
-| 16 | 64 x 64K | 0.772 | 1.907 | 2.496 | 0.857 | **0.388** |
-| 128 | 1 x 64K | 0.105 | 0.292 | 0.098 | 0.046 | **0.036** |
-| 128 | 64 x 64K | 5.949 | 14.56 | 4.966 | 1.024 | **0.545** |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/compare-b200-dark.svg">
+  <img alt="Latency of nvfp4-mla and other MLA decode kernels on B200 for four shapes" src="docs/img/compare-b200-light.svg">
+</picture>
+
+| heads | batch x kv_len | nvfp4 | Cake NVFP4 | trtllm-gen FP8 | trtllm-gen BF16 | fa2 BF16 | Triton FP8 |
+|---|---|---|---|---|---|---|---|
+| 16 | 1 x 4K | **0.012** | 0.013 | 0.013 | 0.017 | 0.026 | 0.051 |
+| 16 | 1 x 64K | 0.031 | **0.020** | 0.030 | 0.044 | 0.083 | 0.113 |
+| 16 | 16 x 64K | 0.197 | **0.088** | 0.118 | 0.237 | 0.562 | 0.532 |
+| 16 | 64 x 64K | 0.741 | **0.318** | 0.386 | 0.844 | 2.473 | 1.908 |
+| 128 | 1 x 64K | 0.102 | **0.033** | 0.037 | 0.046 | 0.099 | 0.298 |
+| 128 | 16 x 64K | 1.454 | 0.300 | **0.148** | 0.256 | 1.522 | 3.515 |
+| 128 | 64 x 64K | 5.761 | **0.548** | 0.587 | 1.061 | 4.928 | 14.56 |
 
 How to read these numbers:
 
-- **SM120, 16 heads** (memory bound): fastest in all 16 measured shapes (batch 1-64, 1K-64K tokens): 1.6-3.6x
-  faster than Triton FP8 and 1.5-6.4x faster than fa2. At 64 x 64K it reads 1.33 TB/s, 85% of the achievable
-  1.56 TB/s (`benchmarks/roofline.py`). Triton FP8 reaches the same fraction there, so the 1.66x gain is the byte
+- **SM120, 16 heads** (memory bound): fastest in all 16 measured shapes (batch 1-64, 1K-64K tokens): 1.6-3.4x
+  faster than Triton FP8 and 1.5-6.1x faster than fa2. At 64 x 64K it reads 1.32 TB/s, 85% of the achievable
+  1.56 TB/s (`benchmarks/roofline.py`). Triton FP8 reaches the same fraction there, so the 1.65x gain is the byte
   ratio 576 / 352.
-- **SM120, 128 heads**: fastest at batch 1-4, where XQA is slow with long contexts. From batch 16 the problem is
-  compute bound and XQA's FP8 MMA wins; the BF16 `mma.sync` peak of this GPU is the limit for this kernel. It is
+- **SM120, 128 heads**: fastest at batch 1-4, where XQA has no KV split and is slow with long contexts. From batch 16
+  the problem is compute bound and XQA's FP8 MMA wins (2.1x at 64 x 64K). The BF16 `mma.sync` floor for that shape
+  is 2.57 ms, already above XQA, so closing this gap needs lower-precision MMA (see [Roadmap](#roadmap)). It is
   faster than Triton FP8 and fa2 in all shapes.
-- **B200, 16 heads**: faster than trtllm-gen BF16 in all 16 shapes (1.1-1.5x), than fa2 (1.6-3.2x) and than
-  Triton FP8 (2.4-4.6x). trtllm-gen FP8 (`tcgen05` MMA) is up to 2x faster except at batch 1-4 with 1K tokens.
-  This kernel uses `mma.sync` on both GPUs; on B200 it is limited by latency within the SM, not by memory.
-- **B200, 128 heads**: compute bound, and `mma.sync` is far below `tcgen05`: up to 12x slower than trtllm-gen FP8.
-- FlashInfer's `cake_mla_nvfp4_paged_decode` (v0.7.3, SM100, reads the same cache with an NVFP4 query) is not in these
-  tables yet; it needs CUDA 13.4.
+- **B200, 16 heads**: FlashInfer Cake (`tcgen05` MMA) is the fastest in most shapes, up to 2.3x faster than this
+  kernel; this kernel is faster only at batch 1-4 with up to 4K tokens. It is faster than trtllm-gen BF16 in all
+  16 shapes (1.03-1.47x), than fa2 (1.6-3.3x) and than Triton FP8 (2.5-5.1x). This kernel uses `mma.sync` on both
+  GPUs; on B200 it is limited by latency within the SM, not by memory.
+- **B200, 128 heads**: compute bound, and `mma.sync` is far below `tcgen05`: Cake and trtllm-gen FP8 are up to
+  10-11x faster.
+- Cake's query is NVFP4, so its error against the BF16 cache is 1.4-1.7x higher (see [Accuracy](#accuracy)).
+
+## Optimization history
+
+Latency of each kernel version on the same shapes. v1 runs on CUDA cores; v2 moves to tensor cores with
+dequantization in registers; v3 adds the `cp.async` pipeline; v4 splits the KV range across CTAs; v5 cuts
+instructions per token. Each step, and the profile that motivated it, is in
+[docs/optimization-log.md](docs/optimization-log.md).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/versions-dark.svg">
+  <img alt="Latency per kernel version, v1 to v5, for three shapes on RTX PRO 6000 and B200" src="docs/img/versions-light.svg">
+</picture>
+
+The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof; at
+128 heads both GPUs sit at about a third to a half of the BF16 `mma.sync` roof, which is the next target.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/roofline-dark.svg">
+  <img alt="Roofline of RTX PRO 6000 and B200 with kernel versions v1 to v5 and the fastest other library" src="docs/img/roofline-light.svg">
+</picture>
 
 ## Reproduce
 
@@ -148,11 +187,17 @@ pip install -e ".[test,bench]"
 pytest tests                       # correctness; the first run builds the extension three ways (~3 min)
 python benchmarks/roofline.py      # achievable read BW and BF16 mma.sync peak of this GPU
 python benchmarks/baselines.py     # sanity check: every baseline agrees with FlashInfer fa2
+python benchmarks/accuracy.py      # error against the dequantized and the BF16 reference
 python benchmarks/bench.py         # full sweep; --batch / --s-kv / --heads / --providers to narrow it
+uv run --with matplotlib python benchmarks/plot.py   # redraw docs/img from benchmarks/results
 ```
 
 The largest sweep points (64 x 64K, with BF16 copies for the baselines) need a lot of GPU memory; narrow the sweep on
 smaller GPUs.
+
+The `cake` provider needs SM100, CUDA 13.4 and `flashinfer-python>=0.7.4rc1`. The PyPI wheel does not ship Cake's
+CUDA sources ([flashinfer#7977](https://github.com/flashinfer-ai/flashinfer/issues/7977)); copy
+`flashinfer/experimental/` from the source distribution of the same version into the installed package.
 
 ## How it works
 
@@ -182,9 +227,11 @@ Dequantization: `ckv = e2m1 * scale * ckv_scale`, `kpe = fp8 * kpe_scale`.
 
 ## Roadmap
 
+- Compute-bound shapes on SM120 (128 heads, and MTP below): block-scaled FP4 `mma.sync` for QK, where the cache's
+  scales match the MMA's operand scales, and more warps per scheduler to keep the tensor pipe busy.
+- A `tcgen05` path for SM100 that keeps the BF16 query; the target is FlashInfer Cake at 16 heads.
 - MTP / speculative decode (2-4 query tokens per request).
 - An SGLang integration (attention backend plugin plus a KV pool in this layout).
-- A B200 comparison with FlashInfer's `cake_mla_nvfp4_paged_decode`.
 
 ## Acknowledgements
 
