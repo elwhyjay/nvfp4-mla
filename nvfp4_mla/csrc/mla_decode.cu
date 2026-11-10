@@ -163,10 +163,16 @@ __device__ __forceinline__ void mma_fp8(float& c0, float& c1, float& c2, float& 
 // Block-scaled FP4: 4 E4M3 scales per lane, one per k16 block (lane (g, t): row g + 8 (t % 2) of A, column g of B).
 __device__ __forceinline__ void mma_fp4(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sfa,
                                         uint32_t sfb) {
+// Block-scaled mma.sync: SM12x only, PTX ISA 8.7 (CUDA 12.9)
+#if (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)) && \
+    (__CUDACC_VER_MAJOR__ > 12 || __CUDACC_VER_MINOR__ >= 9)
   asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {0,0}, {%11}, {0,0};"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "r"(sfb));
+#else
+  __trap();
+#endif
 }
 
 // 8 floats to 8 E2M1 codes, v[0] in the lowest nibble
@@ -225,8 +231,11 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&d)[4], const void* p) {
                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(p)))
                : "memory");
 }
-__device__ __forceinline__ void ldsm_x4_trans(uint32_t (&d)[4], const void* p) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+
+// Two 16 x 16 byte matrices (lanes 0-15 address rows 0-15 of the first, 16-31 of the second), transposed: lane (g, t)
+// gets column g (d0) and g + 8 (d1) of rows 4t..4t+3 of the first matrix, d2 / d3 the same of the second.
+__device__ __forceinline__ void ldsm_x2_trans_b8(uint32_t (&d)[4], const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3}, [%4];"
                : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(p)))
                : "memory");
@@ -560,6 +569,41 @@ __device__ __forceinline__ void load_q_fp4(const Frag& f, const __nv_bfloat16* q
   }
 }
 
+// FP8 paths: o[k][h][c] is channel 128w + 16k + 8h + 2t + (c & 1) of row g (c < 2) or g + 8.
+__device__ __forceinline__ void store_out8(Acc& a, const Frag& f, __nv_bfloat16* out, size_t row0, size_t row1,
+                                           float ckv_scale) {
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    a.l[r] += __shfl_xor_sync(~0u, a.l[r], 1);
+    a.l[r] += __shfl_xor_sync(~0u, a.l[r], 2);
+    const float s = a.l[r] > 0.f ? ckv_scale / a.l[r] : 0.f;
+    __nv_bfloat16* dst = out + (r ? row1 : row0) * CKV + 128 * f.w + 2 * f.t4;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+        *reinterpret_cast<uint32_t*>(dst + 16 * k + 8 * h) = pack_bf16x2(a.o[k][h][2 * r] * s, a.o[k][h][2 * r + 1] * s);
+  }
+}
+
+__device__ __forceinline__ void store_partial8(Acc& a, const Frag& f, float* o_part, float* lse_part, size_t row0,
+                                               size_t row1, float ckv_scale) {
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    a.l[r] += __shfl_xor_sync(~0u, a.l[r], 1);
+    a.l[r] += __shfl_xor_sync(~0u, a.l[r], 2);
+    const size_t row = r ? row1 : row0;
+    const float s = a.l[r] > 0.f ? ckv_scale / a.l[r] : 0.f;
+    float* dst = o_part + row * CKV + 128 * f.w + 2 * f.t4;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+        *reinterpret_cast<float2*>(dst + 16 * k + 8 * h) = make_float2(a.o[k][h][2 * r] * s, a.o[k][h][2 * r + 1] * s);
+    if (f.w == 0 && f.t4 == 0) lse_part[row] = a.l[r] > 0.f ? a.m[r] + log2f(a.l[r]) : -INFINITY;
+  }
+}
+
 // ---- pipelined kernel
 // Copy: 4 threads per token (TILE = 32 tokens x 4 = 128 threads); thread p copies ckv chunks {p, 4+p, 8+p, 12+p}
 // (each instruction covers 64 contiguous bytes per token), sf chunk p (p < 2), kpe chunk p. So each thread needs one
@@ -587,11 +631,10 @@ template <int P> __device__ __forceinline__ int kpe_chunk(int c, int r) { return
 // smem after the stages: BF16 path, the cross-warp score buffers (one per 16-token sub-tile parity); FP8 path,
 // Fp8Smem. Then the mbarrier (BF16 path).
 struct Fp8Smem {
-  // V tile in e4m3. Chunk 8b + q holds channels 128b + 32i + 4q + {0..3}, i = 0..3 (so the PV output of warp b lands
-  // in the Acc layout), stored at chunk c ^ (r & 7) ^ ((c >> 2) & 6) of token row r: conflict-free for the
-  // converting threads' stores and for ldmatrix.trans over 8 tokens.
+  // V tile in e4m3: chunk c of token row r (channels 16c .. 16c + 15) at chunk c ^ (r & 7) ^ ((c >> 2) & 6), which
+  // is conflict-free for the converting threads' stores and for the transposing ldmatrix over 8 or 16 tokens.
   uint4 v[TILE][CKV / 16];
-  uint8_t p[16][TILE];  // P in e4m3; column = PV k position (token order of the QK accumulators)
+  uint8_t p[16][TILE];  // P in e4m3, column = token
   float mx[16][4];      // per row: max over each warp's tokens; after the loop, each warp's row sum
 };
 template <int P>
@@ -640,12 +683,11 @@ __device__ __forceinline__ void tile_fp8(Acc& a, const Frag& f, const QF8& q, co
 #pragma unroll
   for (int e = 0; e < 4; ++e) sv[e] = ((c[0][e] + c[1][e]) + (c[2][e] + c[3][e])) + q.kpe_ratio[e / 2] * cp[e];
 
-  // this token's latent K is also V: store it to the V tile (see Fp8Smem for the chunk order)
+  // this token's latent K is also V: chunks 8t..8t+7 of the V tile
 #pragma unroll
   for (int k = 0; k < 8; ++k) {
     const int ch = 8 * t + k;
-    sm.v[r][ch ^ (r & 7) ^ ((ch >> 2) & 6)] =
-        make_uint4(kq[k / 2][k % 2], kq[4 + k / 2][k % 2], kq[8 + k / 2][k % 2], kq[12 + k / 2][k % 2]);
+    sm.v[r][ch ^ (r & 7) ^ ((ch >> 2) & 6)] = make_uint4(kq[2 * k][0], kq[2 * k][1], kq[2 * k + 1][0], kq[2 * k + 1][1]);
   }
 
   tile_back(a, f, sv, q.scale, sm, t0, L);
@@ -653,7 +695,7 @@ __device__ __forceinline__ void tile_fp8(Acc& a, const Frag& f, const QF8& q, co
 
 // One 32-token tile with FP4 QK (P = 2). K's B fragments are the cache bytes as stored (ldmatrix: 8 token rows of a
 // 16 B chunk; chunk 2s = b0 of step s, 2s + 1 = b1), scaled in the MMA by the token's scale bytes. The same registers
-// are converted to E4M3 for the V tile: thread t holds exactly chunks 2t and 2t + 1 of each 128-channel block.
+// are converted to E4M3 for the V tile.
 __device__ __forceinline__ void tile_fp4q(Acc& a, const Frag& f, const QF4& q, const Stage& st, Fp8Smem& sm, int t0,
                                           int L) {
   const int w = f.w, g = f.g, t = f.t4, r = 8 * w + g;
@@ -692,12 +734,12 @@ __device__ __forceinline__ void tile_fp4q(Acc& a, const Frag& f, const QF4& q, c
     }
   }
 #pragma unroll
-  for (int b = 0; b < 4; ++b)
+  for (int k = 0; k < 8; ++k)
 #pragma unroll
-    for (int k = 0; k < 2; ++k) {  // chunk q = 2t + k of block b: words i = channels 128b + 32i + 4q .. +4
-      const int ch = 8 * b + 2 * t + k;
-      sm.v[r][ch ^ (r & 7) ^ ((ch >> 2) & 6)] =
-          make_uint4(e8[2 * b][0][k], e8[2 * b][1][k], e8[2 * b + 1][0][k], e8[2 * b + 1][1][k]);
+    for (int h = 0; h < 2; ++h) {  // channels 64k + 32h + 8t .. +8 = half t % 2 of chunk 4k + 2h + t / 2
+      const int ch = 4 * k + 2 * h + t / 2;
+      *reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(&sm.v[r][ch ^ (r & 7) ^ ((ch >> 2) & 6)]) + 8 * (t % 2)) =
+          make_uint2(e8[k][h][0], e8[k][h][1]);
     }
   tile_back(a, f, sv, q.scale, sm, t0, L);
 }
@@ -735,24 +777,20 @@ __device__ __forceinline__ void tile_back(Acc& a, const Frag& f, float (&sv)[4],
   }
   rescale_o(a, corr);
 
-  // P: PV k position 4t' + i is token 2t' + i (i < 2) or 8 + 2t' + i - 2, +16 for the upper half (as in v6)
-  const int kp = 16 * (w >> 1) + 4 * t + 2 * (w & 1);
-  *reinterpret_cast<uint16_t*>(&sm.p[g][kp]) = pack_e4m3x2(sv[0], sv[1]);
-  *reinterpret_cast<uint16_t*>(&sm.p[g + 8][kp]) = pack_e4m3x2(sv[2], sv[3]);
+  *reinterpret_cast<uint16_t*>(&sm.p[g][r - g + 2 * t]) = pack_e4m3x2(sv[0], sv[1]);  // tokens 8w + 2t, +1
+  *reinterpret_cast<uint16_t*>(&sm.p[g + 8][r - g + 2 * t]) = pack_e4m3x2(sv[2], sv[3]);
   __syncthreads();  // P complete
 
   uint32_t pa[4];
   ldsm_x4(pa, &sm.p[(f.lane / 8 & 1) * 8 + f.lane % 8][f.lane / 16 * 16]);
 #pragma unroll
-  for (int k = 0; k < 8; ++k) {
-    // ldmatrix.trans over the 4 token blocks: thread (g, t) receives tokens 8m + 2t, 8m + 2t + 1 of chunk bytes 2g,
-    // 2g + 1, i.e. channels 32(g / 2) + 4k + 2(g % 2) + {0, 1} of warp w's block; split into even / odd channels.
+  for (int k = 0; k < 8; ++k) {  // chunk 8w + k: channels 128w + 16k + 8h + n, h = 0 / 1 -> o[k][h]
     const int ch = 8 * w + k, tok = f.lane;
     uint32_t x[4];
-    ldsm_x4_trans(x, &sm.v[tok][ch ^ (tok & 7) ^ ((ch >> 2) & 6)]);
+    ldsm_x2_trans_b8(x, &sm.v[tok][ch ^ (tok & 7) ^ ((ch >> 2) & 6)]);
     float(&o)[2][4] = a.o[k];
-    mma_fp8(o[0][0], o[1][0], o[0][2], o[1][2], pa, __byte_perm(x[0], x[1], 0x6420), __byte_perm(x[2], x[3], 0x6420));
-    mma_fp8(o[0][1], o[1][1], o[0][3], o[1][3], pa, __byte_perm(x[0], x[1], 0x7531), __byte_perm(x[2], x[3], 0x7531));
+    mma_fp8(o[0][0], o[0][1], o[0][2], o[0][3], pa, x[0], x[2]);
+    mma_fp8(o[1][0], o[1][1], o[1][2], o[1][3], pa, x[1], x[3]);
   }
 }
 
@@ -781,8 +819,7 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
   const int ntiles = t_end > t_beg ? (t_end - t_beg + TILE - 1) / TILE : 0;
   const int cr = threadIdx.x / 4, cp = threadIdx.x % 4;  // copy role: token row, part
   auto page_of = [&](int tile) { const int t = t_beg + tile * TILE + cr; return t < t_end ? pt[t >> page_shift] : 0; };
-  auto issue = [&](int tile, int page) {
-    Stage& s = st[tile % STAGES];
+  auto issue = [&](int tile, int page, Stage& s) {
     const int t = t_beg + tile * TILE + cr;
     const bool ok = t < t_end;
     const size_t tok = (size_t(page) << page_shift) | (t & ((1 << page_shift) - 1));
@@ -808,19 +845,19 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
 
 #pragma unroll
   for (int i = 0; i < STAGES - 1; ++i) {
-    if (i < ntiles) issue(i, page_of(i));
+    if (i < ntiles) issue(i, page_of(i), st[i]);
     cp_async_commit();
   }
   int next_page = page_of(STAGES - 1);
-  for (int i = 0; i < ntiles; ++i) {
+  // s: the stage holding tile i; s_next: the stage refilled with tile i + STAGES - 1
+  auto step = [&](int i, const Stage& s, Stage& s_next) {
     cp_async_wait<STAGES - 2>();
     __syncthreads();  // tile i visible to all; everyone is done with the stage refilled below
     const int nxt = i + STAGES - 1;
-    if (nxt < ntiles) issue(nxt, next_page);
+    if (nxt < ntiles) issue(nxt, next_page, s_next);
     cp_async_commit();
     next_page = page_of(nxt + 1);
 
-    const Stage& s = st[i % STAGES];
     if constexpr (P == 2) {
       tile_fp4q(a, f, q4, s, sm8, t_beg + i * TILE, t_end);
     } else if constexpr (P == 1) {
@@ -839,6 +876,16 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
                   kpe_scale / ckv_scale);
       }
     }
+  };
+  if constexpr (P != 0 && STAGES == 2) {
+    // Unrolled by the stage count: each copy's stage is a compile-time constant, so the swizzled smem offsets of a
+    // stage do not change from tile to tile.
+    for (int i = 0; i < ntiles; i += 2) {
+      step(i, st[0], st[1]);
+      if (i + 1 < ntiles) step(i + 1, st[1], st[0]);
+    }
+  } else {
+    for (int i = 0; i < ntiles; ++i) step(i, st[i % STAGES], st[(i + STAGES - 1) % STAGES]);
   }
   if constexpr (P != 0) {  // row sums: thread -> warp -> CTA, through mx (no warp reads it after the last tile's P barrier)
 #pragma unroll
@@ -857,7 +904,12 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
   }
   if (o_part) {
     const size_t prow0 = (size_t(blockIdx.z) * gridDim.y + b) * H + 16 * blockIdx.x + f.g;
-    store_partial(a, f, o_part, lse_part, prow0, prow0 + 8, ckv_scale);
+    if constexpr (P != 0)
+      store_partial8(a, f, o_part, lse_part, prow0, prow0 + 8, ckv_scale);
+    else
+      store_partial(a, f, o_part, lse_part, prow0, prow0 + 8, ckv_scale);
+  } else if constexpr (P != 0) {
+    store_out8(a, f, out, row0, row1, ckv_scale);
   } else {
     store_out(a, f, out, row0, row1, ckv_scale);
   }
@@ -1003,9 +1055,11 @@ torch::Tensor decode(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv
   if (precision == 1)
     return decode_impl<2, 1>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale, kpe_scale,
                              max_kv_len, num_splits);
-  if (precision == 2)
+  if (precision == 2) {
+    TORCH_CHECK(at::cuda::getDeviceProperties(ckv.get_device())->major == 12, "precision 2 (FP4 QK) needs SM12x");
     return decode_impl<2, 2>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale, kpe_scale,
                              max_kv_len, num_splits);
+  }
   TORCH_CHECK(precision == 0, "precision must be 0 (BF16), 1 (FP8) or 2 (FP4 QK)");
   switch (stages) {
 #define CASE(S) \

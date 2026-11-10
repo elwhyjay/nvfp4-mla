@@ -25,6 +25,7 @@ ap.add_argument("--ref", required=True, help="reference mla_decode.cu")
 ap.add_argument("--ref-stages", type=int, default=3)
 ap.add_argument("--rounds", type=int, default=5)
 ap.add_argument("--precision", type=int, default=1, help="precision of the package kernel (1 FP8, 2 FP4 QK)")
+ap.add_argument("--ref-precision", type=int, help="precision of the reference kernel (default: --precision)")
 ap.add_argument("--heads", default="16,128")
 ap.add_argument("--batch", default="1,16,64")
 ap.add_argument("--s-kv", default="4096,16384,65536")
@@ -45,7 +46,7 @@ for H in ints(a.heads):
     for B in ints(a.batch):
         for S in ints(a.s_kv):
             c = RandomCache([S] * B, 64, H)
-            fr = lambda: ref.decode(*c.args(), S, 0, a.ref_stages, True)
+            fr = lambda: ref.decode(*c.args(), S, 0, a.ref_stages, a.precision if a.ref_precision is None else a.ref_precision)
             fn = lambda: new.decode(*c.args(), S, 0, 3, a.precision)
             rounds = [(baselines.gpu_ms(fr), baselines.gpu_ms(fn)) for _ in range(a.rounds)]
             ratios = [tn / tr for tr, tn in rounds]

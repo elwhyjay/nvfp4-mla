@@ -586,6 +586,80 @@ Predictions:
 - Decision: keep as an opt-in mode (`precision=2`); the rule asked for 3%. It trades 25-55% more error on most shapes
   for 4-5% on large compute-bound ones.
 
+### Last SM120 hypotheses (v11)
+
+Where v9 and v10 spend instructions and stall samples, per warp and 32-token tile (H=128 B64 64K):
+
+| group | v9 instructions | v9 stalls | v10 instructions | v10 stalls |
+|---|---|---|---|---|
+| conversion (`F2FP`, `HMUL2`) | 199 | 21% | 203 | 22% |
+| integer and address math | 73 | 12% | 146 | 24% |
+| `PRMT` | 40 | 10% | 56 | 11% |
+| MMA | 34 | 21% | 26 | 12% |
+| shared memory | 32 | 12% | 33 | 8% |
+| FP32 (softmax and sums) | 49 | 10% | 50 | 11% |
+
+The integer instructions in the tile loop are address math redone every tile: the 64-bit global address of each
+`cp.async` (page to token byte offset) and the swizzled shared-memory offsets added to the stage base. The stage
+base changes every tile, and at about 240 registers the compiler recomputes the per-lane offsets instead of keeping
+them.
+
+1. An 8-bit transposing `ldmatrix` (`.m16n16.trans.b8`, available on sm_120a) loads V's PV fragments directly.
+   32 of v9's 40 `PRMT` only split `ldmatrix.trans` (b16) results into even and odd channels. Prediction: `PRMT`
+   40 -> 8, its stall share 10% -> about 3%, time -3% to -6%.
+2. Unrolling the tile loop by the stage count (2) makes each copy's stage base a compile-time constant, so the
+   swizzled offsets can leave the loop and the global addresses are needed once per page. Prediction: integer
+   instructions -40% to -60%, time -3% to -8% (more in the FP4 QK mode). Risk: holding the offsets may need registers
+   the kernel does not have; checked first with ptxas.
+3. The conversion is a floor on SM120. Every element needs `cvt` (E2M1 to f16), a multiply by its block scale, and
+   `cvt` (to E4M3): 1.5 instructions per element, 39% of v9's instructions. A lookup-table conversion, moving the
+   scale into P, or a BF16 V tile were each checked on paper and cost as much or more (or leave one CTA per SM),
+   and block-scaled MMA cannot take V's scales (they run along the output channels). XQA, reading an FP8 cache,
+   does not pay this. Prediction: after 1 and 2 the H=128 B64 64K time is about 2.6-2.7 ms, still above XQA's
+   2.30 ms, so on SM120 this kernel does not overtake XQA at H=128.
+
+These are the last steps for SM120; the work then moves to B200.
+
+### v11 results and the end of the SM120 work
+
+**1. Transposing 8-bit `ldmatrix` (v11a).** A probe of `ldmatrix.m16n16.x2.trans.b8` showed that lane (g, t) gets
+channel g and g + 8 of tokens 4t..4t+3 (first 16 rows) and 16+4t..16+4t+3 (second 16 rows): exactly the PV B
+fragments of two n8 blocks, in natural token order. The V tile now holds plain 16-channel chunks (no byte permute
+on either side), P is stored in token order, and the FP8 path has its own output stores (channel 128w + 16k + 8h +
+2t + {0, 1}).
+
+| FP8 mode | v10 | v11a | predicted |
+|---|---|---|---|
+| `PRMT` per warp per tile | 40 | 8 | 8 |
+| its share of stall samples | 10% | 2% | about 3% |
+| H=128 B64 64K (same run) | 3.037 ms | 2.860 ms (-5.4%) | -3% to -6% |
+| other shapes | | H=128 -3% to -6%, H=16 0% to -3% | |
+
+Output bitwise equal to v10. In the FP4 QK mode the same change gained nothing (-4% to +2%).
+
+**2. Tile loop unrolled by the stage count (v11b).**
+
+| | FP8 mode v11a -> v11b | FP4 QK mode v10 -> v11b | predicted |
+|---|---|---|---|
+| integer instructions per warp per tile | 68 -> 33 | 146 -> 30 | -40% to -60% |
+| all instructions | 469 -> 428 | 564 -> 440 | |
+| H=128 B64 64K | 2.860 -> 2.855 ms (0%) | 2.936 -> 2.785 ms (-5.2%) | -3% to -8% |
+
+The integer work fell as predicted in both modes, but the FP8 mode did not get faster: 9% fewer instructions and
+no change in time, another sign that this kernel is limited by latency, not by issue slots. The FP4 QK mode, which
+had twice the integer work, gained 5%. Registers 245 -> 253 (FP8 mode), no spills.
+
+FP4 QK mode against FP8 mode in the same build: H=128 B64 64K -3.0%, other large H=128 shapes -2% to -3%, small
+shapes up to +8%. That is exactly the 3% the rule asked for, at 25-55% more error; it stays an opt-in mode.
+
+**3. Conversion floor: confirmed.** After 1 and 2, H=128 B64 64K takes 2.79-2.86 ms in the FP8 mode and 2.71 ms
+in the FP4 QK mode (predicted 2.6-2.7 ms), against 2.30 ms for XQA. The conversion is now 46% of the FP8 mode's
+instructions. On SM120 this kernel does not overtake XQA's FP8 cache at H=128.
+
+SM120 summary at H=128 B64 64K: v5 (BF16) 4.81 ms -> v6 (FP8 MMA) 3.51 -> v9 (QK by token) 3.01 -> v11 2.79-2.86
+(FP8) / 2.71 (FP4 QK). At H=16 the BF16 path stays at 85% of DRAM bandwidth and is the fastest MLA decode measured on
+SM120.
+
 ### Later: B200
 
 FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:
