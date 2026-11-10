@@ -258,6 +258,71 @@ takes the same 15.6 cycles.
 - Decision rule: if H=128 improves by less than 10%, the non-tensor instruction stream is the limit, and the next
   step attacks it before the FP4 query. One candidate is that at H=128 eight CTAs dequantize the same KV tile.
 
+### v6 result: FP8 QK and PV
+
+Implementation (`tile_fp8` in the kernel, `fp8=True`):
+- A whole 32-token tile per step, since PV with k32 consumes 32 tokens at once.
+- Q is quantized to E4M3 at the start with one scale per row and part (latent / RoPE); the scales fold into the
+  score scale.
+- K/V: E2M1 to f16, times the block scale (exact), then rounded to E4M3. The RoPE part of K is used as stored.
+- The PV token axis is permuted to match the QK accumulator layout, so P needs no shuffle. V is transposed with
+  `movmatrix` on byte pairs, then split into two channels with a byte permute.
+- P is E4M3 without scaling; the row sum stays fp32.
+- The PV output lands in the same registers as in the BF16 path, so the softmax update and the stores are shared.
+- One cross-warp reduction per tile, so a single buffer is enough: smem goes from 45 KB to 43 KB.
+
+Measured (RTX PRO 6000; v5 and v6 in the same run):
+
+| | v5 | v6 | predicted |
+|---|---|---|---|
+| H=128 B64 64K | 4.81 ms | **3.56 ms (-26%)** | 3.5-4.0 ms |
+| H=128 B64 4K | 0.417 ms | 0.324 ms (-22%) | |
+| H=128 B1 64K | 0.104 ms | 0.082 ms (-21%) | |
+| H=16 B64 64K | 1.122 ms | 1.125 ms | within 3% |
+| MMA per warp per tile | 68 | **36** | 36 |
+| Tensor pipe busy time (ncu) | 2.69 ms | **1.48 ms (-45%)** | about -47% |
+| Other instructions per warp per tile | 666 | 679 | no decrease |
+| Error vs BF16 cache (9 shapes) | 0.078-0.150 | 0.085-0.161 | |
+
+- Error grew by 0% to 11% over v5, a little more than the simulated -3% to +7%.
+- Instruction mix per warp per tile: conversions (`F2FP`) 84 -> 140 for the E4M3 rounding and P, `MOVM` 64 -> 32
+  plus `PRMT` 8 -> 40 for the byte-pair transpose, address math 120 -> 86 (one tile step instead of two).
+- Not predicted: registers fell from 206 to 168 (FP8 Q fragments are half the size), so registers would now allow
+  3 CTAs per SM. Shared memory (43 KB per CTA) is now the only limit at 2.
+- Issue slots 35% -> 48%; stalls: dependency wait 23%, short scoreboard 14%. Still latency-bound with 2 warps per
+  scheduler.
+
+### v6b hypothesis: 2 pipeline stages, 3 CTAs per SM
+
+- Two stages cut smem to about 32 KB, so 3 CTAs fit per SM (168 registers x 384 threads = 64512 of 65536).
+- The memory pipeline keeps the same depth per SM: 2 stages x 3 CTAs = 3 x 2 = 6 tiles in flight.
+- A third warp per scheduler should hide part of the dependency and short-scoreboard stalls (37% together).
+- Predictions: occupancy 2 -> 3 CTAs per SM; H=128 B64 64K 3.56 ms -> 2.9-3.2 ms (-10% to -20%); H=16 within 3%.
+- Decision rule: adopt 2 stages for the FP8 path if H=128 improves by 10% or more; otherwise keep 3.
+
+### v6b result: occupancy went up, the time did not
+
+| | 3 stages (v6) | 2 stages | predicted |
+|---|---|---|---|
+| CTAs per SM (achieved occupancy) | 2 (16.6%) | 3 (24.4%) | 3 |
+| Kernel time, H=128 B64 64K (ncu) | 3.71 ms | 3.50 ms (-5.4%) | |
+| KV splits chosen at that shape | 8 (11 waves) | 11 (10 waves) | |
+| End-to-end, H=128 B64 64K | 3.511 ms | 3.485 ms (-0.7%) | 2.9-3.2 ms |
+| H=128 B64 4K | 0.325 ms | 0.269 ms (-17%) | |
+| H=128 B16 64K | 0.950 ms | 0.891 ms (-6%) | |
+| H=128 B1 4K | 0.024 ms | 0.029 ms (+21%) | |
+
+- The latency-hiding hypothesis is mostly wrong. With 50% more warps the kernel got only 5% faster; issue slots
+  went from 48% to 53% and the stall mix barely changed.
+- The 17% gain at 4K comes from wave quantization, not latency hiding: 512 CTAs fit in one wave at 3 per SM and
+  need two at 2 per SM.
+- At 64K the kernel gain was eaten by the split policy. A larger wave made the policy choose 11 splits instead of 8,
+  which adds about 50 MB of fp32 partial results written and read by the combine kernel. The policy's cost model
+  has no term for combine traffic, which grows with the number of rows (8x larger at H=128 than at H=16).
+- Decision: keep 3 stages (the rule asked for 10% at the target shape). Two findings carry forward: the split
+  policy should count combine traffic, and the non-tensor instruction stream (679 instructions per warp per tile
+  against 36 MMA) is the limit, not the number of warps.
+
 ### Later: B200
 
 FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:

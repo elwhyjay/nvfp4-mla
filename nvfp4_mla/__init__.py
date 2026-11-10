@@ -67,7 +67,7 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
     if max_kv_len is None:
         max_kv_len = int(kv_lens.max())
     return _load().decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale,
-                          ckv_scale, kpe_scale, max_kv_len, num_splits, 3)
+                          ckv_scale, kpe_scale, max_kv_len, num_splits, 3, False)
 
 
 def dequantize(ckv_cache, ckv_sf_cache, kpe_cache, ckv_scale=1.0, kpe_scale=1.0, dtype=torch.bfloat16):

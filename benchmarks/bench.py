@@ -6,6 +6,7 @@
 Times are GPU kernel time per call with a cold L2 (CUPTI; host launch overhead excluded, see baselines.gpu_ms).
 GB/s counts each format's own bytes per token: NVFP4 352, FP8 576, BF16 1152. Providers:
   nvfp4[/N[/S]]   this kernel (N KV splits, 0 = auto; S pipeline stages)
+  nvfp4-fp8[/N]   this kernel with FP8 (e4m3) QK and PV
   nvfp4+fa2       nvfp4_mla.dequantize to BF16, then FlashInfer fa2 ("dequantize, then a BF16 kernel")
   fa2, cutlass    FlashInfer BatchMLAPagedAttentionWrapper, BF16 KV
   trtllm:bf16|fp8 FlashInfer trtllm_batch_decode_with_kv_cache_mla (trtllm-gen on SM100, XQA on SM120)
@@ -30,9 +31,9 @@ KNOWN_BW = {"NVIDIA RTX PRO 6000 Blackwell Server Edition": 1559, "NVIDIA B200":
 
 
 def ours(name, c, max_len):
-    _, splits, stages = (name.split("/") + ["0", "3"])[:3]
+    kind, splits, stages = (name.split("/") + ["0", "3"])[:3]
     f = nvfp4_mla._load().decode
-    return lambda: f(*c.args(), max_len, int(splits), int(stages))
+    return lambda: f(*c.args(), max_len, int(splits), int(stages), kind == "nvfp4-fp8")
 
 
 def cake(c, max_len):
@@ -51,7 +52,7 @@ def cake(c, max_len):
 
 
 def make(name, c, inp, max_len):
-    if name.startswith("nvfp4/") or name == "nvfp4":
+    if name.split("/")[0] in ("nvfp4", "nvfp4-fp8"):
         return ours(name, c, max_len)
     if name == "cake":
         return cake(c, max_len)

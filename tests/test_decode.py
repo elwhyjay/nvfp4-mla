@@ -21,8 +21,8 @@ CASES = [  # (kv_lens, page_size, heads)
 ]
 
 
-def run(c, build="native", splits=0, stages=3):
-    return nvfp4_mla._load(*BUILDS[build]).decode(*c.args(), int(c.kv_lens.max()), splits, stages)
+def run(c, build="native", splits=0, stages=3, fp8=False):
+    return nvfp4_mla._load(*BUILDS[build]).decode(*c.args(), int(c.kv_lens.max()), splits, stages, fp8)
 
 
 def check(out, c, label):
@@ -69,6 +69,26 @@ def test_compat_cvt_matches_native(kv_lens, page_size, heads):
     """The pre-CUDA-13.2 conversion path (through f16) is exact, so the output is bitwise identical."""
     c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
     assert torch.equal(run(c, "compat_cvt"), run(c))
+
+
+@pytest.mark.parametrize("num_splits", [0, 3])
+@pytest.mark.parametrize("kv_lens,page_size,heads", CASES)
+def test_decode_fp8(num_splits, kv_lens, page_size, heads):
+    """FP8 QK and PV: a few percent of extra error over the dequantized cache, and close to the BF16 path against
+    the unquantized cache."""
+    c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
+    out = run(c, splits=num_splits, fp8=True)
+    assert not out.isnan().any()
+    assert rel_l2(out, c.reference()) < 0.08  # E4M3 rounding of Q, K, V and P; measured up to 0.061
+    ref = c.reference_bf16()
+    assert rel_l2(out, ref) < 1.2 * rel_l2(run(c, splits=num_splits), ref)  # measured up to 1.11x
+
+
+@pytest.mark.parametrize("kv_lens,page_size,heads", CASES[1:3] + CASES[4:5])
+def test_fp8_stages_match(kv_lens, page_size, heads):
+    """Pipeline depth does not change the arithmetic: with the split fixed, 2 and 3 stages agree bitwise."""
+    c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
+    assert torch.equal(run(c, splits=3, stages=2, fp8=True), run(c, splits=3, fp8=True))
 
 
 def test_public_api():

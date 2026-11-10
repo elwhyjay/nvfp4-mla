@@ -13,6 +13,9 @@
 // token is dequantized once. Partial scores (over a warp's channels) are summed across warps through smem.
 // KV tiles of 32 tokens stream through a cp.async pipeline; long contexts are split across CTAs and merged by
 // mla_combine.
+// FP8 variant (tile_fp8): e4m3 m16n8k32 for QK and PV over a whole 32-token tile. Q is quantized to e4m3 once with a
+// per-row scale; K/V are e2m1 * scale rounded to e4m3; P is e4m3 (l stays fp32). The PV token axis is permuted to
+// match the QK accumulator layout, and the PV output channels land where the BF16 path puts them (shared Acc).
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -149,6 +152,46 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], 
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// Accumulator registers are passed one by one: the FP8 PV writes into the BF16 path's Acc layout.
+__device__ __forceinline__ void mma_fp8(float& c0, float& c1, float& c2, float& c3, const uint32_t (&a)[4], uint32_t b0,
+                                        uint32_t b1) {
+  asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// 8 E2M1 codes (low nibble first) times a f16x2 scale, rounded to 8 E4M3 bytes: .x = codes 0-3, .y = codes 4-7.
+// The f16 product is exact (e2m1 * e4m3 needs 6 significant bits); only the final cvt rounds.
+__device__ __forceinline__ uint2 e2m1x8_to_e4m3x8(uint32_t w, uint32_t scale) {
+  uint2 d;
+  asm("{\n.reg .b8 b0, b1, b2, b3;\n.reg .b32 h0, h1, h2, h3;\n.reg .b16 e0, e1, e2, e3;\n"
+      "mov.b32 {b0, b1, b2, b3}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 h0, b0;\ncvt.rn.f16x2.e2m1x2 h1, b1;\ncvt.rn.f16x2.e2m1x2 h2, b2;\ncvt.rn.f16x2.e2m1x2 h3, b3;\n"
+      "mul.rn.f16x2 h0, h0, %3;\nmul.rn.f16x2 h1, h1, %3;\nmul.rn.f16x2 h2, h2, %3;\nmul.rn.f16x2 h3, h3, %3;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;\ncvt.rn.satfinite.e4m3x2.f16x2 e1, h1;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;\ncvt.rn.satfinite.e4m3x2.f16x2 e3, h3;\n"
+      "mov.b32 %0, {e0, e1};\nmov.b32 %1, {e2, e3};\n}"
+      : "=r"(d.x), "=r"(d.y)
+      : "r"(w), "r"(scale));
+  return d;
+}
+
+__device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint16_t x) {
+  uint32_t d;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(d) : "h"(x));
+  return d;
+}
+
+// four floats to four e4m3 bytes, a in the lowest byte
+__device__ __forceinline__ uint32_t pack_e4m3x4(float a, float b, float c, float d) {
+  uint32_t r;
+  asm("{\n.reg .b16 lo, hi;\ncvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\ncvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n}"
+      : "=r"(r)
+      : "f"(a), "f"(b), "f"(c), "f"(d));
+  return r;
+}
+
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool valid) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(smem)), "l"(gmem), "r"(valid ? 16 : 0));
 }
@@ -185,6 +228,46 @@ __device__ __forceinline__ void load_q(const Frag& f, const __nv_bfloat16* q_nop
   const uint2 p0 = *reinterpret_cast<const uint2*>(q_pe + row0 * KPE + f.pbase);
   const uint2 p1 = *reinterpret_cast<const uint2*>(q_pe + row1 * KPE + f.pbase);
   qpa[0] = p0.x, qpa[1] = p1.x, qpa[2] = p0.y, qpa[3] = p1.y;
+}
+
+// Masks tokens past L, then the online-softmax step. s[nb][e] holds the unscaled score of token t0 + 8nb + 2*t4 +
+// (e & 1) for row g (e < 2) or g + 8, and p on return. scale[r]: score scale of row g / g + 8 (log2 units).
+template <int NB>
+__device__ __forceinline__ void softmax_update(Acc& a, const Frag& f, float (&s)[NB][4], int t0, int L,
+                                               const float (&scale)[2]) {
+  if (t0 + 8 * NB > L)  // last (sub-)tile only (uniform across the CTA)
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        if (t0 + 8 * nb + 2 * f.t4 + (e & 1) >= L) s[nb][e] = -INFINITY;
+
+  // Lazy rescale (as in FlashAttention-4): keep a stale running max until a row's max grows by more than 8, so
+  // p = 2^(s - m) stays <= 256 (fine for fp32 l/o and bf16 or e4m3 P) and the o *= corr pass almost never runs.
+  float corr[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    float mx = fmaxf(s[0][2 * r], s[0][2 * r + 1]);
+#pragma unroll
+    for (int nb = 1; nb < NB; ++nb) mx = fmaxf(mx, fmaxf(s[nb][2 * r], s[nb][2 * r + 1]));
+    mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 1));
+    mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 2)) * scale[r];  // scores are unscaled until here
+    const bool grow = mx > a.m[r] + 8.f;  // always true on the first tile (m = -inf; token t0 is valid)
+    corr[r] = grow ? ex2(a.m[r] - mx) : 1.f;
+    a.m[r] = grow ? mx : a.m[r];
+    a.l[r] *= corr[r];
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+      for (int e = 2 * r; e < 2 * r + 2; ++e) a.l[r] += (s[nb][e] = ex2(fmaf(s[nb][e], scale[r], -a.m[r])));
+  }
+  if (__any_sync(~0u, corr[0] != 1.f || corr[1] != 1.f))
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) a.o[j][h][e] *= corr[e / 2];
 }
 
 // One 16-token sub-tile starting at t0. raw/s2/pe[nb] are this thread's bytes of token t0 + 8nb + g (zero if past
@@ -255,37 +338,7 @@ __device__ __forceinline__ void subtile(Acc& a, const Frag& f, const uint32_t (&
     }
     s[0][2 * r] = x.x, s[0][2 * r + 1] = x.y, s[1][2 * r] = x.z, s[1][2 * r + 1] = x.w;
   }
-  if (t0 + 16 > L)  // last sub-tile only (uniform across the CTA)
-#pragma unroll
-    for (int nb = 0; nb < 2; ++nb)
-#pragma unroll
-      for (int e = 0; e < 4; ++e)
-        if (t0 + 8 * nb + 2 * t4 + (e & 1) >= L) s[nb][e] = -INFINITY;
-
-  // Lazy rescale (as in FlashAttention-4): keep a stale running max until a row's max grows by more than 8, so
-  // p = 2^(s - m) stays <= 256 (fine for fp32 l/o and bf16 P) and the o *= corr pass almost never runs.
-  float corr[2];
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-    float mx = fmaxf(fmaxf(s[0][2 * r], s[0][2 * r + 1]), fmaxf(s[1][2 * r], s[1][2 * r + 1]));
-    mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 1));
-    mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 2)) * score_scale;  // scores are unscaled until here
-    const bool grow = mx > a.m[r] + 8.f;  // always true on the first sub-tile (m = -inf; token t0 is valid)
-    corr[r] = grow ? ex2(a.m[r] - mx) : 1.f;
-    a.m[r] = grow ? mx : a.m[r];
-    a.l[r] *= corr[r];
-#pragma unroll
-    for (int nb = 0; nb < 2; ++nb)
-#pragma unroll
-      for (int e = 2 * r; e < 2 * r + 2; ++e) a.l[r] += (s[nb][e] = ex2(fmaf(s[nb][e], score_scale, -a.m[r])));
-  }
-  if (__any_sync(~0u, corr[0] != 1.f || corr[1] != 1.f))
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-#pragma unroll
-      for (int h = 0; h < 2; ++h)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) a.o[j][h][e] *= corr[e / 2];
+  softmax_update(a, f, s, t0, L, {score_scale, score_scale});
 
   // QK accumulator layout of two n8 blocks == A fragment layout of one k16 step
   const uint32_t pa[4] = {pack_bf16x2(s[0][0], s[0][1]), pack_bf16x2(s[0][2], s[0][3]),
@@ -294,6 +347,161 @@ __device__ __forceinline__ void subtile(Acc& a, const Frag& f, const uint32_t (&
   for (int j = 0; j < 8; ++j)
 #pragma unroll
     for (int h = 0; h < 2; ++h) mma_bf16(a.o[j][h], pa, vb[0][j][h], vb[1][j][h]);
+}
+
+// ---- FP8 path
+
+// Q in e4m3 with one scale per row and part (latent / RoPE), the amax taken over all 4 warps through xchg (smem,
+// 4 x 16 x 2 floats). A fragment of k32-step j: thread t's channels cbase + 8j + {0..3} (a0, a1) and + {4..7} (a2,
+// a3); RoPE: channels pbase + {0..3} in a0/a1, the upper k half zero. The row scales fold into the score scale.
+struct QF8 {
+  uint32_t qa[4][4], qpa[4];
+  float scale[2], kpe_ratio[2];  // per row g / g + 8
+};
+
+__device__ __forceinline__ void load_q_fp8(const Frag& f, const __nv_bfloat16* q_nope, const __nv_bfloat16* q_pe,
+                                           size_t row0, size_t row1, float* xchg, float sm_scale_log2,
+                                           float ckv_scale, float kpe_scale, QF8& q) {
+  auto lo = [](uint32_t w) { return __uint_as_float(w << 16); };
+  auto hi = [](uint32_t w) { return __uint_as_float(w & 0xffff0000u); };
+  float qn[2][32], qp[2][4], an[2], ap[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const size_t row = r ? row1 : row0;
+    uint4 v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = reinterpret_cast<const uint4*>(q_nope + row * CKV + f.cbase)[i];
+    const uint32_t* w = &v[0].x;
+    an[r] = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      qn[r][2 * i] = lo(w[i]), qn[r][2 * i + 1] = hi(w[i]);
+      an[r] = fmaxf(an[r], fmaxf(fabsf(qn[r][2 * i]), fabsf(qn[r][2 * i + 1])));
+    }
+    const uint2 p = *reinterpret_cast<const uint2*>(q_pe + row * KPE + f.pbase);
+    qp[r][0] = lo(p.x), qp[r][1] = hi(p.x), qp[r][2] = lo(p.y), qp[r][3] = hi(p.y);
+    ap[r] = fmaxf(fmaxf(fabsf(qp[r][0]), fabsf(qp[r][1])), fmaxf(fabsf(qp[r][2]), fabsf(qp[r][3])));
+#pragma unroll
+    for (int o = 1; o <= 2; o *= 2) {
+      an[r] = fmaxf(an[r], __shfl_xor_sync(~0u, an[r], o));
+      ap[r] = fmaxf(ap[r], __shfl_xor_sync(~0u, ap[r], o));
+    }
+    if (f.t4 == 0) xchg[2 * (16 * f.w + f.g + 8 * r)] = an[r], xchg[2 * (16 * f.w + f.g + 8 * r) + 1] = ap[r];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+#pragma unroll
+    for (int ww = 0; ww < 4; ++ww)
+      an[r] = fmaxf(an[r], xchg[2 * (16 * ww + f.g + 8 * r)]), ap[r] = fmaxf(ap[r], xchg[2 * (16 * ww + f.g + 8 * r) + 1]);
+    an[r] = fmaxf(an[r], 1e-30f), ap[r] = fmaxf(ap[r], 1e-30f);  // all-zero rows quantize to zero
+    const float in = 448.f / an[r], ip = 448.f / ap[r];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float* x = &qn[r][8 * j];
+      q.qa[j][r] = pack_e4m3x4(x[0] * in, x[1] * in, x[2] * in, x[3] * in);
+      q.qa[j][2 + r] = pack_e4m3x4(x[4] * in, x[5] * in, x[6] * in, x[7] * in);
+    }
+    q.qpa[r] = pack_e4m3x4(qp[r][0] * ip, qp[r][1] * ip, qp[r][2] * ip, qp[r][3] * ip);
+    q.qpa[2 + r] = 0;
+    q.scale[r] = sm_scale_log2 * ckv_scale * (an[r] / 448.f);
+    q.kpe_ratio[r] = (ap[r] * kpe_scale) / (an[r] * ckv_scale);
+  }
+}
+
+// One 32-token tile starting at t0 (FP8 path). raw/s2/pe[nb] are this thread's bytes of token t0 + 8nb + g (zero if
+// past L). rb: the cross-warp reduction buffer (one per tile suffices: the tile loop's __syncthreads orders reuse).
+constexpr int RB_STRIDE = 36;  // floats per row: 32 tokens + 4 pad, so 8 threads' float4 stores cover all banks
+
+__device__ __forceinline__ void tile_fp8(Acc& a, const Frag& f, const QF8& q, const uint4 (&raw)[4],
+                                         const uint16_t (&s2)[4], const uint32_t (&pe)[4], int t0, int L,
+                                         float (*rb)[16][RB_STRIDE], uint64_t* bar) {
+  const int w = f.w, g = f.g, t4 = f.t4;
+  uint32_t kq[4][4][2];  // [token block nb][k-step j][a0/a2 half]: e4m3 of token 8nb + g, channels cbase + 8j + 4h..
+#pragma unroll
+  for (int nb = 0; nb < 4; ++nb) {
+    const uint32_t s01 = e4m3x2_to_f16x2(s2[nb]);
+    const uint32_t sc[2] = {__byte_perm(s01, 0, 0x1010), __byte_perm(s01, 0, 0x3232)};
+    const uint32_t* rw = &raw[nb].x;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {  // word j = channels cbase + 8j .. +8, scale block j / 2
+      const uint2 e = e2m1x8_to_e4m3x8(rw[j], sc[j / 2]);
+      kq[nb][j][0] = e.x, kq[nb][j][1] = e.y;
+    }
+  }
+
+  // QK: four independent accumulator chains per k-step. RoPE: the cache bytes are already e4m3.
+  float c[4][4] = {}, cp[4][4] = {}, s[4][4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int nb = 0; nb < 4; ++nb) mma_fp8(c[nb][0], c[nb][1], c[nb][2], c[nb][3], q.qa[j], kq[nb][j][0], kq[nb][j][1]);
+#pragma unroll
+  for (int nb = 0; nb < 4; ++nb) {
+    mma_fp8(cp[nb][0], cp[nb][1], cp[nb][2], cp[nb][3], q.qpa, pe[nb], 0u);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) s[nb][e] = c[nb][e] + q.kpe_ratio[e / 2] * cp[nb][e];
+  }
+
+  // Cross-warp sum: a thread's 8 values of a row are two float4 at 8 * t4.
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    float4* p = reinterpret_cast<float4*>(&rb[w][g + 8 * r][8 * t4]);
+    p[0] = make_float4(s[0][2 * r], s[0][2 * r + 1], s[1][2 * r], s[1][2 * r + 1]);
+    p[1] = make_float4(s[2][2 * r], s[2][2 * r + 1], s[3][2 * r], s[3][2 * r + 1]);
+  }
+  const uint64_t token = mbar_arrive(bar);
+
+  // PV B fragments, independent of P. PV k position 4t + i covers token 2t + i (i < 2) or 8 + 2t + i - 2 (the QK
+  // accumulator layout), +16 for the second register. movmatrix moves byte pairs (b16), so thread (g, t) receives
+  // tokens 8nb + 2t, 8nb + 2t + 1 of channel pair c0, c0 + 1 (c0 = 128w + 32(g/2) + 8j + 4h + 2(g%2)); a byte
+  // permute splits them into channel c0 (even block) and c0 + 1 (odd block).
+  uint32_t vb[4][2][2][2];  // [j][h][even/odd][b0/b1]
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      uint32_t x[4];
+#pragma unroll
+      for (int nb = 0; nb < 4; ++nb) x[nb] = movmatrix_trans(kq[nb][j][h]);
+#pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        vb[j][h][0][k] = __byte_perm(x[2 * k], x[2 * k + 1], 0x6420);
+        vb[j][h][1][k] = __byte_perm(x[2 * k], x[2 * k + 1], 0x7531);
+      }
+    }
+  mbar_wait(bar, token);
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    float4 x0 = make_float4(0.f, 0.f, 0.f, 0.f), x1 = x0;
+#pragma unroll
+    for (int ww = 0; ww < 4; ++ww) {  // own partial from registers; same summation order in every warp
+      const float4* p = reinterpret_cast<const float4*>(&rb[ww][g + 8 * r][8 * t4]);
+      const float4 y0 = ww == w ? make_float4(s[0][2 * r], s[0][2 * r + 1], s[1][2 * r], s[1][2 * r + 1]) : p[0];
+      const float4 y1 = ww == w ? make_float4(s[2][2 * r], s[2][2 * r + 1], s[3][2 * r], s[3][2 * r + 1]) : p[1];
+      if (ww == 0)
+        x0 = y0, x1 = y1;
+      else
+        x0.x += y0.x, x0.y += y0.y, x0.z += y0.z, x0.w += y0.w, x1.x += y1.x, x1.y += y1.y, x1.z += y1.z, x1.w += y1.w;
+    }
+    s[0][2 * r] = x0.x, s[0][2 * r + 1] = x0.y, s[1][2 * r] = x0.z, s[1][2 * r + 1] = x0.w;
+    s[2][2 * r] = x1.x, s[2][2 * r + 1] = x1.y, s[3][2 * r] = x1.z, s[3][2 * r + 1] = x1.w;
+  }
+  softmax_update(a, f, s, t0, L, q.scale);
+
+  // P as the A fragment in the permuted token order; e4m3 without scaling (p <= 256, l stays fp32).
+  const uint32_t pa[4] = {pack_e4m3x4(s[0][0], s[0][1], s[1][0], s[1][1]), pack_e4m3x4(s[0][2], s[0][3], s[1][2], s[1][3]),
+                          pack_e4m3x4(s[2][0], s[2][1], s[3][0], s[3][1]), pack_e4m3x4(s[2][2], s[2][3], s[3][2], s[3][3])};
+  // Output column n = 2t + e of block (j, h, eo) is channel cbase + 8j + 4h + 2e + eo: Acc slot [2j + h][e][eo (+2)].
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int eo = 0; eo < 2; ++eo) {
+        float(&o)[2][4] = a.o[2 * j + h];
+        mma_fp8(o[0][eo], o[1][eo], o[0][eo + 2], o[1][eo + 2], pa, vb[j][h][eo][0], vb[j][h][eo][1]);
+      }
 }
 
 __device__ __forceinline__ void store_out(Acc& a, const Frag& f, __nv_bfloat16* out, size_t row0, size_t row1,
@@ -347,7 +555,19 @@ struct Stage {
   uint8_t kpe[TILE][KPE];      // chunk c at c ^ ((r >> 1) & 3)
 };
 
-template <int STAGES>
+// smem after the stages: the cross-warp reduction buffers (BF16: one per 16-token sub-tile parity; FP8: one per tile),
+// then the mbarrier.
+template <bool FP8>
+constexpr int RED_FLOATS = FP8 ? 4 * 16 * RB_STRIDE : 2 * 4 * 16 * 16;
+
+__device__ __forceinline__ void read_token(const Stage& s, int r, const Frag& f, uint4& raw, uint16_t& s2, uint32_t& pe) {
+  const int c = f.cbase / 32;  // ckv chunk 4w + t4
+  raw = *reinterpret_cast<const uint4*>(&s.ckv[r][16 * (c ^ ((r & 1) << 2))]);
+  s2 = *reinterpret_cast<const uint16_t*>(&s.sf[r][16 * ((f.w / 2) ^ ((r >> 2) & 1)) + f.cbase / 16 % 16]);
+  pe = *reinterpret_cast<const uint32_t*>(&s.kpe[r][16 * (f.w ^ ((r >> 1) & 3)) + 4 * f.t4]);
+}
+
+template <int STAGES, bool FP8>
 __global__ void __launch_bounds__(128) mla_decode_kernel(
     const __nv_bfloat16* __restrict__ q_nope, const __nv_bfloat16* __restrict__ q_pe, const uint8_t* __restrict__ ckv,
     const uint8_t* __restrict__ sf, const uint8_t* __restrict__ kpe, const int* __restrict__ page_table,
@@ -362,8 +582,10 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
   const size_t row0 = size_t(b) * H + 16 * blockIdx.x + f.g, row1 = row0 + 8;
   extern __shared__ __align__(16) uint8_t smem[];
   Stage* st = reinterpret_cast<Stage*>(smem);
-  auto red = reinterpret_cast<float(*)[4][16][16]>(smem + STAGES * sizeof(Stage));
-  auto bar = reinterpret_cast<uint64_t*>(red + 2);
+  float* red_base = reinterpret_cast<float*>(smem + STAGES * sizeof(Stage));
+  auto red = reinterpret_cast<float(*)[4][16][16]>(red_base);
+  auto red8 = reinterpret_cast<float(*)[16][RB_STRIDE]>(red_base);
+  auto bar = reinterpret_cast<uint64_t*>(red_base + RED_FLOATS<FP8>);
   if (threadIdx.x == 0) mbar_init(bar, 128);
   __syncthreads();
 
@@ -385,7 +607,11 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
   };
 
   uint32_t qa[8][4], qpa[4];
-  load_q(f, q_nope, q_pe, row0, row1, qa, qpa);
+  QF8 q8;
+  if constexpr (FP8)
+    load_q_fp8(f, q_nope, q_pe, row0, row1, red_base, sm_scale_log2, ckv_scale, kpe_scale, q8);
+  else
+    load_q(f, q_nope, q_pe, row0, row1, qa, qpa);
   Acc a = {{}, {-INFINITY, -INFINITY}, {0.f, 0.f}};
 
 #pragma unroll
@@ -403,22 +629,26 @@ __global__ void __launch_bounds__(128) mla_decode_kernel(
     next_page = page_of(nxt + 1);
 
     const Stage& s = st[i % STAGES];
+    if constexpr (FP8) {
+      uint4 raw[4];
+      uint16_t s2[4];
+      uint32_t pe[4];
 #pragma unroll
-    for (int sub = 0; sub < TILE / 16; ++sub) {
-      uint4 raw[2];
-      uint16_t s2[2];
-      uint32_t pe[2];
+      for (int nb = 0; nb < 4; ++nb) read_token(s, 8 * nb + f.g, f, raw[nb], s2[nb], pe[nb]);
+      tile_fp8(a, f, q8, raw, s2, pe, t_beg + i * TILE, t_end, red8, bar);
+    } else {
 #pragma unroll
-      for (int nb = 0; nb < 2; ++nb) {
-        const int r = 16 * sub + 8 * nb + f.g, c = f.cbase / 32;  // ckv chunk 4w + t4
-        raw[nb] = *reinterpret_cast<const uint4*>(&s.ckv[r][16 * (c ^ ((r & 1) << 2))]);
-        s2[nb] = *reinterpret_cast<const uint16_t*>(&s.sf[r][16 * ((f.w / 2) ^ ((r >> 2) & 1)) + f.cbase / 16 % 16]);
-        pe[nb] = *reinterpret_cast<const uint32_t*>(&s.kpe[r][16 * (f.w ^ ((r >> 1) & 3)) + 4 * f.t4]);
+      for (int sub = 0; sub < TILE / 16; ++sub) {
+        uint4 raw[2];
+        uint16_t s2[2];
+        uint32_t pe[2];
+#pragma unroll
+        for (int nb = 0; nb < 2; ++nb) read_token(s, 16 * sub + 8 * nb + f.g, f, raw[nb], s2[nb], pe[nb]);
+        const int t0 = t_beg + i * TILE + 16 * sub;
+        if (t0 < t_end)  // uniform across the CTA
+          subtile(a, f, qa, qpa, raw, s2, pe, t0, t_end, red[(2 * i + sub) & 1], bar, sm_scale_log2 * ckv_scale,
+                  kpe_scale / ckv_scale);
       }
-      const int t0 = t_beg + i * TILE + 16 * sub;
-      if (t0 < t_end)  // uniform across the CTA
-        subtile(a, f, qa, qpa, raw, s2, pe, t0, t_end, red[(2 * i + sub) & 1], bar, sm_scale_log2 * ckv_scale,
-                kpe_scale / ckv_scale);
     }
   }
   if (o_part) {
@@ -482,7 +712,7 @@ void check_cache(const torch::Tensor& ckv, const torch::Tensor& sf, const torch:
   TORCH_CHECK(ckv.is_contiguous() && sf.is_contiguous() && kpe.is_contiguous(), "caches must be contiguous");
 }
 
-template <int STAGES>
+template <int STAGES, bool FP8>
 torch::Tensor decode_impl(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf,
                           torch::Tensor kpe, torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale,
                           double ckv_scale, double kpe_scale, int64_t max_kv_len, int64_t num_splits) {
@@ -504,8 +734,8 @@ torch::Tensor decode_impl(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tenso
   TORCH_CHECK((ps & (ps - 1)) == 0, "page_size must be a power of two");
   const at::cuda::OptionalCUDAGuard guard(ckv.device());
 
-  constexpr size_t smem = STAGES * sizeof(Stage) + 2 * 4 * 16 * 16 * sizeof(float) + sizeof(uint64_t);
-  auto kernel = mla_decode_kernel<STAGES>;
+  constexpr size_t smem = STAGES * sizeof(Stage) + RED_FLOATS<FP8> * sizeof(float) + sizeof(uint64_t);
+  auto kernel = mla_decode_kernel<STAGES, FP8>;
   // once per process, outside any CUDA-graph capture; ponytail: assumes one GPU model per process
   static const int wave = [&] {
     int dev, sms, per_sm;
@@ -563,11 +793,18 @@ torch::Tensor decode_impl(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tenso
 
 torch::Tensor decode(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf, torch::Tensor kpe,
                      torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale, double ckv_scale,
-                     double kpe_scale, int64_t max_kv_len, int64_t num_splits, int64_t stages) {
+                     double kpe_scale, int64_t max_kv_len, int64_t num_splits, int64_t stages, bool fp8) {
+  if (fp8) {
+    TORCH_CHECK(stages == 2 || stages == 3, "the FP8 path is built with 2 or 3 stages");
+    return stages == 2 ? decode_impl<2, true>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale,
+                                              kpe_scale, max_kv_len, num_splits)
+                       : decode_impl<3, true>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale,
+                                              kpe_scale, max_kv_len, num_splits);
+  }
   switch (stages) {
 #define CASE(S) \
-  case S: return decode_impl<S>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale, kpe_scale, \
-                                max_kv_len, num_splits);
+  case S: return decode_impl<S, false>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale, \
+                                       kpe_scale, max_kv_len, num_splits);
     CASE(2) CASE(3) CASE(4) CASE(6)
 #undef CASE
   }
