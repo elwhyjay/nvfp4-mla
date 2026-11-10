@@ -1,4 +1,4 @@
-// Step 0: achievable DRAM read BW (decode is read-only) and BF16 mma.sync peak.
+// Achievable DRAM read BW (decode is read-only) and BF16 mma.sync peak; see roofline.py.
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 

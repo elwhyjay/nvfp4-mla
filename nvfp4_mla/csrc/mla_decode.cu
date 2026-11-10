@@ -1,14 +1,42 @@
-// NVFP4 MLA dense decode over the flashinfer#4676 paged layout:
-//   ckv [pages, ps, 256] u8  E2M1 x2, low nibble = even channel
-//   sf  [pages, ps, 32]  e4m3 one scale per 16 channels
-//   kpe [pages, ps, 64]  e4m3
+// Dense MLA decode (q_len = 1) over the NVFP4 paged KV cache of flashinfer#4676:
+//   ckv_cache    [pages, page_size, 256] uint8   E2M1 x2, low nibble = even channel
+//   ckv_sf_cache [pages, page_size, 32]  e4m3    one scale per 16 channels
+//   kpe_cache    [pages, page_size, 64]  e4m3
 //   ckv = e2m1 * sf * ckv_scale, kpe = fp8 * kpe_scale
+//
+// CTA = (16-head group, request, KV split), 4 warps, BF16 mma.sync m16n8k16. Warp w owns ckv channels [128w, +128)
+// and kpe channels [16w, +16); thread (g = lane/4, t = lane%4) owns ckv [128w + 32t, +32) (two scale blocks) and kpe
+// [16w + 4t, +4). The QK reduction axis is permuted so that k-step j of thread t covers its channels 4j..4j+3, and Q
+// is loaded in the same permutation once: the A fragments of heads g and g+8 stay in registers.
+// Per 16-token sub-tile a thread dequantizes tokens g and 8+g into QK B fragments (cvt to bf16x2, then the block
+// scale on the operand, exact in bf16); after movmatrix.trans the same registers are the PV B fragments, so each
+// token is dequantized once. Partial scores (over a warp's channels) are summed across warps through smem.
+// KV tiles of 32 tokens stream through a cp.async pipeline; long contexts are split across CTAs and merged by
+// mla_combine.
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <torch/extension.h>
 
+#include <climits>
+#include <cmath>
+
 constexpr int CKV = 512, KPE = 64;
+
+// cvt.rn.bf16x2.{e2m1x2,e4m3x2} need PTX 9.2 (CUDA 13.2). Older toolkits (12.8+) convert through f16, which is exact
+// for these values but costs 3 more instructions per pair. NVFP4_MLA_COMPAT_CVT forces that path for testing.
+#if (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && \
+    !defined(NVFP4_MLA_COMPAT_CVT)
+#define NVFP4_MLA_BF16X2_CVT
+#endif
+
+template <typename T>
+const T* ptr(const torch::Tensor& t) {
+  return reinterpret_cast<const T*>(t.data_ptr());
+}
+
+// ---- scalar dequant (used by dequantize(); same multiply order as nvfp4_mla.testing so results are bitwise equal)
 
 __device__ __forceinline__ float e2m1_to_float(uint32_t c) {
   // e>0: (1 + m/2) * 2^(e-1) built directly as fp32 bits; e==0: m/2. No denormals, so -ftz safe.
@@ -22,7 +50,6 @@ __device__ __forceinline__ float e4m3_to_float(uint8_t x) {
   return float(f);
 }
 
-// 16 channels = one scale block. Same multiply order as ref.py so results are bitwise equal.
 __device__ __forceinline__ void dequant16(uint2 packed, uint8_t sf, float ckv_scale, float v[16]) {
   const float s = e4m3_to_float(sf);
 #pragma unroll
@@ -32,104 +59,45 @@ __device__ __forceinline__ void dequant16(uint2 packed, uint8_t sf, float ckv_sc
   }
 }
 
-// v1: CUDA-core fp32, accuracy only. CTA = (head, request); warps stride over tokens with their own online
-// softmax state; lane owns ckv channels [16*lane, +16) (exactly one scale block) and kpe channels [2*lane, +2).
-template <int WARPS>
-__global__ void mla_decode_v1(const __nv_bfloat16* __restrict__ q_nope, const __nv_bfloat16* __restrict__ q_pe,
-                              const uint8_t* __restrict__ ckv, const uint8_t* __restrict__ sf,
-                              const uint8_t* __restrict__ kpe, const int* __restrict__ page_table, int table_stride,
-                              const int* __restrict__ kv_lens, int page_size, float sm_scale, float ckv_scale,
-                              float kpe_scale, __nv_bfloat16* __restrict__ out) {
-  const int h = blockIdx.x, b = blockIdx.y, H = gridDim.x;
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const int L = kv_lens[b];
-  const size_t qo = (size_t(b) * H + h);
+// ---- PTX helpers
 
-  float qn[16], qp[2], acc[16] = {};
-#pragma unroll
-  for (int i = 0; i < 16; ++i) qn[i] = __bfloat162float(q_nope[qo * CKV + 16 * lane + i]);
-  qp[0] = __bfloat162float(q_pe[qo * KPE + 2 * lane]);
-  qp[1] = __bfloat162float(q_pe[qo * KPE + 2 * lane + 1]);
-
-  float m = -INFINITY, l = 0.f;
-  for (int t = warp; t < L; t += WARPS) {
-    const size_t tok = size_t(page_table[b * table_stride + t / page_size]) * page_size + t % page_size;
-    float v[16];
-    dequant16(reinterpret_cast<const uint2*>(ckv + tok * (CKV / 2))[lane], sf[tok * (CKV / 16) + lane], ckv_scale, v);
-    float d = qp[0] * e4m3_to_float(kpe[tok * KPE + 2 * lane]) * kpe_scale +
-              qp[1] * e4m3_to_float(kpe[tok * KPE + 2 * lane + 1]) * kpe_scale;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) d += qn[i] * v[i];
-#pragma unroll
-    for (int o = 16; o; o /= 2) d += __shfl_xor_sync(~0u, d, o);
-    const float s = d * sm_scale, m_new = fmaxf(m, s);
-    const float corr = expf(m - m_new), p = expf(s - m_new);
-    l = l * corr + p;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) acc[i] = acc[i] * corr + p * v[i];
-    m = m_new;
-  }
-
-  __shared__ float sm_m[WARPS], sm_l[WARPS], sm_acc[WARPS][CKV];
-  if (lane == 0) sm_m[warp] = m, sm_l[warp] = l;
-#pragma unroll
-  for (int i = 0; i < 16; ++i) sm_acc[warp][16 * lane + i] = acc[i];
-  __syncthreads();
-  float M = -INFINITY;
-  for (int w = 0; w < WARPS; ++w) M = fmaxf(M, sm_m[w]);
-  float denom = 0.f, wt[WARPS];
-  for (int w = 0; w < WARPS; ++w) denom += sm_l[w] * (wt[w] = M == -INFINITY ? 0.f : expf(sm_m[w] - M));
-  for (int c = threadIdx.x; c < CKV; c += blockDim.x) {
-    float o = 0.f;
-    for (int w = 0; w < WARPS; ++w) o += sm_acc[w][c] * wt[w];
-    out[qo * CKV + c] = __float2bfloat16(denom > 0.f ? o / denom : 0.f);
-  }
+#ifndef NVFP4_MLA_BF16X2_CVT
+__device__ __forceinline__ uint32_t f16x2_to_bf16x2(uint32_t h) {
+  uint32_t d;
+  asm("{\n.reg .b16 lo, hi;\n.reg .f32 a, b;\nmov.b32 {lo, hi}, %1;\ncvt.f32.f16 a, lo;\ncvt.f32.f16 b, hi;\n"
+      "cvt.rn.bf16x2.f32 %0, b, a;\n}"
+      : "=r"(d)
+      : "r"(h));
+  return d;
 }
-
-template <typename T>
-const T* ptr(const torch::Tensor& t) {
-  return reinterpret_cast<const T*>(t.data_ptr());
-}
-
-torch::Tensor decode_v1(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf,
-                        torch::Tensor kpe, torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale,
-                        double ckv_scale, double kpe_scale) {
-  const int B = q_nope.size(0), H = q_nope.size(1);
-  TORCH_CHECK(q_nope.is_contiguous() && q_pe.is_contiguous() && page_table.is_contiguous());
-  TORCH_CHECK(ckv.size(2) == CKV / 2 && sf.size(2) == CKV / 16 && kpe.size(2) == KPE);
-  auto out = torch::empty({B, H, CKV}, q_nope.options());
-  constexpr int WARPS = 4;
-  mla_decode_v1<WARPS><<<dim3(H, B), 32 * WARPS, 0, at::cuda::getCurrentCUDAStream()>>>(
-      ptr<__nv_bfloat16>(q_nope), ptr<__nv_bfloat16>(q_pe), ptr<uint8_t>(ckv), ptr<uint8_t>(sf), ptr<uint8_t>(kpe),
-      page_table.data_ptr<int>(), page_table.size(1), kv_lens.data_ptr<int>(), ckv.size(1), sm_scale, ckv_scale,
-      kpe_scale, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// v2: BF16 mma.sync m16n8k16 + register dequant, single stage (loads go straight to registers).
-//
-// CTA = (16-head group, request), 4 warps. Warp w owns ckv channels [128w, +128) and kpe channels [16w, +16);
-// thread (g = lane/4, t = lane%4) owns ckv [128w + 32t, +32) (= 2 scale blocks) and kpe [16w + 4t, +4).
-// QK: the reduction axis is permuted so that k-step j of thread t covers its channels 4j..4j+3; Q is loaded in
-// the same permutation once, so the A fragments (heads g, g+8) never leave registers.
-// Per 16-token sub-tile, thread loads tokens g and 8+g (16 B ckv + 2 B scales + 4 B kpe each), dequantizes into
-// QK B fragments, and the same registers become PV B fragments after movmatrix.trans (8 tokens x 8 channels).
-// Partial scores (over the warp's channels) are summed across warps through smem.
-// PV output lands on the thread's own 32 channels for heads g and g+8.
+#endif
 
 __device__ __forceinline__ void e2m1x8_to_bf16x8(uint32_t w, uint32_t (&o)[4]) {
+#ifdef NVFP4_MLA_BF16X2_CVT
   asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
       "cvt.rn.bf16x2.e2m1x2 %0, b0;\ncvt.rn.bf16x2.e2m1x2 %1, b1;\n"
       "cvt.rn.bf16x2.e2m1x2 %2, b2;\ncvt.rn.bf16x2.e2m1x2 %3, b3;\n}"
       : "=r"(o[0]), "=r"(o[1]), "=r"(o[2]), "=r"(o[3])
       : "r"(w));
+#else
+  asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\n"
+      "cvt.rn.f16x2.e2m1x2 %2, b2;\ncvt.rn.f16x2.e2m1x2 %3, b3;\n}"
+      : "=r"(o[0]), "=r"(o[1]), "=r"(o[2]), "=r"(o[3])
+      : "r"(w));
+#pragma unroll
+  for (int i = 0; i < 4; ++i) o[i] = f16x2_to_bf16x2(o[i]);
+#endif
 }
 
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t x) {
   uint32_t d;
+#ifdef NVFP4_MLA_BF16X2_CVT
   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(d) : "h"(x));
+#else
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(d) : "h"(x));
+  d = f16x2_to_bf16x2(d);
+#endif
   return d;
 }
 
@@ -145,10 +113,34 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
   return d;
 }
 
+// volatile: keeps the transposes between mbar_arrive and mbar_wait, where they hide the barrier latency
 __device__ __forceinline__ uint32_t movmatrix_trans(uint32_t x) {
   uint32_t d;
-  asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;" : "=r"(d) : "r"(x));
+  asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;" : "=r"(d) : "r"(x));
   return d;
+}
+
+// Split arrive/wait barrier (mbarrier: arrive releases, try_wait acquires) over the CTA's 128 threads.
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ void mbar_init(uint64_t* bar, int count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count) : "memory");
+}
+__device__ __forceinline__ uint64_t mbar_arrive(uint64_t* bar) {
+  uint64_t state;
+  asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];" : "=l"(state) : "r"(smem_u32(bar)) : "memory");
+  return state;
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint64_t state) {
+  asm volatile(
+      "{\n.reg .pred p;\nWAIT:\nmbarrier.try_wait.shared::cta.b64 p, [%0], %1;\n@!p bra WAIT;\n}" ::"r"(smem_u32(bar)),
+      "l"(state)
+      : "memory");
+}
+
+__device__ __forceinline__ float ex2(float x) {  // exp2f adds denormal handling around MUFU.EX2; scores never need it
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
 }
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -156,6 +148,15 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], 
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool valid) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(smem)), "l"(gmem), "r"(valid ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+// ---- per-thread state and the 16-token step
 
 struct Acc {
   float o[8][2][4];  // [k-step j][half][c]: channels cbase + 4j + 2*half + {0,1}, heads g (c0,c1) / g+8 (c2,c3)
@@ -186,12 +187,12 @@ __device__ __forceinline__ void load_q(const Frag& f, const __nv_bfloat16* q_nop
   qpa[0] = p0.x, qpa[1] = p1.x, qpa[2] = p0.y, qpa[3] = p1.y;
 }
 
-// One 16-token sub-tile starting at t0. raw/s2/pe[nb] are this thread's bytes of token t0 + 8nb + g (zero if
-// past L). rb: this sub-tile's cross-warp reduction buffer. Contains one __syncthreads.
+// One 16-token sub-tile starting at t0. raw/s2/pe[nb] are this thread's bytes of token t0 + 8nb + g (zero if past
+// L). rb: this sub-tile's cross-warp reduction buffer; bar: the CTA barrier guarding it.
 __device__ __forceinline__ void subtile(Acc& a, const Frag& f, const uint32_t (&qa)[8][4], const uint32_t (&qpa)[4],
                                         const uint4 (&raw)[2], const uint16_t (&s2)[2], const uint32_t (&pe)[2],
-                                        int t0, int L, float (*rb)[16][24], float sm_scale_log2, float ckv_scale,
-                                        float kpe_scale) {
+                                        int t0, int L, float (*rb)[16][16], uint64_t* bar, float score_scale,
+                                        float kpe_ratio) {
   const int w = f.w, g = f.g, t4 = f.t4;
   uint32_t kb[2][8][2], kpb[2][2];
 #pragma unroll
@@ -212,56 +213,79 @@ __device__ __forceinline__ void subtile(Acc& a, const Frag& f, const uint32_t (&
     kpb[nb][1] = e4m3x2_to_bf16x2(pe[nb] >> 16);
   }
 
-  float s[2][4];
+  // QK: the two n8 blocks' accumulator chains interleave, so dependent HMMAs don't stall back to back
+  float c[2][4] = {}, cp[2][4] = {}, s[2][4];
+#pragma unroll
+  for (int j = 0; j < 8; ++j)
+#pragma unroll
+    for (int nb = 0; nb < 2; ++nb) mma_bf16(c[nb], qa[j], kb[nb][j][0], kb[nb][j][1]);
 #pragma unroll
   for (int nb = 0; nb < 2; ++nb) {
-    float c[4] = {}, cp[4] = {};
+    mma_bf16(cp[nb], qpa, kpb[nb][0], kpb[nb][1]);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) mma_bf16(c, qa[j], kb[nb][j][0], kb[nb][j][1]);
-    mma_bf16(cp, qpa, kpb[nb][0], kpb[nb][1]);
-#pragma unroll
-    for (int e = 0; e < 4; ++e) s[nb][e] = ckv_scale * c[e] + kpe_scale * cp[e];
+    for (int e = 0; e < 4; ++e) s[nb][e] = c[nb][e] + kpe_ratio * cp[nb][e];
   }
 
+  // Cross-warp sum of the partial scores. Row = head; a thread's 4 values of a row (n-block 0 then 1) are one float4
+  // at 4 * t4, so a quarter warp covers two adjacent 64 B rows: conflict free.
 #pragma unroll
-  for (int nb = 0; nb < 2; ++nb) {
-    *reinterpret_cast<float2*>(&rb[w][g][8 * nb + 2 * t4]) = make_float2(s[nb][0], s[nb][1]);
-    *reinterpret_cast<float2*>(&rb[w][g + 8][8 * nb + 2 * t4]) = make_float2(s[nb][2], s[nb][3]);
-  }
-  __syncthreads();
+  for (int r = 0; r < 2; ++r)
+    *reinterpret_cast<float4*>(&rb[w][g + 8 * r][4 * t4]) =
+        make_float4(s[0][2 * r], s[0][2 * r + 1], s[1][2 * r], s[1][2 * r + 1]);
+  const uint64_t token = mbar_arrive(bar);
+  uint32_t vb[2][8][2];  // PV B fragments; independent of P, so they fill the wait for the other warps
 #pragma unroll
   for (int nb = 0; nb < 2; ++nb)
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      float2 x = make_float2(0.f, 0.f);
+    for (int j = 0; j < 8; ++j)
 #pragma unroll
-      for (int ww = 0; ww < 4; ++ww) {
-        const float2 y = *reinterpret_cast<const float2*>(&rb[ww][g + 8 * r][8 * nb + 2 * t4]);
-        x.x += y.x, x.y += y.y;
-      }
-      const int t = t0 + 8 * nb + 2 * t4;
-      s[nb][2 * r] = t < L ? x.x * sm_scale_log2 : -INFINITY;
-      s[nb][2 * r + 1] = t + 1 < L ? x.y * sm_scale_log2 : -INFINITY;
+      for (int h = 0; h < 2; ++h) vb[nb][j][h] = movmatrix_trans(kb[nb][j][h]);
+  mbar_wait(bar, token);
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+    for (int ww = 0; ww < 4; ++ww) {  // own partial from registers; same summation order in every warp
+      const float4 y = ww == w ? make_float4(s[0][2 * r], s[0][2 * r + 1], s[1][2 * r], s[1][2 * r + 1])
+                               : *reinterpret_cast<const float4*>(&rb[ww][g + 8 * r][4 * t4]);
+      if (ww == 0)
+        x = y;
+      else
+        x.x += y.x, x.y += y.y, x.z += y.z, x.w += y.w;
     }
+    s[0][2 * r] = x.x, s[0][2 * r + 1] = x.y, s[1][2 * r] = x.z, s[1][2 * r + 1] = x.w;
+  }
+  if (t0 + 16 > L)  // last sub-tile only (uniform across the CTA)
+#pragma unroll
+    for (int nb = 0; nb < 2; ++nb)
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        if (t0 + 8 * nb + 2 * t4 + (e & 1) >= L) s[nb][e] = -INFINITY;
 
+  // Lazy rescale (as in FlashAttention-4): keep a stale running max until a row's max grows by more than 8, so
+  // p = 2^(s - m) stays <= 256 (fine for fp32 l/o and bf16 P) and the o *= corr pass almost never runs.
+  float corr[2];
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     float mx = fmaxf(fmaxf(s[0][2 * r], s[0][2 * r + 1]), fmaxf(s[1][2 * r], s[1][2 * r + 1]));
     mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 1));
-    mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 2));
-    const float mn = fmaxf(a.m[r], mx);  // finite: token t0 is always valid
-    const float corr = exp2f(a.m[r] - mn);
-    a.m[r] = mn;
-    a.l[r] *= corr;
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-#pragma unroll
-      for (int h = 0; h < 2; ++h) a.o[j][h][2 * r] *= corr, a.o[j][h][2 * r + 1] *= corr;
+    mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, 2)) * score_scale;  // scores are unscaled until here
+    const bool grow = mx > a.m[r] + 8.f;  // always true on the first sub-tile (m = -inf; token t0 is valid)
+    corr[r] = grow ? ex2(a.m[r] - mx) : 1.f;
+    a.m[r] = grow ? mx : a.m[r];
+    a.l[r] *= corr[r];
 #pragma unroll
     for (int nb = 0; nb < 2; ++nb)
 #pragma unroll
-      for (int e = 2 * r; e < 2 * r + 2; ++e) a.l[r] += (s[nb][e] = exp2f(s[nb][e] - mn));
+      for (int e = 2 * r; e < 2 * r + 2; ++e) a.l[r] += (s[nb][e] = ex2(fmaf(s[nb][e], score_scale, -a.m[r])));
   }
+  if (__any_sync(~0u, corr[0] != 1.f || corr[1] != 1.f))
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) a.o[j][h][e] *= corr[e / 2];
 
   // QK accumulator layout of two n8 blocks == A fragment layout of one k16 step
   const uint32_t pa[4] = {pack_bf16x2(s[0][0], s[0][1]), pack_bf16x2(s[0][2], s[0][3]),
@@ -269,7 +293,7 @@ __device__ __forceinline__ void subtile(Acc& a, const Frag& f, const uint32_t (&
 #pragma unroll
   for (int j = 0; j < 8; ++j)
 #pragma unroll
-    for (int h = 0; h < 2; ++h) mma_bf16(a.o[j][h], pa, movmatrix_trans(kb[0][j][h]), movmatrix_trans(kb[1][j][h]));
+    for (int h = 0; h < 2; ++h) mma_bf16(a.o[j][h], pa, vb[0][j][h], vb[1][j][h]);
 }
 
 __device__ __forceinline__ void store_out(Acc& a, const Frag& f, __nv_bfloat16* out, size_t row0, size_t row1,
@@ -291,38 +315,6 @@ __device__ __forceinline__ void store_out(Acc& a, const Frag& f, __nv_bfloat16* 
   }
 }
 
-__global__ void __launch_bounds__(128) mla_decode_v2(
-    const __nv_bfloat16* __restrict__ q_nope, const __nv_bfloat16* __restrict__ q_pe, const uint8_t* __restrict__ ckv,
-    const uint8_t* __restrict__ sf, const uint8_t* __restrict__ kpe, const int* __restrict__ page_table,
-    int table_stride, const int* __restrict__ kv_lens, int page_size, int H, float sm_scale_log2, float ckv_scale,
-    float kpe_scale, __nv_bfloat16* __restrict__ out) {
-  const Frag f;
-  const int b = blockIdx.y, L = kv_lens[b];
-  const size_t row0 = size_t(b) * H + 16 * blockIdx.x + f.g, row1 = row0 + 8;
-  uint32_t qa[8][4], qpa[4];
-  load_q(f, q_nope, q_pe, row0, row1, qa, qpa);
-  Acc a = {{}, {-INFINITY, -INFINITY}, {0.f, 0.f}};
-  __shared__ float red[2][4][16][24];  // [parity][warp][head][token]; row stride 24 avoids bank conflicts
-
-  for (int t0 = 0, it = 0; t0 < L; t0 += 16, ++it) {
-    uint4 raw[2] = {};
-    uint16_t s2[2] = {};
-    uint32_t pe[2] = {};
-#pragma unroll
-    for (int nb = 0; nb < 2; ++nb) {
-      const int t = t0 + 8 * nb + f.g;
-      if (t < L) {  // never touch slots past kv_len: they may hold NaN scales
-        const size_t tok = size_t(page_table[b * table_stride + t / page_size]) * page_size + t % page_size;
-        raw[nb] = *reinterpret_cast<const uint4*>(ckv + tok * (CKV / 2) + f.cbase / 2);
-        s2[nb] = *reinterpret_cast<const uint16_t*>(sf + tok * (CKV / 16) + f.cbase / 16);
-        pe[nb] = *reinterpret_cast<const uint32_t*>(kpe + tok * KPE + f.pbase);
-      }
-    }
-    subtile(a, f, qa, qpa, raw, s2, pe, t0, L, red[it & 1], sm_scale_log2, ckv_scale, kpe_scale);  // 2 buffers: 1 barrier/sub-tile
-  }
-  store_out(a, f, out, row0, row1, ckv_scale);
-}
-
 // Split-KV partial: o normalized by its own l (fp32), lse in log2 units (the kernel's score scale).
 __device__ __forceinline__ void store_partial(Acc& a, const Frag& f, float* o_part, float* lse_part, size_t row0,
                                               size_t row1, float ckv_scale) {
@@ -340,54 +332,49 @@ __device__ __forceinline__ void store_partial(Acc& a, const Frag& f, float* o_pa
   }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// v3: v2's math + cp.async multi-stage pipeline of T-token tiles in smem.
-// Copy: 4 threads per token (T = 32 tokens x 4 = 128 threads); thread p copies ckv chunks {p, 4+p, 8+p, 12+p}
+// ---- pipelined kernel
+// Copy: 4 threads per token (TILE = 32 tokens x 4 = 128 threads); thread p copies ckv chunks {p, 4+p, 8+p, 12+p}
 // (each instruction covers 64 contiguous bytes per token), sf chunk p (p < 2), kpe chunk p. So each thread needs one
-// page id per tile, fetched one tile ahead. Tokens past L are zero-filled (src-size 0), never read.
-// smem rows are XOR-swizzled at 16 B granularity so the per-thread fragment reads are bank-conflict free.
+// page id per tile, fetched one tile ahead. Tokens past the split end are zero-filled (src-size 0), never read: slots
+// past kv_len may hold NaN scales. smem rows are XOR-swizzled at 16 B granularity so the per-thread fragment reads
+// are bank-conflict free.
 
-constexpr int V3_T = 32;
-
-__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool valid) {
-  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 16 : 0));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
-template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+constexpr int TILE = 32;
 
 struct Stage {
-  uint8_t ckv[V3_T][CKV / 2];  // chunk c of row r at c ^ ((r & 1) << 2)
-  uint8_t sf[V3_T][CKV / 16];  // chunk c at c ^ ((r >> 2) & 1)
-  uint8_t kpe[V3_T][KPE];      // chunk c at c ^ ((r >> 1) & 3)
+  uint8_t ckv[TILE][CKV / 2];  // chunk c of row r at c ^ ((r & 1) << 2)
+  uint8_t sf[TILE][CKV / 16];  // chunk c at c ^ ((r >> 2) & 1)
+  uint8_t kpe[TILE][KPE];      // chunk c at c ^ ((r >> 1) & 3)
 };
 
 template <int STAGES>
-__global__ void __launch_bounds__(128) mla_decode_v3(
+__global__ void __launch_bounds__(128) mla_decode_kernel(
     const __nv_bfloat16* __restrict__ q_nope, const __nv_bfloat16* __restrict__ q_pe, const uint8_t* __restrict__ ckv,
     const uint8_t* __restrict__ sf, const uint8_t* __restrict__ kpe, const int* __restrict__ page_table,
-    int table_stride, const int* __restrict__ kv_lens, int page_size, int H, float sm_scale_log2, float ckv_scale,
+    int table_stride, const int* __restrict__ kv_lens, int page_shift, int H, float sm_scale_log2, float ckv_scale,
     float kpe_scale, __nv_bfloat16* __restrict__ out, int chunk, float* __restrict__ o_part,
     float* __restrict__ lse_part) {
   const Frag f;
   const int b = blockIdx.y;
-  // v4 split-KV: CTA z covers tokens [t_beg, t_end); chunk is a multiple of V3_T. Empty splits write lse = -inf.
+  // CTA z covers tokens [t_beg, t_end); chunk is a multiple of TILE. Empty splits write lse = -inf.
   const int t_beg = blockIdx.z * chunk, t_end = min(kv_lens[b], t_beg + chunk);
   const int* pt = page_table + size_t(b) * table_stride;
   const size_t row0 = size_t(b) * H + 16 * blockIdx.x + f.g, row1 = row0 + 8;
   extern __shared__ __align__(16) uint8_t smem[];
   Stage* st = reinterpret_cast<Stage*>(smem);
-  auto red = reinterpret_cast<float(*)[4][16][24]>(smem + STAGES * sizeof(Stage));
+  auto red = reinterpret_cast<float(*)[4][16][16]>(smem + STAGES * sizeof(Stage));
+  auto bar = reinterpret_cast<uint64_t*>(red + 2);
+  if (threadIdx.x == 0) mbar_init(bar, 128);
+  __syncthreads();
 
-  const int ntiles = t_end > t_beg ? (t_end - t_beg + V3_T - 1) / V3_T : 0;
+  const int ntiles = t_end > t_beg ? (t_end - t_beg + TILE - 1) / TILE : 0;
   const int cr = threadIdx.x / 4, cp = threadIdx.x % 4;  // copy role: token row, part
-  auto page_of = [&](int tile) { const int t = t_beg + tile * V3_T + cr; return t < t_end ? pt[t / page_size] : 0; };
+  auto page_of = [&](int tile) { const int t = t_beg + tile * TILE + cr; return t < t_end ? pt[t >> page_shift] : 0; };
   auto issue = [&](int tile, int page) {
     Stage& s = st[tile % STAGES];
-    const int t = t_beg + tile * V3_T + cr;
+    const int t = t_beg + tile * TILE + cr;
     const bool ok = t < t_end;
-    const size_t tok = size_t(page) * page_size + t % page_size;
+    const size_t tok = (size_t(page) << page_shift) | (t & ((1 << page_shift) - 1));
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       const int c = 4 * k + cp;
@@ -417,7 +404,7 @@ __global__ void __launch_bounds__(128) mla_decode_v3(
 
     const Stage& s = st[i % STAGES];
 #pragma unroll
-    for (int sub = 0; sub < V3_T / 16; ++sub) {
+    for (int sub = 0; sub < TILE / 16; ++sub) {
       uint4 raw[2];
       uint16_t s2[2];
       uint32_t pe[2];
@@ -428,9 +415,10 @@ __global__ void __launch_bounds__(128) mla_decode_v3(
         s2[nb] = *reinterpret_cast<const uint16_t*>(&s.sf[r][16 * ((f.w / 2) ^ ((r >> 2) & 1)) + f.cbase / 16 % 16]);
         pe[nb] = *reinterpret_cast<const uint32_t*>(&s.kpe[r][16 * (f.w ^ ((r >> 1) & 3)) + 4 * f.t4]);
       }
-      const int t0 = t_beg + i * V3_T + 16 * sub;
+      const int t0 = t_beg + i * TILE + 16 * sub;
       if (t0 < t_end)  // uniform across the CTA
-        subtile(a, f, qa, qpa, raw, s2, pe, t0, t_end, red[(2 * i + sub) & 1], sm_scale_log2, ckv_scale, kpe_scale);
+        subtile(a, f, qa, qpa, raw, s2, pe, t0, t_end, red[(2 * i + sub) & 1], bar, sm_scale_log2 * ckv_scale,
+                kpe_scale / ckv_scale);
     }
   }
   if (o_part) {
@@ -478,19 +466,47 @@ __global__ void __launch_bounds__(128) mla_combine(const float* __restrict__ o_p
       make_uint2(pack_bf16x2(acc.x * s, acc.y * s), pack_bf16x2(acc.z * s, acc.w * s));
 }
 
-// num_splits = 0: enough CTAs for one full wave, at least 256 tokens per split. max_kv_len comes from the caller
-// (as in FlashInfer's plan) to avoid a device sync.
-torch::Tensor decode_v4(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf,
-                        torch::Tensor kpe, torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale,
-                        double ckv_scale, double kpe_scale, int64_t max_kv_len, int64_t num_splits) {
+// ---- host
+
+void check_cache(const torch::Tensor& ckv, const torch::Tensor& sf, const torch::Tensor& kpe) {
+  TORCH_CHECK(ckv.is_cuda() && sf.device() == ckv.device() && kpe.device() == ckv.device(),
+              "caches must be on the same CUDA device");
+  TORCH_CHECK(ckv.scalar_type() == at::kByte, "ckv_cache must be uint8 (packed E2M1)");
+  TORCH_CHECK(sf.scalar_type() == at::kFloat8_e4m3fn && kpe.scalar_type() == at::kFloat8_e4m3fn,
+              "ckv_sf_cache and kpe_cache must be float8_e4m3fn");
+  TORCH_CHECK(ckv.dim() == 3 && ckv.size(2) == CKV / 2, "ckv_cache must be [pages, page_size, 256]");
+  TORCH_CHECK(sf.dim() == 3 && sf.size(2) == CKV / 16, "ckv_sf_cache must be [pages, page_size, 32]");
+  TORCH_CHECK(kpe.dim() == 3 && kpe.size(2) == KPE, "kpe_cache must be [pages, page_size, 64]");
+  TORCH_CHECK(sf.sizes().slice(0, 2) == ckv.sizes().slice(0, 2) && kpe.sizes().slice(0, 2) == ckv.sizes().slice(0, 2),
+              "ckv_cache, ckv_sf_cache and kpe_cache must have the same [pages, page_size]");
+  TORCH_CHECK(ckv.is_contiguous() && sf.is_contiguous() && kpe.is_contiguous(), "caches must be contiguous");
+}
+
+template <int STAGES>
+torch::Tensor decode_impl(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf,
+                          torch::Tensor kpe, torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale,
+                          double ckv_scale, double kpe_scale, int64_t max_kv_len, int64_t num_splits) {
+  check_cache(ckv, sf, kpe);
+  TORCH_CHECK(q_nope.dim() == 3 && q_nope.size(2) == CKV, "q_nope must be [batch, heads, 512]");
   const int B = q_nope.size(0), H = q_nope.size(1);
+  TORCH_CHECK(q_pe.dim() == 3 && q_pe.size(0) == B && q_pe.size(1) == H && q_pe.size(2) == KPE,
+              "q_pe must be [batch, heads, 64]");
+  TORCH_CHECK(q_nope.scalar_type() == at::kBFloat16 && q_pe.scalar_type() == at::kBFloat16, "q must be bfloat16");
   TORCH_CHECK(H % 16 == 0, "heads must be a multiple of 16");
-  TORCH_CHECK(q_nope.is_contiguous() && q_pe.is_contiguous() && page_table.is_contiguous());
-  TORCH_CHECK(ckv.size(2) == CKV / 2 && sf.size(2) == CKV / 16 && kpe.size(2) == KPE);
-  constexpr int STAGES = 3;
-  constexpr size_t smem = STAGES * sizeof(Stage) + 2 * 4 * 16 * 24 * sizeof(float);
-  auto kernel = mla_decode_v3<STAGES>;
-  // once per process, outside any CUDA-graph capture; ponytail: assumes a single device per process
+  TORCH_CHECK(page_table.dim() == 2 && page_table.size(0) == B && page_table.scalar_type() == at::kInt,
+              "page_table must be int32 [batch, max_pages]");
+  TORCH_CHECK(kv_lens.dim() == 1 && kv_lens.size(0) == B && kv_lens.scalar_type() == at::kInt,
+              "kv_lens must be int32 [batch]");
+  for (const auto* t : {&q_nope, &q_pe, &page_table, &kv_lens})
+    TORCH_CHECK(t->device() == ckv.device() && t->is_contiguous(), "inputs must be contiguous and on the cache device");
+  TORCH_CHECK(ckv_scale > 0 && kpe_scale > 0, "ckv_scale and kpe_scale must be positive");
+  const int ps = ckv.size(1), page_shift = __builtin_ctz(ps);
+  TORCH_CHECK((ps & (ps - 1)) == 0, "page_size must be a power of two");
+  const at::cuda::OptionalCUDAGuard guard(ckv.device());
+
+  constexpr size_t smem = STAGES * sizeof(Stage) + 2 * 4 * 16 * 16 * sizeof(float) + sizeof(uint64_t);
+  auto kernel = mla_decode_kernel<STAGES>;
+  // once per process, outside any CUDA-graph capture; ponytail: assumes one GPU model per process
   static const int wave = [&] {
     int dev, sms, per_sm;
     C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
@@ -503,10 +519,24 @@ torch::Tensor decode_v4(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor 
   auto round_up = [](int x, int m) { return (x + m - 1) / m * m; };
   int chunk;
   if (num_splits > 0) {
-    chunk = round_up((max_len + num_splits - 1) / num_splits, V3_T);
+    chunk = round_up((max_len + num_splits - 1) / num_splits, TILE);
   } else {
-    const int ctas = B * H / 16, splits = std::max(1, wave / ctas);
-    chunk = std::max(256, round_up((max_len + splits - 1) / splits, V3_T));
+    // Minimize waves x (chunk + C0), C0 = per-CTA fixed cost (Q load, pipeline fill) in tokens: a split whose CTAs
+    // leave the last wave half empty is slower than more, shorter splits. Chunks stay >= sqrt(L): a CTA's time grows
+    // with chunk and combine's with L / chunk, so their sum is smallest near sqrt(L). Both fitted to split sweeps
+    // on RTX PRO 6000 and B200 (H 16/128, B 1-64, 1K-64K tokens).
+    constexpr int C0 = 256;
+    const long ctas = B * H / 16;
+    const int min_chunk = round_up(std::max<int>(std::sqrt(max_len), 1), TILE);
+    long best = LONG_MAX;
+    chunk = round_up(max_len, TILE);
+    for (int s = 1;; ++s) {
+      const int c = round_up((max_len + s - 1) / s, TILE);
+      if (s > 1 && c < min_chunk) break;
+      const long waves = (ctas * ((max_len + c - 1) / c) + wave - 1) / wave, cost = waves * (c + C0);
+      if (cost < best) best = cost, chunk = c;
+      if (c == TILE) break;
+    }
   }
   const int splits = (max_len + chunk - 1) / chunk;
 
@@ -519,44 +549,33 @@ torch::Tensor decode_v4(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor 
   auto stream = at::cuda::getCurrentCUDAStream();
   kernel<<<dim3(H / 16, B, splits), 128, smem, stream>>>(
       ptr<__nv_bfloat16>(q_nope), ptr<__nv_bfloat16>(q_pe), ptr<uint8_t>(ckv), ptr<uint8_t>(sf), ptr<uint8_t>(kpe),
-      page_table.data_ptr<int>(), page_table.size(1), kv_lens.data_ptr<int>(), ckv.size(1), H,
+      page_table.data_ptr<int>(), page_table.size(1), kv_lens.data_ptr<int>(), page_shift, H,
       sm_scale * 1.4426950408889634, ckv_scale, kpe_scale, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), chunk,
       splits > 1 ? o_part.data_ptr<float>() : nullptr, splits > 1 ? lse_part.data_ptr<float>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (splits > 1) {
-    mla_combine<<<dim3(B * H, CKV / 64), 128, 0, stream>>>(o_part.data_ptr<float>(), lse_part.data_ptr<float>(), splits, B * H,
-                                           reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
+    mla_combine<<<dim3(B * H, CKV / 64), 128, 0, stream>>>(o_part.data_ptr<float>(), lse_part.data_ptr<float>(), splits,
+                                                           B * H, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return out;
 }
 
-torch::Tensor decode_v3(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf,
-                        torch::Tensor kpe, torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale,
-                        double ckv_scale, double kpe_scale) {
-  const int max_pages = page_table.size(1), ps = ckv.size(1);  // one split covering any request
-  return decode_v4(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale, kpe_scale,
-                   int64_t(max_pages) * ps, 1);
+torch::Tensor decode(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf, torch::Tensor kpe,
+                     torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale, double ckv_scale,
+                     double kpe_scale, int64_t max_kv_len, int64_t num_splits, int64_t stages) {
+  switch (stages) {
+#define CASE(S) \
+  case S: return decode_impl<S>(q_nope, q_pe, ckv, sf, kpe, page_table, kv_lens, sm_scale, ckv_scale, kpe_scale, \
+                                max_kv_len, num_splits);
+    CASE(2) CASE(3) CASE(4) CASE(6)
+#undef CASE
+  }
+  TORCH_CHECK(false, "stages must be 2, 3, 4 or 6");
 }
 
-torch::Tensor decode_v2(torch::Tensor q_nope, torch::Tensor q_pe, torch::Tensor ckv, torch::Tensor sf,
-                        torch::Tensor kpe, torch::Tensor page_table, torch::Tensor kv_lens, double sm_scale,
-                        double ckv_scale, double kpe_scale) {
-  const int B = q_nope.size(0), H = q_nope.size(1);
-  TORCH_CHECK(H % 16 == 0, "heads must be a multiple of 16");
-  TORCH_CHECK(q_nope.is_contiguous() && q_pe.is_contiguous() && page_table.is_contiguous());
-  TORCH_CHECK(ckv.size(2) == CKV / 2 && sf.size(2) == CKV / 16 && kpe.size(2) == KPE);
-  auto out = torch::empty({B, H, CKV}, q_nope.options());
-  mla_decode_v2<<<dim3(H / 16, B), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-      ptr<__nv_bfloat16>(q_nope), ptr<__nv_bfloat16>(q_pe), ptr<uint8_t>(ckv), ptr<uint8_t>(sf), ptr<uint8_t>(kpe),
-      page_table.data_ptr<int>(), page_table.size(1), kv_lens.data_ptr<int>(), ckv.size(1), H,
-      sm_scale * 1.4426950408889634, ckv_scale, kpe_scale, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
+// ---- whole-cache dequant (reference check and the "dequant, then a BF16 kernel" path)
 
-// Dequant the whole cache with the kernel's device functions. fp32 output: bitwise check vs ref.py.
-// bf16 output: the "dequant-then-kernel" baseline (exact for power-of-two ckv_scale).
 __device__ __forceinline__ void store16(float* p, const float (&v)[16]) {
   for (int j = 0; j < 16; ++j) p[j] = v[j];
 }
@@ -581,11 +600,14 @@ __global__ void dequant_kernel(const uint8_t* ckv, const uint8_t* sf, const uint
          e4m3_to_float(kpe[tok * KPE + 2 * blk + 1]) * kpe_scale);
 }
 
-std::vector<torch::Tensor> dequant(torch::Tensor ckv, torch::Tensor sf, torch::Tensor kpe, double ckv_scale,
-                                   double kpe_scale, bool bf16) {
+std::vector<torch::Tensor> dequantize(torch::Tensor ckv, torch::Tensor sf, torch::Tensor kpe, double ckv_scale,
+                                      double kpe_scale, bool bf16) {
+  check_cache(ckv, sf, kpe);
+  const at::cuda::OptionalCUDAGuard guard(ckv.device());
   const size_t n_tok = ckv.size(0) * ckv.size(1);
   auto opt = ckv.options().dtype(bf16 ? torch::kBFloat16 : torch::kFloat32);
   auto ckv_out = torch::empty({ckv.size(0), ckv.size(1), CKV}, opt), kpe_out = torch::empty({ckv.size(0), ckv.size(1), KPE}, opt);
+  if (n_tok == 0) return {ckv_out, kpe_out};
   const dim3 grid((n_tok * 32 + 255) / 256);
   auto s = at::cuda::getCurrentCUDAStream();
   if (bf16)
@@ -600,9 +622,6 @@ std::vector<torch::Tensor> dequant(torch::Tensor ckv, torch::Tensor sf, torch::T
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("decode_v1", &decode_v1);
-  m.def("decode_v2", &decode_v2);
-  m.def("decode_v3", &decode_v3);
-  m.def("decode_v4", &decode_v4);
-  m.def("dequant", &dequant);
+  m.def("decode", &decode);
+  m.def("dequantize", &dequantize);
 }

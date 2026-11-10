@@ -1,7 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "modal-benchmark"
+name = "nvfp4-mla"
 version = "0.1.0"
-requires-python = ">=3.12"
-dependencies = [
-    "modal>=1.5.5",
-]
+description = "MLA decode attention that reads the FlashInfer NVFP4 paged KV cache directly (Blackwell SM100 / SM120)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+# The CUDA extension is compiled on first use (torch.utils.cpp_extension), so torch must match the local CUDA toolkit.
+dependencies = ["torch>=2.7", "ninja"]
+
+[project.optional-dependencies]
+test = ["pytest", "flashinfer-python>=0.7.0"]
+bench = ["flashinfer-python>=0.7.0", "triton"]
+
+[tool.setuptools]
+packages = ["nvfp4_mla"]
+
+[tool.setuptools.package-data]
+nvfp4_mla = ["csrc/*.cu"]

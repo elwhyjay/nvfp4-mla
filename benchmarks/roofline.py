@@ -1,6 +1,7 @@
-"""Step 0: achievable read BW and BF16 mma.sync peak -> ridge point, per GPU.
+"""Achievable DRAM read BW and BF16 mma.sync peak of the local GPU, and the ridge point they imply.
 
-  uv run modal run bench.py::sh --cmd "python kernels/step0.py"            (GPU=B200 for SM100)
+  python benchmarks/roofline.py      (needs ~8 GB of free GPU memory)
+The read BW is what bench.py's %BW column is relative to (pass it as --bw on GPUs it doesn't know).
 """
 import hashlib
 import itertools
@@ -12,7 +13,7 @@ from torch.utils.cpp_extension import load
 
 CC = "".join(map(str, torch.cuda.get_device_capability()))
 SRC = pathlib.Path(__file__).with_suffix(".cu")
-mod = load(f"step0_sm{CC}_{hashlib.sha1(SRC.read_bytes()).hexdigest()[:8]}", [str(SRC)], extra_cuda_cflags=["-O3"])
+mod = load(f"roofline_sm{CC}_{hashlib.sha1(SRC.read_bytes()).hexdigest()[:8]}", [str(SRC)], extra_cuda_cflags=["-O3"])
 SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
 
@@ -28,17 +29,16 @@ def ms(fn, iters=20):
 print(f"{torch.cuda.get_device_name()}  CC{CC}  SMs={SMS}")
 flag = torch.zeros(1, dtype=torch.int32, device="cuda")
 best_bw = 0.0
-for gb in (4,):  # 1 GB runs read partly from L2 (128 MB) left over from the previous run
-    x = torch.empty(gb << 30, dtype=torch.uint8, device="cuda")
-    for unroll, bps, thr in itertools.product((1, 4, 8), (2, 4, 8), (256, 512)):
-        t = ms(lambda: mod.read(x, unroll, SMS * bps, thr, flag))
-        bw = x.numel() / t / 1e6
-        best_bw = max(best_bw, bw)
-        print(f"  read {gb}GB unroll={unroll} blocks/SM={bps} threads={thr}: {bw:7.0f} GB/s")
-    y = torch.empty_like(x)
-    print(f"  torch copy_ {gb}GB (r+w): {2 * x.numel() / ms(lambda: y.copy_(x)) / 1e6:7.0f} GB/s")
-    del x, y
-    torch.cuda.empty_cache()
+x = torch.empty(4 << 30, dtype=torch.uint8, device="cuda")  # 4 GB: a 1 GB buffer still hits L2 left from the last run
+for unroll, bps, thr in itertools.product((1, 4, 8), (2, 4, 8), (256, 512)):
+    t = ms(lambda: mod.read(x, unroll, SMS * bps, thr, flag))
+    bw = x.numel() / t / 1e6
+    best_bw = max(best_bw, bw)
+    print(f"  read 4GB unroll={unroll} blocks/SM={bps} threads={thr}: {bw:7.0f} GB/s")
+y = torch.empty_like(x)
+print(f"  torch copy_ 4GB (r+w): {2 * x.numel() / ms(lambda: y.copy_(x)) / 1e6:7.0f} GB/s")
+del x, y
+torch.cuda.empty_cache()
 
 out = torch.zeros(1, device="cuda")
 best_tf, iters = 0.0, 4096
