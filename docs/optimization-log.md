@@ -357,6 +357,60 @@ from 1 to 128, decode and combine time each measured with CUPTI.
 - Side result for the FP8 path: with the policy's own choices, 2 stages beat 3 stages on 8 of 11 shapes (geometric
   mean -3.2%; H=128 B64 4K -17%, H=128 B1 64K +4.9%). This matters when the FP8 path becomes the default.
 
+### v7 hypothesis: share the K/V conversion between head groups
+
+At H=128 the 8 CTAs of one request and split (16 heads each) all convert the same KV tile. From the v6 instruction
+mix, per warp and tile, the work that does not depend on the head group is the E2M1 -> E4M3 conversion (132
+`F2FP`), the scale multiply (64 `HMUL2`), the V transpose (32 `MOVM` + 32 `PRMT`) and the raw KV reads (12 `LDS`):
+about 270 of 715 instructions.
+
+Options:
+
+| option | conversion per head group | cost |
+|---|---|---|
+| a warp computes two head groups (32 heads, 128 channels) | 1/2 | accumulators alone need 128 registers; with Q, K, V and scores it exceeds 255 |
+| a warp computes 32 heads x 64 channels, 8 warps per CTA | 1/2 | the cross-warp score reduction becomes 8-way over twice the rows: about 224 `FADD` and 56 `LDS` per tile |
+| 8 warps per CTA = 2 head groups; warps w and w + 4 own the same channels and each converts half of the tile's tokens, then they swap halves through smem | 1/2 | 4 `STS.128` + 4 `LDS.128` + one 64-thread barrier per tile; smem about 68 KB, so 1 CTA (8 warps) per SM, the same warps per SM as now |
+
+Choice: the third option. Registers stay at 168, the score reduction stays 4-way, and the copy work (`cp.async`
+issue and address math) is spread over 256 threads instead of 128. The V transpose stays in registers in this step
+(each warp still needs its own PV fragments); moving it to smem is a later step.
+
+Predictions (FP8 path, H=128; H=16 keeps one head group per CTA):
+- Instructions per warp per tile: about 715 -> 605 (-15%): conversion -98, raw reads -6, copy about -15, exchange +10.
+- H=128 B64 64K: 3.55 ms -> 3.15-3.35 ms (-6% to -12%). Less than the instruction cut, because the kernel is
+  latency-bound and the pair barrier adds a wait.
+- Decision rule: keep if H=128 B64 64K improves by 5% or more and no H=128 shape gets more than 3% slower. If the
+  instruction count falls as predicted but the time does not, issue bandwidth is not what limits the kernel.
+
+### v7 result: shared conversion made it slower
+
+| per warp per tile (ncu, H=128 B64 64K) | v6 | v7 (2 head groups) | predicted |
+|---|---|---|---|
+| `F2FP` (conversion) | 140 | **74** | halved |
+| `HMUL2` (scale) | 64 | **32** | halved |
+| address and integer math | 86 | **156** | about -15 |
+| all instructions | 715 | 682 (-4.7%) | about 605 (-15%) |
+| registers | 168 | 178 | 168 |
+| issue slots busy | 48% | 39% | |
+| tensor pipe busy | 40% | 34% | |
+| kernel time (ncu) | 3.71 ms | 4.22 ms (+14%) | |
+
+End-to-end on the H=128 shapes (CUPTI): B64 64K 3.447 -> 4.043 ms (+17%), B16 64K +15%, B64 4K +12%;
+only B1 16K got faster.
+
+- The sharing itself worked: conversion and scale instructions halved.
+- Two things were not predicted:
+  - Address math grew by 70 instructions per tile: the slot-to-token rotation, the exchange indices and the
+    8-way copy split all need runtime index arithmetic.
+  - The SM now holds one 8-warp CTA instead of two independent 4-warp CTAs. Every `__syncthreads` and every pair
+    barrier stops warps that used to belong to a different CTA and kept running. Issue slots fell from 48% to 39%,
+    and barrier and MIO stalls appeared (4% and 10%).
+- The hypothesis "fewer instructions per tile make it faster" is wrong for this kernel. What limits it is the latency
+  of the per-warp chain (load, convert, QK, cross-warp sum, softmax, PV) and how much independent work the
+  schedulers can switch to. Two small independent CTAs per SM give more of that than one large one.
+- Decision: drop the two-group CTA; its code is not kept on main.
+
 ### Later: B200
 
 FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:
