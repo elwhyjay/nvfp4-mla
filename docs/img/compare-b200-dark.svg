@@ -1,0 +1,541 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="720pt" height="446.4pt" viewBox="0 0 720 446.4" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-11-10T15:26:10.001158</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.11.2, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 446.4 
+L 720 446.4 
+L 720 0 
+L 0 0 
+z
+" style="fill: #1a1a19"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 106.82 207.504 
+L 355.14 207.504 
+L 355.14 25.47 
+L 106.82 25.47 
+z
+" style="fill: #1a1a19"/>
+   </g>
+   <g id="matplotlib.axis_1"/>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_1"/>
+     <g id="text_1">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="194.147526" transform="rotate(-0 103.32 194.147526)">FlashInfer fa2 (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_2"/>
+     <g id="text_2">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="164.701716" transform="rotate(-0 103.32 164.701716)">SGLang Triton (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="line2d_3"/>
+     <g id="text_3">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="135.255905" transform="rotate(-0 103.32 135.255905)">trtllm-gen (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="line2d_4"/>
+     <g id="text_4">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="105.810095" transform="rotate(-0 103.32 105.810095)">nvfp4-mla (NVFP4)</text>
+     </g>
+    </g>
+    <g id="ytick_5">
+     <g id="line2d_5"/>
+     <g id="text_5">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="76.364284" transform="rotate(-0 103.32 76.364284)">trtllm-gen (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_6">
+     <g id="line2d_6"/>
+     <g id="text_6">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="46.918474" transform="rotate(-0 103.32 46.918474)">FlashInfer Cake (NVFP4)</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_3">
+    <path d="M 106.82 199.229727 
+L 310.360984 199.229727 
+L 310.360984 180.973325 
+L 106.82 180.973325 
+z
+" clip-path="url(#pdbb2435aa9)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 106.82 169.783917 
+L 263.820785 169.783917 
+L 263.820785 151.527514 
+L 106.82 151.527514 
+z
+" clip-path="url(#pdbb2435aa9)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 106.82 140.338106 
+L 176.249079 140.338106 
+L 176.249079 122.081704 
+L 106.82 122.081704 
+z
+" clip-path="url(#pdbb2435aa9)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 106.82 110.892296 
+L 167.797801 110.892296 
+L 167.797801 92.635894 
+L 106.82 92.635894 
+z
+" clip-path="url(#pdbb2435aa9)" style="fill: #3987e5"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 106.82 81.446486 
+L 138.612527 81.446486 
+L 138.612527 63.190083 
+L 106.82 63.190083 
+z
+" clip-path="url(#pdbb2435aa9)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 106.82 52.000675 
+L 132.97199 52.000675 
+L 132.97199 33.744273 
+L 106.82 33.744273 
+z
+" clip-path="url(#pdbb2435aa9)" style="fill: #d95926"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 106.82 207.504 
+L 106.82 25.47 
+" style="fill: none; stroke: #383835; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_7">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="313.414098" y="193.242276" transform="rotate(-0 313.414098 193.242276)">2.47 ms</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="266.8739" y="163.796466" transform="rotate(-0 266.8739 163.796466)">1.91 ms</text>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="179.302194" y="134.350655" transform="rotate(-0 179.302194 134.350655)">844 µs</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="170.850916" y="104.985595" transform="rotate(-0 170.850916 104.985595)">741 µs</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="141.665642" y="75.459034" transform="rotate(-0 141.665642 75.459034)">386 µs</text>
+   </g>
+   <g id="text_12">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="136.025105" y="46.013224" transform="rotate(-0 136.025105 46.013224)">318 µs</text>
+   </g>
+   <g id="text_13">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="106.82" y="19.47" transform="rotate(-0 106.82 19.47)">H=16, batch 64, 64K tokens</text>
+   </g>
+  </g>
+  <g id="axes_2">
+   <g id="patch_10">
+    <path d="M 461.96 207.504 
+L 710.28 207.504 
+L 710.28 25.47 
+L 461.96 25.47 
+z
+" style="fill: #1a1a19"/>
+   </g>
+   <g id="matplotlib.axis_3"/>
+   <g id="matplotlib.axis_4">
+    <g id="ytick_7">
+     <g id="line2d_7"/>
+     <g id="text_14">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="194.147526" transform="rotate(-0 458.46 194.147526)">SGLang Triton (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_8">
+     <g id="line2d_8"/>
+     <g id="text_15">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="164.701716" transform="rotate(-0 458.46 164.701716)">FlashInfer fa2 (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_9">
+     <g id="line2d_9"/>
+     <g id="text_16">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="135.255905" transform="rotate(-0 458.46 135.255905)">trtllm-gen (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_10">
+     <g id="line2d_10"/>
+     <g id="text_17">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="105.810095" transform="rotate(-0 458.46 105.810095)">nvfp4-mla (NVFP4)</text>
+     </g>
+    </g>
+    <g id="ytick_11">
+     <g id="line2d_11"/>
+     <g id="text_18">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="76.364284" transform="rotate(-0 458.46 76.364284)">trtllm-gen (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_12">
+     <g id="line2d_12"/>
+     <g id="text_19">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="46.918474" transform="rotate(-0 458.46 46.918474)">FlashInfer Cake (NVFP4)</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_11">
+    <path d="M 461.96 199.229727 
+L 665.500984 199.229727 
+L 665.500984 180.973325 
+L 461.96 180.973325 
+z
+" clip-path="url(#pab49b000d5)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 461.96 169.783917 
+L 611.782593 169.783917 
+L 611.782593 151.527514 
+L 461.96 151.527514 
+z
+" clip-path="url(#pab49b000d5)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 461.96 140.338106 
+L 541.773226 140.338106 
+L 541.773226 122.081704 
+L 461.96 122.081704 
+z
+" clip-path="url(#pab49b000d5)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 461.96 110.892296 
+L 517.123988 110.892296 
+L 517.123988 92.635894 
+L 461.96 92.635894 
+z
+" clip-path="url(#pab49b000d5)" style="fill: #3987e5"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 461.96 81.446486 
+L 516.221393 81.446486 
+L 516.221393 63.190083 
+L 461.96 63.190083 
+z
+" clip-path="url(#pab49b000d5)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 461.96 52.000675 
+L 498.820921 52.000675 
+L 498.820921 33.744273 
+L 461.96 33.744273 
+z
+" clip-path="url(#pab49b000d5)" style="fill: #d95926"/>
+   </g>
+   <g id="patch_17">
+    <path d="M 461.96 207.504 
+L 461.96 25.47 
+" style="fill: none; stroke: #383835; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="668.554098" y="193.242276" transform="rotate(-0 668.554098 193.242276)">113 µs</text>
+   </g>
+   <g id="text_21">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="614.835708" y="163.796466" transform="rotate(-0 614.835708 163.796466)">83 µs</text>
+   </g>
+   <g id="text_22">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="544.826341" y="134.350655" transform="rotate(-0 544.826341 134.350655)">44 µs</text>
+   </g>
+   <g id="text_23">
+    <text style="font-weight: 700; font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="520.177102" y="104.985595" transform="rotate(-0 520.177102 104.985595)">31 µs</text>
+   </g>
+   <g id="text_24">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="519.274508" y="75.459034" transform="rotate(-0 519.274508 75.459034)">30 µs</text>
+   </g>
+   <g id="text_25">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="501.874035" y="46.013224" transform="rotate(-0 501.874035 46.013224)">20 µs</text>
+   </g>
+   <g id="text_26">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="461.96" y="19.47" transform="rotate(-0 461.96 19.47)">H=16, batch 1, 64K tokens</text>
+   </g>
+  </g>
+  <g id="axes_3">
+   <g id="patch_18">
+    <path d="M 106.82 423.288 
+L 355.14 423.288 
+L 355.14 241.254 
+L 106.82 241.254 
+z
+" style="fill: #1a1a19"/>
+   </g>
+   <g id="matplotlib.axis_5"/>
+   <g id="matplotlib.axis_6">
+    <g id="ytick_13">
+     <g id="line2d_13"/>
+     <g id="text_27">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="409.931526" transform="rotate(-0 103.32 409.931526)">SGLang Triton (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_14">
+     <g id="line2d_14"/>
+     <g id="text_28">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="380.485716" transform="rotate(-0 103.32 380.485716)">nvfp4-mla (NVFP4)</text>
+     </g>
+    </g>
+    <g id="ytick_15">
+     <g id="line2d_15"/>
+     <g id="text_29">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="351.039905" transform="rotate(-0 103.32 351.039905)">FlashInfer fa2 (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_16">
+     <g id="line2d_16"/>
+     <g id="text_30">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="321.594095" transform="rotate(-0 103.32 321.594095)">trtllm-gen (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_17">
+     <g id="line2d_17"/>
+     <g id="text_31">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="292.148284" transform="rotate(-0 103.32 292.148284)">trtllm-gen (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_18">
+     <g id="line2d_18"/>
+     <g id="text_32">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="103.32" y="262.702474" transform="rotate(-0 103.32 262.702474)">FlashInfer Cake (NVFP4)</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_19">
+    <path d="M 106.82 415.013727 
+L 310.360984 415.013727 
+L 310.360984 396.757325 
+L 106.82 396.757325 
+z
+" clip-path="url(#pb1bb8967c3)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_20">
+    <path d="M 106.82 385.567917 
+L 187.365178 385.567917 
+L 187.365178 367.311514 
+L 106.82 367.311514 
+z
+" clip-path="url(#pb1bb8967c3)" style="fill: #3987e5"/>
+   </g>
+   <g id="patch_21">
+    <path d="M 106.82 356.122106 
+L 175.717229 356.122106 
+L 175.717229 337.865704 
+L 106.82 337.865704 
+z
+" clip-path="url(#pb1bb8967c3)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_22">
+    <path d="M 106.82 326.676296 
+L 121.655323 326.676296 
+L 121.655323 308.419894 
+L 106.82 308.419894 
+z
+" clip-path="url(#pb1bb8967c3)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_23">
+    <path d="M 106.82 297.230486 
+L 115.032392 297.230486 
+L 115.032392 278.974083 
+L 106.82 278.974083 
+z
+" clip-path="url(#pb1bb8967c3)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_24">
+    <path d="M 106.82 267.784675 
+L 114.474991 267.784675 
+L 114.474991 249.528273 
+L 106.82 249.528273 
+z
+" clip-path="url(#pb1bb8967c3)" style="fill: #d95926"/>
+   </g>
+   <g id="patch_25">
+    <path d="M 106.82 423.288 
+L 106.82 241.254 
+" style="fill: none; stroke: #383835; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_33">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="313.414098" y="409.026276" transform="rotate(-0 313.414098 409.026276)">14.56 ms</text>
+   </g>
+   <g id="text_34">
+    <text style="font-weight: 700; font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="190.418293" y="379.661216" transform="rotate(-0 190.418293 379.661216)">5.76 ms</text>
+   </g>
+   <g id="text_35">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="178.770344" y="350.134655" transform="rotate(-0 178.770344 350.134655)">4.93 ms</text>
+   </g>
+   <g id="text_36">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="124.708438" y="320.688845" transform="rotate(-0 124.708438 320.688845)">1.06 ms</text>
+   </g>
+   <g id="text_37">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="118.085507" y="291.243034" transform="rotate(-0 118.085507 291.243034)">587 µs</text>
+   </g>
+   <g id="text_38">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="117.528106" y="261.797224" transform="rotate(-0 117.528106 261.797224)">548 µs</text>
+   </g>
+   <g id="text_39">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="106.82" y="235.254" transform="rotate(-0 106.82 235.254)">H=128, batch 64, 64K tokens</text>
+   </g>
+  </g>
+  <g id="axes_4">
+   <g id="patch_26">
+    <path d="M 461.96 423.288 
+L 710.28 423.288 
+L 710.28 241.254 
+L 461.96 241.254 
+z
+" style="fill: #1a1a19"/>
+   </g>
+   <g id="matplotlib.axis_7"/>
+   <g id="matplotlib.axis_8">
+    <g id="ytick_19">
+     <g id="line2d_19"/>
+     <g id="text_40">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="409.931526" transform="rotate(-0 458.46 409.931526)">SGLang Triton (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_20">
+     <g id="line2d_20"/>
+     <g id="text_41">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="380.485716" transform="rotate(-0 458.46 380.485716)">nvfp4-mla (NVFP4)</text>
+     </g>
+    </g>
+    <g id="ytick_21">
+     <g id="line2d_21"/>
+     <g id="text_42">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="351.039905" transform="rotate(-0 458.46 351.039905)">FlashInfer fa2 (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_22">
+     <g id="line2d_22"/>
+     <g id="text_43">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="321.594095" transform="rotate(-0 458.46 321.594095)">trtllm-gen (BF16)</text>
+     </g>
+    </g>
+    <g id="ytick_23">
+     <g id="line2d_23"/>
+     <g id="text_44">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="292.148284" transform="rotate(-0 458.46 292.148284)">trtllm-gen (FP8)</text>
+     </g>
+    </g>
+    <g id="ytick_24">
+     <g id="line2d_24"/>
+     <g id="text_45">
+      <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="458.46" y="262.702474" transform="rotate(-0 458.46 262.702474)">FlashInfer Cake (NVFP4)</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_27">
+    <path d="M 461.96 415.013727 
+L 665.500984 415.013727 
+L 665.500984 396.757325 
+L 461.96 396.757325 
+z
+" clip-path="url(#p75a26a088d)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_28">
+    <path d="M 461.96 385.567917 
+L 531.586427 385.567917 
+L 531.586427 367.311514 
+L 461.96 367.311514 
+z
+" clip-path="url(#p75a26a088d)" style="fill: #3987e5"/>
+   </g>
+   <g id="patch_29">
+    <path d="M 461.96 356.122106 
+L 529.312133 356.122106 
+L 529.312133 337.865704 
+L 461.96 337.865704 
+z
+" clip-path="url(#p75a26a088d)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_30">
+    <path d="M 461.96 326.676296 
+L 493.048959 326.676296 
+L 493.048959 308.419894 
+L 461.96 308.419894 
+z
+" clip-path="url(#p75a26a088d)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_31">
+    <path d="M 461.96 297.230486 
+L 487.122899 297.230486 
+L 487.122899 278.974083 
+L 461.96 278.974083 
+z
+" clip-path="url(#p75a26a088d)" style="fill: #52514e"/>
+   </g>
+   <g id="patch_32">
+    <path d="M 461.96 267.784675 
+L 484.412303 267.784675 
+L 484.412303 249.528273 
+L 461.96 249.528273 
+z
+" clip-path="url(#p75a26a088d)" style="fill: #d95926"/>
+   </g>
+   <g id="patch_33">
+    <path d="M 461.96 423.288 
+L 461.96 241.254 
+" style="fill: none; stroke: #383835; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_46">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="668.554098" y="409.026276" transform="rotate(-0 668.554098 409.026276)">298 µs</text>
+   </g>
+   <g id="text_47">
+    <text style="font-weight: 700; font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="534.639542" y="379.661216" transform="rotate(-0 534.639542 379.661216)">102 µs</text>
+   </g>
+   <g id="text_48">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="532.365248" y="350.134655" transform="rotate(-0 532.365248 350.134655)">99 µs</text>
+   </g>
+   <g id="text_49">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="496.102073" y="320.688845" transform="rotate(-0 496.102073 320.688845)">46 µs</text>
+   </g>
+   <g id="text_50">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="490.176013" y="291.243034" transform="rotate(-0 490.176013 291.243034)">37 µs</text>
+   </g>
+   <g id="text_51">
+    <text style="font-size: 8.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="487.465418" y="261.797224" transform="rotate(-0 487.465418 261.797224)">33 µs</text>
+   </g>
+   <g id="text_52">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="461.96" y="235.254" transform="rotate(-0 461.96 235.254)">H=128, batch 1, 64K tokens</text>
+   </g>
+  </g>
+  <g id="text_53">
+   <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #898781" x="7.2" y="441.936" transform="rotate(-0 7.2 441.936)">B200, q_len 1, page size 64. GPU kernel time per call (CUPTI), L2 flushed. Lower is better.</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pdbb2435aa9">
+   <rect x="106.82" y="25.47" width="248.32" height="182.034"/>
+  </clipPath>
+  <clipPath id="pab49b000d5">
+   <rect x="461.96" y="25.47" width="248.32" height="182.034"/>
+  </clipPath>
+  <clipPath id="pb1bb8967c3">
+   <rect x="106.82" y="241.254" width="248.32" height="182.034"/>
+  </clipPath>
+  <clipPath id="p75a26a088d">
+   <rect x="461.96" y="241.254" width="248.32" height="182.034"/>
+  </clipPath>
+ </defs>
+</svg>
