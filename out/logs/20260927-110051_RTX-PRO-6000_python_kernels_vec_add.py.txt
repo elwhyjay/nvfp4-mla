@@ -1,6 +1,0 @@
-$ python kernels/vec_add.py
-# RTX-PRO-6000  20260927-110051
-
-ok 16777216
-
-# exit 0

@@ -1,6 +1,0 @@
-==WARNING== Note: Running with unmodified GPU clocks. If not controlled otherwise, profiling results may be inconsistent.
-==PROF== Connected to process 38 (/usr/local/bin/python)
-==PROF== Profiling "vec_add": 0%....50%....100% - 40 passes
-ok 16777216
-==PROF== Disconnected from process 38
-==PROF== Report: /tmp/profile.ncu-rep

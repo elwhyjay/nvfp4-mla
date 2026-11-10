@@ -1,2 +1,11 @@
 /sglang
 .DS_Store
+__pycache__
+*.egg-info/
+.venv/
+# Modal launcher, raw run outputs, profiling helpers and private notes; not part of the public package
+/bench.py
+/out/
+/dev/
+/NVFP4_MLA_DECODE_PLAN.md
+/uv.lock
