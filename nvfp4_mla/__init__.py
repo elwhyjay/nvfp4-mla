@@ -41,8 +41,11 @@ def _load(*extra_cuda_cflags: str):
             os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
 
 
+_PRECISIONS = {"bf16": 0, "fp8": 1, "fp4-qk": 2}
+
+
 def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale,
-           ckv_scale=1.0, kpe_scale=1.0, max_kv_len=None, num_splits=0):
+           ckv_scale=1.0, kpe_scale=1.0, max_kv_len=None, num_splits=0, precision="bf16"):
     """Absorbed-MLA decode (one query token per request) on an NVFP4 paged KV cache.
 
     Args:
@@ -60,14 +63,22 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
         max_kv_len: an upper bound of ``kv_lens``, used to size the KV split. Pass it to avoid a device sync and
             to keep the launch shape fixed under CUDA graphs. Default: ``kv_lens.max()``.
         num_splits: KV splits per request; 0 picks it from the GPU size, batch and ``max_kv_len``.
+        precision: arithmetic of the attention, not of the cache:
+            ``"bf16"`` (default): BF16 query, P and MMA; the error is the cache format's own.
+            ``"fp8"``: E4M3 query, K, V and P with FP8 MMA. Up to 1.7x faster on compute-bound shapes (128 heads,
+            batch >= 4) with 0-11% more error; the same or slower with 16 heads.
+            ``"fp4-qk"``: as ``"fp8"``, with QK in block-scaled FP4 (FP4 query, as FlashInfer Cake). About 3% faster
+            than ``"fp8"`` at 128 heads and large batch, 25-55% more error. SM12x only.
 
     Returns:
         ``[batch, heads, 512]`` bfloat16 attention output (the latent value; apply W_UV outside).
     """
     if max_kv_len is None:
         max_kv_len = int(kv_lens.max())
+    if precision not in _PRECISIONS:
+        raise ValueError(f"precision must be one of {list(_PRECISIONS)}, got {precision!r}")
     return _load().decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale,
-                          ckv_scale, kpe_scale, max_kv_len, num_splits, 3, 0)
+                          ckv_scale, kpe_scale, max_kv_len, num_splits, 3, _PRECISIONS[precision])
 
 
 def dequantize(ckv_cache, ckv_sf_cache, kpe_cache, ckv_scale=1.0, kpe_scale=1.0, dtype=torch.bfloat16):

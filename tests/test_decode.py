@@ -88,6 +88,8 @@ def test_decode_fp8(num_splits, kv_lens, page_size, heads):
 @pytest.mark.parametrize("kv_lens,page_size,heads", CASES)
 def test_decode_fp4_qk(num_splits, kv_lens, page_size, heads):
     """FP4 QK (FP4 query): more error than the FP8 path, about FlashInfer Cake's."""
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("block-scaled mma.sync is SM12x only")
     c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
     out = run(c, splits=num_splits, precision=2)
     assert not out.isnan().any()
@@ -99,6 +101,9 @@ def test_decode_fp4_qk(num_splits, kv_lens, page_size, heads):
 def test_public_api():
     c = RandomCache([300, 70], page_size=16, heads=16, ckv_scale=0.5, kpe_scale=2.0)
     check(nvfp4_mla.decode(*c.args()), c, "nvfp4_mla.decode")
+    assert torch.equal(nvfp4_mla.decode(*c.args(), precision="fp8"), run(c, precision=1))
+    with pytest.raises(ValueError, match="precision"):
+        nvfp4_mla.decode(*c.args(), precision="int8")
     got = torch.cat(nvfp4_mla.dequantize(c.ckv_cache, c.ckv_sf_cache, c.kpe_cache, 0.5, 2.0), -1)
     want = torch.cat(c.dequantize(), -1)
     ok = ~want.isnan()

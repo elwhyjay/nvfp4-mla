@@ -4,14 +4,15 @@ MLA decode attention (DeepSeek-style, weight-absorbed) that reads the **FlashInf
 I added this cache format and its quantize/append kernel to FlashInfer in
 [flashinfer#4676](https://github.com/flashinfer-ai/flashinfer/pull/4676); this repository is the decode side.
 The latent KV is stored as E2M1 with one E4M3 scale per 16 channels and the RoPE part as FP8, so one token is
-352 bytes (FP8: 576, BF16: 1152). The kernel dequantizes in registers and keeps Q, P and the MMA in BF16 with FP32
-accumulation.
+352 bytes (FP8: 576, BF16: 1152). By default the kernel dequantizes in registers and keeps Q, P and the MMA in BF16
+with FP32 accumulation; an FP8 mode (E4M3 Q, K, V, P and MMA) is up to 1.7x faster on compute-bound shapes.
 
 It is written from scratch in CUDA (`mma.sync`, `cp.async`, split-KV) and uses one code path for both
 **SM120 (RTX PRO 6000)** and **SM100 (B200)**.
 
 Status: dense decode, one query token per request (see [Roadmap](#roadmap)). How the kernel got from a CUDA-core
-version to 85% of DRAM bandwidth, step by step with the profiles behind each change:
+version to 85% of DRAM bandwidth, then to the FP8 mode for compute-bound shapes, step by step with the hypothesis,
+the profile and the result of each change (including the ones that did not work):
 [docs/optimization-log.md](docs/optimization-log.md).
 
 ## Why
@@ -30,14 +31,15 @@ FlashInfer can write an MLA KV cache in NVFP4 (#4676). Who can read it back for 
   for `--kv-cache-dtype nvfp4` on dense MLA models.
 - FlashInfer's generic MLA decode (`trtllm_batch_decode_with_kv_cache_mla`) still raises for this cache.
 
-This kernel reads the cache on SM120 and SM100 and keeps the query in BF16.
+This kernel reads the cache on SM120 and SM100 and keeps the query in BF16 by default; its FP8 mode trades a few
+percent of accuracy for speed on compute-bound shapes.
 
 ## Requirements
 
 - NVIDIA Blackwell GPU: SM120 (RTX PRO 6000) or SM100 (B200). Other Blackwell parts (SM103, SM121) are not tested.
-- CUDA toolkit 12.8 or newer, with `nvcc` on `PATH`. With 13.2 or newer the kernel uses the native FP4/FP8 to BF16
-  conversion instructions; older toolkits convert through FP16, which gives the same values with a few more
-  instructions.
+- CUDA toolkit 12.8 or newer, with `nvcc` on `PATH` (`precision="fp4-qk"` needs 12.9). With 13.2 or newer the
+  kernel uses the native FP4/FP8 to BF16 conversion instructions; older toolkits convert through FP16, which gives the
+  same values with a few more instructions.
 - PyTorch 2.7 or newer for the same CUDA major version, and `ninja`.
 - `flashinfer-python >= 0.7.0` to write the cache (and for the tests and benchmarks).
 
@@ -75,9 +77,18 @@ out = nvfp4_mla.decode(
     ckv_cache, ckv_sf_cache, kpe_cache,
     page_table, kv_lens,                 # [B, max_pages] int32 page ids, [B] int32 lengths
     sm_scale, ckv_scale, kpe_scale,
-    max_kv_len=max_context_len)          # an upper bound: no host sync, fixed launch shape for CUDA graphs
+    max_kv_len=max_context_len,          # an upper bound: no host sync, fixed launch shape for CUDA graphs
+    precision="bf16")                    # or "fp8": faster with 128 heads and batch >= 4 (see Performance)
 # out: [B, H, 512] bfloat16 (latent output; apply W_UV outside)
 ```
+
+`precision` sets the arithmetic of the attention, not the cache format:
+
+| `precision` | Q, P and MMA | when to use it | extra error over `"bf16"` |
+|---|---|---|---|
+| `"bf16"` (default) | BF16 | 16 heads, small batches, and on B200 | |
+| `"fp8"` | E4M3 (Q quantized per row in the kernel; K and V rounded to E4M3) | 128 heads, batch 4 and up, SM120: 1.3-1.7x faster | 0-11% |
+| `"fp4-qk"` | as `"fp8"`, QK in block-scaled FP4 (FP4 query, as FlashInfer Cake) | 128 heads, large batch, SM120: about 3% faster than `"fp8"` | 25-55% |
 
 `page_table` is the same block table as `block_tables` in FlashInfer's `MLAPlanMetadata.dense`.
 `nvfp4_mla.dequantize(ckv_cache, ckv_sf_cache, kpe_cache, ckv_scale, kpe_scale)` returns the cache in BF16 or FP32,
@@ -93,8 +104,11 @@ head dims 512 + 64 (DeepSeek-V2/V3/R1, Kimi-K2).
 - The in-kernel dequantization is bitwise equal to the PyTorch reference, also with `--use_fast_math`.
 - Quantization error of the format itself (random data, NVFP4 cache vs BF16 cache): relative L2 0.08-0.12, cosine
   about 0.995. For comparison, FP8 KV with FP8 Q (Triton FP8, XQA) has cosine 0.998 against BF16.
+- `precision="fp8"`: 0.02-0.06 against the dequantized cache (E4M3 rounding of Q, K, V and P); against the BF16 cache
+  0-11% more error than the default, because the cache format dominates. `precision="fp4-qk"`: 25-55% more.
+  [`benchmarks/precision.py`](benchmarks/precision.py) simulates the options on the CPU.
 - FlashInfer Cake also quantizes the query to NVFP4. On the same caches its relative L2 error against BF16 is
-  0.13-0.17, 1.4-1.7x the error of this kernel (`benchmarks/accuracy.py` on B200, three shapes).
+  0.13-0.17, 1.4-1.7x the error of this kernel's default (`benchmarks/accuracy.py` on B200, three shapes).
 
 ## Performance
 
@@ -115,15 +129,15 @@ Baselines: FlashInfer `BatchMLAPagedAttentionWrapper` (fa2, BF16 KV); FlashInfer
   <img alt="Latency of nvfp4-mla and other MLA decode kernels on RTX PRO 6000 for four shapes" src="docs/img/compare-rtx-pro-6000-light.svg">
 </picture>
 
-| heads | batch x kv_len | nvfp4 | Triton FP8 | fa2 BF16 | dequantize + fa2 | XQA FP8 |
-|---|---|---|---|---|---|---|
-| 16 | 1 x 4K | **0.018** | 0.045 | 0.036 | 0.038 | n/a (needs 128 heads) |
-| 16 | 1 x 64K | **0.043** | 0.115 | 0.127 | 0.180 | n/a |
-| 16 | 16 x 64K | **0.330** | 0.574 | 1.507 | 2.603 | n/a |
-| 16 | 64 x 64K | **1.119** | 1.850 | 6.780 | 11.23 | n/a |
-| 128 | 1 x 64K | **0.103** | 0.225 | 0.161 | 0.213 | 1.113 |
-| 128 | 16 x 64K | 1.336 | 2.198 | 3.168 | 4.272 | **1.127** |
-| 128 | 64 x 64K | 4.995 | 8.387 | 10.04 | 14.39 | **2.360** |
+| heads | batch x kv_len | nvfp4 bf16 | nvfp4 fp8 | nvfp4 fp4-qk | Triton FP8 | fa2 BF16 | dequantize + fa2 | XQA FP8 |
+|---|---|---|---|---|---|---|---|---|
+| 16 | 1 x 4K | **0.018** | 0.019 | 0.021 | 0.045 | 0.036 | 0.038 | n/a (needs 128 heads) |
+| 16 | 1 x 64K | **0.046** | 0.052 | 0.052 | 0.116 | 0.128 | 0.179 | n/a |
+| 16 | 16 x 64K | 0.332 | **0.324** | 0.325 | 0.574 | 1.518 | 2.613 | n/a |
+| 16 | 64 x 64K | 1.121 | **1.105** | **1.105** | 1.852 | 6.790 | 11.23 | n/a |
+| 128 | 1 x 64K | 0.105 | **0.080** | **0.080** | 0.226 | 0.164 | 0.213 | 1.110 |
+| 128 | 16 x 64K | 1.353 | **0.778** | 0.797 | 2.195 | 3.180 | 4.264 | 1.120 |
+| 128 | 64 x 64K | 4.815 | 2.836 | 2.762 | 8.156 | 9.750 | 14.16 | **2.306** |
 
 **B200 (SM100)**
 
@@ -144,14 +158,16 @@ Baselines: FlashInfer `BatchMLAPagedAttentionWrapper` (fa2, BF16 KV); FlashInfer
 
 How to read these numbers:
 
-- **SM120, 16 heads** (memory bound): fastest in all 16 measured shapes (batch 1-64, 1K-64K tokens): 1.6-3.4x
-  faster than Triton FP8 and 1.5-6.1x faster than fa2. At 64 x 64K it reads 1.32 TB/s, 85% of the achievable
-  1.56 TB/s (`benchmarks/roofline.py`). Triton FP8 reaches the same fraction there, so the 1.65x gain is the byte
-  ratio 576 / 352.
-- **SM120, 128 heads**: fastest at batch 1-4, where XQA has no KV split and is slow with long contexts. From batch 16
-  the problem is compute bound and XQA's FP8 MMA wins (2.1x at 64 x 64K). The BF16 `mma.sync` floor for that shape
-  is 2.57 ms, already above XQA, so closing this gap needs lower-precision MMA (see [Roadmap](#roadmap)). It is
-  faster than Triton FP8 and fa2 in all shapes.
+- **SM120, 16 heads** (memory bound): the default mode is the fastest in all 16 measured shapes (batch 1-64, 1K-64K
+  tokens): 1.6-3.3x faster than Triton FP8 and 1.5-6.1x faster than fa2. At 64 x 64K it reads 1.32 TB/s, 85% of the
+  achievable 1.56 TB/s (`benchmarks/roofline.py`). Triton FP8 reaches the same fraction there, so the 1.65x gain is
+  the byte ratio 576 / 352. The FP8 mode changes little here (0.8-1.03x).
+- **SM120, 128 heads** (compute bound from batch 16): the FP8 mode is 1.3-1.7x faster than the default from batch 4.
+  It is the fastest at batch 1-4 (XQA has no KV split and is slow with long contexts) and at batch 16 with 16K tokens
+  or more, and faster than Triton FP8 (1.2-2.9x) and fa2 (1.1-4.1x) in all shapes. XQA's FP8 cache still wins at
+  batch 64 (1.23x at 64 x 64K): this kernel has to convert every K/V element from FP4 to FP8 first, 46% of its
+  instructions, and SM120 has no instruction that folds the block scale into that conversion
+  ([optimization log](docs/optimization-log.md#v11-results-and-the-end-of-the-sm120-work)).
 - **B200, 16 heads**: FlashInfer Cake (`tcgen05` MMA) is the fastest in most shapes, up to 2.3x faster than this
   kernel; this kernel is faster only at batch 1-4 with up to 4K tokens. It is faster than trtllm-gen BF16 in all
   16 shapes (1.03-1.47x), than fa2 (1.6-3.3x) and than Triton FP8 (2.5-5.1x). This kernel uses `mma.sync` on both
@@ -159,21 +175,26 @@ How to read these numbers:
 - **B200, 128 heads**: compute bound, and `mma.sync` is far below `tcgen05`: Cake and trtllm-gen FP8 are up to
   10-11x faster.
 - Cake's query is NVFP4, so its error against the BF16 cache is 1.4-1.7x higher (see [Accuracy](#accuracy)).
+- The FP8 mode does not help on B200: in the same run it is 1.5-1.7x slower than the default at 64 x 64K. B200 needs
+  `tcgen05`, which is the next step (see [Roadmap](#roadmap)).
 
 ## Optimization history
 
 Latency of each kernel version on the same shapes. v1 runs on CUDA cores; v2 moves to tensor cores with
 dequantization in registers; v3 adds the `cp.async` pipeline; v4 splits the KV range across CTAs; v5 cuts
-instructions per token. Each step, and the profile that motivated it, is in
+instructions per token. v6-v11 are the FP8 mode for compute-bound shapes: FP8 MMA (v6), QK split by token so the
+scores need no cross-warp sum (v9), V loaded with a transposing 8-bit `ldmatrix` (v11). Each step, the hypothesis and
+the profile behind it, and the steps that were measured and dropped (v7, v8, a split-policy change) are in
 [docs/optimization-log.md](docs/optimization-log.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/versions-dark.svg">
-  <img alt="Latency per kernel version, v1 to v5, for three shapes on RTX PRO 6000 and B200" src="docs/img/versions-light.svg">
+  <img alt="Latency per kernel version, v1 to v5 on both GPUs and v6 to v11 (FP8 mode) at 128 heads on RTX PRO 6000" src="docs/img/versions-light.svg">
 </picture>
 
-The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof; at
-128 heads both GPUs sit at about a third to a half of the BF16 `mma.sync` roof, which is the next target.
+The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof. At 128
+heads the FP8 mode reaches 45% of the E4M3 `mma.sync` roof on RTX PRO 6000; there the per-element conversion, not the
+tensor pipe, sets the time. B200 is still at the BF16 `mma.sync` stage.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/roofline-dark.svg">
@@ -201,6 +222,8 @@ CUDA sources ([flashinfer#7977](https://github.com/flashinfer-ai/flashinfer/issu
 
 ## How it works
 
+Default (BF16) mode:
+
 - One CTA handles 16 heads of one request and one KV split, with 4 warps. Each warp owns 128 of the 512 latent
   channels, and each thread owns 32 channels, which are exactly two FP4 scale blocks.
 - FP4 to BF16 happens in registers (`cvt.rn.bf16x2.e2m1x2`), and the E4M3 block scale is multiplied on the MMA
@@ -215,6 +238,19 @@ CUDA sources ([flashinfer#7977](https://github.com/flashinfer-ai/flashinfer/issu
 - Long contexts are split across CTAs. The split size is the smallest `waves x (chunk + C0)` with chunk >= sqrt(L),
   and a separate kernel merges the partial results.
 
+FP8 mode (`precision="fp8"`):
+
+- E4M3 `mma.sync` m16n8k32 for QK and PV over 32-token tiles. Q is quantized once per row in the kernel and stays in
+  registers.
+- QK is split by token: each warp takes 8 tokens over all 576 channels, so the MMA itself sums the channels and the
+  scores need no cross-warp reduction; each warp computes the softmax of its own tokens and the warps exchange one row
+  maximum.
+- Each thread converts its token's 128 latent channels (E2M1 to f16, times the block scale, then rounded to E4M3) once;
+  they are QK's operand and go to an E4M3 V tile in shared memory. PV is split by channel and loads V with
+  `ldmatrix.m16n16.trans.b8`, which returns exactly the transposed FP8 fragments.
+- `fp4-qk` feeds QK with the cache bytes as stored, through block-scaled FP4 `mma.sync` (`kind::mxf4nvf4`), whose
+  per-16 E4M3 scales match the cache's.
+
 ## Cache layout (flashinfer#4676)
 
 | tensor | shape | dtype | content |
@@ -227,9 +263,8 @@ Dequantization: `ckv = e2m1 * scale * ckv_scale`, `kpe = fp8 * kpe_scale`.
 
 ## Roadmap
 
-- Compute-bound shapes on SM120 (128 heads, and MTP below): block-scaled FP4 `mma.sync` for QK, where the cache's
-  scales match the MMA's operand scales, and more warps per scheduler to keep the tensor pipe busy.
-- A `tcgen05` path for SM100 that keeps the BF16 query; the target is FlashInfer Cake at 16 heads.
+- A `tcgen05` kernel for SM100, written in CuTe DSL, keeping a BF16 or FP8 query; the target is FlashInfer Cake
+  (in progress).
 - MTP / speculative decode (2-4 query tokens per request).
 - An SGLang integration (attention backend plugin plus a KV pool in this layout).
 

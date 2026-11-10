@@ -14,13 +14,18 @@ import matplotlib.pyplot as plt  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RES, IMG = ROOT / "benchmarks" / "results", ROOT / "docs" / "img"
 
-# Achievable DRAM read BW (GB/s) and mma.sync BF16 m16n8k16 peak (TFLOPS), measured with roofline.py
-GPUS = {"RTX PRO 6000": dict(csv="rtx_pro_6000.csv", bw=1559, mma=455),
-        "B200": dict(csv="b200.csv", bw=7300, mma=558)}
+# Achievable DRAM read BW (GB/s) and mma.sync BF16 / E4M3 peaks (TFLOPS), measured with roofline.py
+GPUS = {"RTX PRO 6000": dict(csv="rtx_pro_6000.csv", bw=1559, mma=455, mma8=897),
+        "B200": dict(csv="b200.csv", bw=7300, mma=558, mma8=None)}
 FLOP_PER_TOKEN_HEAD = 2 * 576 + 2 * 512  # QK over 512 + 64 channels, PV over 512, q_len 1
-KV_BYTES = {"nvfp4": 352, "cake": 352, "nvfp4+fa2": 352, "fp8": 576, "bf16": 1152}
-VERSIONS = ["v1", "v2", "v3", "v4", "v5"]
-VERSION_TICKS = ["v1\nCUDA cores", "v2\nmma.sync", "v3\ncp.async", "v4\nsplit-KV", "v5\nfewer instrs"]
+KV_BYTES = {"nvfp4": 352, "nvfp4-fp8": 352, "nvfp4-fp4q": 352, "cake": 352, "nvfp4+fa2": 352, "fp8": 576,
+            "bf16": 1152}
+# BF16 path v1-v5 on both GPUs; the FP8 path (opt-in, for compute-bound shapes) v6-v11 on RTX PRO 6000
+VERSIONS = {"RTX PRO 6000": ["v1", "v2", "v3", "v4", "v5", "v6", "v9", "v11"], "B200": ["v1", "v2", "v3", "v4", "v5"]}
+TICKS = {"v1": "v1\nCUDA\ncores", "v2": "v2\nmma.sync", "v3": "v3\ncp.async", "v4": "v4\nsplit-KV",
+         "v5": "v5\nfewer\ninstrs", "v6": "v6\nFP8\nMMA", "v9": "v9\nQK by\ntoken", "v11": "v11\n8-bit\nldmatrix"}
+OURS = ("nvfp4", "nvfp4-fp8")
+TABLE_ONLY = ("nvfp4+fa2", "nvfp4-fp4q")  # in the README tables, not in the bar charts
 CONFIGS = [(16, 64, 65536), (16, 1, 65536), (128, 64, 65536), (128, 1, 65536)]
 
 THEMES = {
@@ -34,7 +39,9 @@ THEMES = {
 def name(provider, gpu):
     if provider == "trtllm:fp8":
         return "XQA (FP8)" if gpu == "RTX PRO 6000" else "trtllm-gen (FP8)"
-    return {"nvfp4": "nvfp4-mla (NVFP4)", "cake": "FlashInfer Cake (NVFP4)", "triton:fp8": "SGLang Triton (FP8)",
+    return {"nvfp4": "nvfp4-mla (BF16 mode)", "nvfp4-fp8": "nvfp4-mla (FP8 mode)", "nvfp4-fp4q": "nvfp4-mla (FP4-QK mode)",
+            "cutile": "FlashInfer cuTile (BF16)", "cute-dsl-monolithic": "FlashInfer CuTe DSL (BF16)",
+            "cake": "FlashInfer Cake (NVFP4)", "triton:fp8": "SGLang Triton (FP8)",
             "triton:bf16": "SGLang Triton (BF16)", "fa2": "FlashInfer fa2 (BF16)", "cutlass": "cutlass (BF16)",
             "trtllm:bf16": "trtllm-gen (BF16)", "nvfp4+fa2": "dequant + fa2"}[provider]
 
@@ -78,27 +85,33 @@ def title(ax, t, text):
 
 def versions(t):
     rows = load(RES / "versions.csv")
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.4), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.8), sharey=True, gridspec_kw={"width_ratios": [8.8, 5.8]})
     for ax, gpu in zip(axes, GPUS):
         style(ax, t)
+        vs = VERSIONS[gpu]
         for i, (h, b, s) in enumerate(CONFIGS[:3]):
             ms = {r["version"]: r["ms"] for r in rows
                   if r["gpu"] == gpu and (r["heads"], r["batch"], r["s_kv"]) == (h, b, s)}
-            ys = [ms[v] for v in VERSIONS]
-            ax.plot(range(5), ys, color=t["series"][i], lw=2, marker="o", ms=6, mec=t["surface"], mew=1.5,
+            n = len(vs) if h == 128 else 5  # at H=16 the BF16 path (v5) stays the faster one
+            ys = [ms[v] for v in vs[:n]]
+            ax.plot(range(n), ys, color=t["series"][i], lw=2, marker="o", ms=6, mec=t["surface"], mew=1.5,
                     label=cfg_label(h, b, s), zorder=3)
-            ax.annotate(f"{fmt_ms(ys[-1])}  ({ys[0] / ys[-1]:.0f}×)", (4, ys[-1]), xytext=(8, 0),
+            ax.annotate(f"{fmt_ms(ys[-1])}  ({ys[0] / ys[-1]:.0f}×)", (n - 1, ys[-1]), xytext=(8, 0),
                         textcoords="offset points", va="center", color=t["ink2"], fontsize=8.5)
         ax.set_yscale("log")
-        ax.set_xticks(range(5), VERSION_TICKS, fontsize=8.5)
-        ax.set_xlim(-0.3, 5.2)
+        ax.set_xticks(range(len(vs)), [TICKS[v] for v in vs], fontsize=8)
+        ax.set_xlim(-0.3, len(vs) + 0.4)
+        if len(vs) > 5:
+            ax.axvline(4.5, color=t["grid"], lw=1, zorder=1)
+            ax.text(4.6, 0.97, "FP8 path", transform=ax.get_xaxis_transform(), color=t["muted"], fontsize=8, va="top")
         ax.yaxis.set_major_formatter(lambda y, _: f"{y:g}")
         title(ax, t, gpu)
     axes[0].set_ylabel("latency (ms, log scale)", color=t["ink2"])
     h, l = axes[0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper center", ncol=3, frameon=False, labelcolor=t["ink2"], fontsize=9)
-    fig.text(0.01, 0.01, "Lower is better. v1–v3 timed with CUDA events, v4–v5 with CUPTI kernel time; "
-             "L2 flushed before each call. Labels: v5 latency (speedup over v1).", color=t["muted"], fontsize=8)
+    fig.text(0.01, 0.01, "Lower is better. v1-v5: BF16 path; v6-v11: the FP8 path (opt-in), shown for H=128. v1-v3 timed "
+             "with CUDA events, later versions with CUPTI; L2 flushed. Labels: last latency (speedup over v1).",
+             color=t["muted"], fontsize=8)
     fig.tight_layout(rect=(0, 0.04, 1, 0.92))
     return fig
 
@@ -108,17 +121,18 @@ def comparison(t, gpu):
     fig, axes = plt.subplots(2, 2, figsize=(10, 6.2))
     for ax, (h, b, s) in zip(axes.flat, CONFIGS):
         style(ax, t, grid_axis=None)
-        pts = sorted(((r["ms"], r["provider"]) for r in rows if (r["heads"], r["batch"], r["s_kv"]) == (h, b, s)),
+        pts = sorted(((r["ms"], r["provider"]) for r in rows
+                      if (r["heads"], r["batch"], r["s_kv"]) == (h, b, s) and r["provider"] not in TABLE_ONLY),
                      reverse=True)
         ys = range(len(pts))
         ax.barh(ys, [m for m, _ in pts], height=0.62,
-                color=[t["series"][0] if p == "nvfp4" else t["series"][1] if p == "cake" else t["gray"]
-                       for _, p in pts])
+                color=[t["series"][0] if p == "nvfp4" else t["series"][2] if p == "nvfp4-fp8"
+                       else t["series"][1] if p == "cake" else t["gray"] for _, p in pts])
         ax.set_yticks(ys, [name(p, gpu) for _, p in pts], fontsize=8.5)
         top = max(m for m, _ in pts)
         for y, (m, p) in zip(ys, pts):
-            ax.text(m + top * 0.015, y, fmt_ms(m), va="center", color=t["ink" if p == "nvfp4" else "ink2"],
-                    fontsize=8.5, fontweight="bold" if p == "nvfp4" else "normal")
+            ax.text(m + top * 0.015, y, fmt_ms(m), va="center", color=t["ink" if p in OURS else "ink2"],
+                    fontsize=8.5, fontweight="bold" if p in OURS else "normal")
         ax.set_xlim(0, top * 1.22)
         ax.set_xticks([])
         ax.spines["bottom"].set_visible(False)
@@ -133,7 +147,8 @@ def comparison(t, gpu):
 LABEL_AT = {("RTX PRO 6000", "triton:fp8", 16): (-9, -2, "right", "top"),
             ("RTX PRO 6000", "trtllm:fp8", 128): (6, 4, "left", "bottom"),
             ("B200", "cake", 16): (7, -4, "left", "top"),
-            ("B200", "nvfp4", 16): (-8, 0, "right", "center")}
+            ("B200", "nvfp4", 16): (-8, 0, "right", "center"),
+            ("RTX PRO 6000", "nvfp4", 128): (8, -6, "left", "top")}
 
 
 def roofline(t):
@@ -145,25 +160,32 @@ def roofline(t):
         ax.set_yscale("log")
         xs = [10 * 1.05 ** i for i in range(130)]
         ax.plot(xs, [min(g["bw"] * x / 1e3, g["mma"]) for x in xs], color=t["ink2"], lw=1.5, zorder=2)
-        ax.set_title(f"roofs: DRAM {g['bw']} GB/s, mma.sync BF16 {g['mma']} TFLOPS", loc="right", color=t["ink2"],
-                     fontsize=8)
+        if g["mma8"]:
+            ax.plot(xs, [min(g["bw"] * x / 1e3, g["mma8"]) for x in xs], color=t["muted"], lw=1.2, zorder=2)
+        fp8 = f" / E4M3 {g['mma8']}" if g["mma8"] else ""
+        ax.set_title(f"roofs: DRAM {g['bw']} GB/s, mma.sync BF16 {g['mma']}{fp8} TFLOPS", loc="right",
+                     color=t["ink2"], fontsize=8)
         tflops = lambda r: FLOP_PER_TOKEN_HEAD * r["heads"] * r["batch"] * r["s_kv"] / (r["ms"] * 1e-3) / 1e12
         intensity = lambda p, h: FLOP_PER_TOKEN_HEAD * h / kv_bytes(p)
         for h in (16, 128):
-            pts = sorted((VERSIONS.index(r["version"]), tflops(r)) for r in vrows
-                         if r["gpu"] == gpu and (r["heads"], r["batch"], r["s_kv"]) == (h, 64, 65536))
+            vs = VERSIONS[gpu] if h == 128 else VERSIONS[gpu][:5]
+            pts = sorted((vs.index(r["version"]), tflops(r)) for r in vrows if r["version"] in vs
+                         and r["gpu"] == gpu and (r["heads"], r["batch"], r["s_kv"]) == (h, 64, 65536))
             x = intensity("nvfp4", h)
             ax.plot([x] * len(pts), [y for _, y in pts], color=t["series"][0], lw=2, marker="o", ms=6,
-                    mec=t["surface"], mew=1.5, zorder=4, label="nvfp4-mla, v1 → v5" if h == 16 else None)
-            roof = min(g["bw"] * x / 1e3, g["mma"])
+                    mec=t["surface"], mew=1.5, zorder=4)
+            last = vs[len(pts) - 1]
+            fp8_roof = last not in VERSIONS["B200"]  # v6 on: FP8 MMA
+            roof = min(g["bw"] * x / 1e3, g["mma8"] if fp8_roof else g["mma"])
             dx, dy, ha, va = LABEL_AT.get((gpu, "nvfp4", h), (8, 0, "left", "center"))
-            ax.annotate(f"H={h} v5\n{100 * pts[-1][1] / roof:.0f}% of roof", (x, pts[-1][1]), xytext=(dx, dy),
-                        textcoords="offset points", ha=ha, va=va, color=t["ink"], fontsize=8)
+            ax.annotate(f"H={h} {last}\n{100 * pts[-1][1] / roof:.0f}% of {'E4M3 ' if fp8_roof else ''}roof",
+                        (x, pts[-1][1]), xytext=(dx, dy), textcoords="offset points", ha=ha, va=va, color=t["ink"],
+                        fontsize=8)
             ax.annotate("v1", (x, pts[0][1]), xytext=(-8, 0), textcoords="offset points", ha="right",
                         va="center", color=t["ink2"], fontsize=8)
         # only the rival per head count (fastest other library) and Cake; the bar charts carry the rest
         rows = [r for r in load(RES / g["csv"]) if (r["batch"], r["s_kv"]) == (64, 65536)
-                and r["provider"] not in ("nvfp4", "nvfp4+fa2")]
+                and r["provider"] not in OURS + TABLE_ONLY]
         rivals = {(min((r for r in rows if r["heads"] == h), key=lambda r: r["ms"])["provider"], h) for h in (16, 128)}
         for r in rows:
             if (r["provider"], r["heads"]) not in rivals and r["provider"] != "cake":
@@ -182,8 +204,8 @@ def roofline(t):
         ax.set_xlabel("arithmetic intensity (flop per KV byte)", color=t["ink2"])
         title(ax, t, gpu)
     axes[0].set_ylabel("achieved TFLOPS", color=t["ink2"])
-    fig.text(0.01, 0.01, "Batch 64, 64K tokens, q_len 1. The compute roof is mma.sync BF16, the instruction this "
-             "kernel uses; FP8/FP4 kernels have higher compute roofs.", color=t["muted"], fontsize=8)
+    fig.text(0.01, 0.01, "Batch 64, 64K tokens, q_len 1. Compute roofs are this kernel's mma.sync: BF16 for v1-v5, E4M3 for "
+             "the FP8 path (v6-v11). tcgen05 kernels (trtllm-gen, Cake) have higher roofs.", color=t["muted"], fontsize=8)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     return fig
 

@@ -15,7 +15,9 @@ import triton_mla
 
 CKV, KPE, QK_NOPE = 512, 64, 128
 SM_SCALE = (QK_NOPE + KPE) ** -0.5
-PROVIDERS = ["fa2", "cutlass", "trtllm:bf16", "trtllm:fp8", "triton:bf16", "triton:fp8"]
+PROVIDERS = ["fa2", "cutlass", "cutile", "cute-dsl-monolithic", "cute-dsl-modular", "trtllm:bf16", "trtllm:fp8",
+             "triton:bf16", "triton:fp8"]
+PACKED = ("cutlass", "cute-dsl-monolithic", "cute-dsl-modular")  # these take [.., 576] query and KV
 
 
 @functools.lru_cache(maxsize=1)
@@ -61,8 +63,9 @@ def triton(inp, variant):
 
 
 def wrapper(inp, backend):
-    """FlashInfer BatchMLAPagedAttentionWrapper; fa2 runs anywhere, cutlass needs SM100 and 128 heads."""
-    packed = backend == "cutlass"  # cutlass takes packed [B, H, 576] / [P, ps, 576]
+    """FlashInfer BatchMLAPagedAttentionWrapper, BF16 KV. fa2 runs anywhere; cutlass needs SM100 and 128 heads; cutile
+    (cuTile) runs on SM100 and SM12x; the cute-dsl backends (CuTe DSL) target SM100."""
+    packed = backend in PACKED
     layout = "packed" if packed else "split"
     w = BatchMLAPagedAttentionWrapper(workspace(), backend=backend)
     md = MLAPlanMetadata.dense(cum_seq_lens_q=torch.arange(inp.batch + 1, dtype=torch.int32, device="cuda"),
@@ -73,7 +76,8 @@ def wrapper(inp, backend):
     if packed:
         q = torch.cat([inp.q_nope, inp.q_pe], -1).contiguous()
         kv = torch.cat([inp.ckv, inp.kpe], -1).contiguous()
-        return lambda: w.run(query=q, kv_cache=kv)
+        out = torch.empty(inp.batch, inp.heads, CKV, dtype=torch.bfloat16, device="cuda")  # cute-dsl needs it
+        return lambda: w.run(query=q, kv_cache=kv, out=out)
     return lambda: w.run(query=(inp.q_nope, inp.q_pe), kv_cache=(inp.ckv, inp.kpe))
 
 
@@ -92,7 +96,7 @@ def trtllm(inp, variant):
 
 def make(provider, inp):
     kind, _, variant = provider.partition(":")
-    if kind in ("fa2", "cutlass"):
+    if kind in ("fa2", "cutile") or kind in PACKED:
         return wrapper(inp, kind)
     if kind == "trtllm":
         return trtllm(inp, variant)
