@@ -538,6 +538,54 @@ ncu at H=128 B64 64K:
   (H=16 B1 64K: 0.043 ms vs 0.045 for v6 and 0.050 for v9). Choosing between the two paths per shape is a separate,
   measured step before the FP8 path becomes the default.
 
+### v10 hypothesis: FP4 QK with block scales (speed mode, FP4 query)
+
+After v9 the largest stall source is the conversion chain (31% of samples), then the MMAs (21%). FP4 QK attacks
+only the second: V still has to be converted to E4M3 for PV, so the conversion stays.
+
+Layout, checked first with a probe of `mma.sync kind::mxf4nvf4.block_scale.scale_vec::4X m16n8k64` against a PyTorch
+reference (exact match, with a different scale per column):
+- A: `a0` = row g, k 8t..8t+7 (8 codes, low nibble first), `a1` row g+8, `a2`/`a3` the same at k 32+8t.
+  B: `b0` = column g, k 8t..8t+7; `b1` k 32+8t.
+- Scales: lane (g, t) passes 4 E4M3 bytes (one per k16 block): row g + 8 (t % 2) for A, column g for B.
+
+Design (QK only; RoPE stays FP8; softmax, P and PV unchanged from v9):
+- k64 step s covers latent channels 64s..64s+63 in order, so each k16 block is one 16-channel scale block of the
+  cache, and K's B fragments are the cache bytes as stored: 4 `ldmatrix.x4` per tile, no conversion for QK. The
+  B scales are the token's 32 scale bytes.
+- The same registers are the source of the E4M3 conversion for the V tile, which removes the separate cache reads.
+  Thread t then holds exactly chunks 2t and 2t+1 of each 128-channel block of the V tile, and v9's swizzle stays
+  conflict-free for these stores.
+- Q: E2M1 codes with an E4M3 scale per 16 channels and an fp32 scale per row (FlashInfer Cake's scheme), 48
+  registers instead of 72.
+
+Predictions:
+- MMAs per warp per tile: 34 -> 26; instructions per tile about 513 -> 495.
+- H=128 B64 64K, same run as v9: -3% to -8%.
+- Error against the BF16 cache: +28% to +55% over v9 (as simulated), about the level of FlashInfer Cake.
+- Decision rule: keep as an opt-in mode if H=128 B64 64K is 3% or more faster; it never replaces the FP8 mode.
+
+### v10 result: FP4 QK, a small gain at a large accuracy cost
+
+239 registers, no spills; the FP8 path is unchanged by the refactor (bitwise equal to v9).
+
+| | v9 (FP8) | v10 (FP4 QK) | predicted |
+|---|---|---|---|
+| H=128 B64 64K (same run, 5 rounds) | 3.027 ms | 2.877 ms (-4.5%) | -3% to -8% |
+| other H=128, batch 16-64 | | -2% to -5% | |
+| H=128 batch 1, H=16 | | 0% to +9% | |
+| MMAs per warp per tile | 34 | 26 | 26 |
+| instructions per warp per tile | 513 | 564 (+10%) | about 495 |
+| tensor pipe busy | 46% | 37% | |
+| stall share at the FP8 MMAs | 21% | 10% | |
+| error vs the BF16 cache (9 shapes) | 0.085-0.161 | 0.096-0.201 (+3% to +55%) | +28% to +55% |
+
+- The MMA count and the MMA stalls fell as predicted, and the time fell by the predicted amount.
+- The instruction count rose instead of falling: integer work (`IMAD`, `LOP3`; 16% of stall samples together) for
+  the `ldmatrix` row addresses, the runtime byte selectors and the scale extraction.
+- Decision: keep as an opt-in mode (`precision=2`); the rule asked for 3%. It trades 25-55% more error on most shapes
+  for 4-5% on large compute-bound ones.
+
 ### Later: B200
 
 FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:

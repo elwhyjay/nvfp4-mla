@@ -21,8 +21,8 @@ CASES = [  # (kv_lens, page_size, heads)
 ]
 
 
-def run(c, build="native", splits=0, stages=3, fp8=False):
-    return nvfp4_mla._load(*BUILDS[build]).decode(*c.args(), int(c.kv_lens.max()), splits, stages, fp8)
+def run(c, build="native", splits=0, stages=3, precision=0):
+    return nvfp4_mla._load(*BUILDS[build]).decode(*c.args(), int(c.kv_lens.max()), splits, stages, precision)
 
 
 def check(out, c, label):
@@ -77,11 +77,23 @@ def test_decode_fp8(num_splits, kv_lens, page_size, heads):
     """FP8 QK and PV: a few percent of extra error over the dequantized cache, and close to the BF16 path against
     the unquantized cache."""
     c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
-    out = run(c, splits=num_splits, fp8=True)
+    out = run(c, splits=num_splits, precision=1)
     assert not out.isnan().any()
     assert rel_l2(out, c.reference()) < 0.08  # E4M3 rounding of Q, K, V and P; measured up to 0.061
     ref = c.reference_bf16()
     assert rel_l2(out, ref) < 1.2 * rel_l2(run(c, splits=num_splits), ref)  # measured up to 1.11x
+
+
+@pytest.mark.parametrize("num_splits", [0, 3])
+@pytest.mark.parametrize("kv_lens,page_size,heads", CASES)
+def test_decode_fp4_qk(num_splits, kv_lens, page_size, heads):
+    """FP4 QK (FP4 query): more error than the FP8 path, about FlashInfer Cake's."""
+    c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
+    out = run(c, splits=num_splits, precision=2)
+    assert not out.isnan().any()
+    assert rel_l2(out, c.reference()) < 0.2  # measured up to 0.133
+    ref = c.reference_bf16()
+    assert rel_l2(out, ref) < 2.0 * rel_l2(run(c, splits=num_splits), ref)  # measured up to 1.71x
 
 
 def test_public_api():

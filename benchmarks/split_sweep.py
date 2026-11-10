@@ -78,7 +78,7 @@ for H, B, L in SHAPES:
             n = (L + chunk - 1) // chunk
             if n in res or chunk < TILE:
                 continue
-            t = kernel_ms(lambda: f(*c.args(), L, n, stages, path == "fp8"))
+            t = kernel_ms(lambda: f(*c.args(), L, n, stages, int(path == "fp8")))
             res[n] = t
             rows.append(dict(path=path, stages=stages, heads=H, batch=B, s_kv=L, splits=n, auto=int(n == auto),
                              decode_ms=t["decode"], combine_ms=t["combine"], total_ms=t["decode"] + t["combine"]))
