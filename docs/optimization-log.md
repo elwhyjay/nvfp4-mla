@@ -470,6 +470,74 @@ Where the v6 warps actually wait (stall samples at H=128 B64 64K, by the instruc
 No single item dominates. The cross-warp sum and the row maximum (19% together) come from the decomposition
 itself: the four warps of a CTA split QK by channel, so every tile ends with a 4-way sum of 16 x 32 partial scores.
 
+### v9 hypothesis: split QK by token instead of by channel
+
+v6's warps split QK by channel, which costs a 4-way sum of 16 x 32 fp32 partial scores every tile, and every warp
+then computes the softmax of all 32 tokens. The new decomposition for the FP8 path (CTA = 16 heads, 4 warps,
+32-token tiles):
+
+- QK: warp w takes tokens 8w..8w+7 over all 576 channels. Thread t's part of the reduction axis is latent channels
+  [128t, +128) and RoPE [16t, +16), so the MMA itself sums over the four threads and the scores need no cross-warp
+  sum. Q (E4M3, 72 registers) stays in registers; its per-row scale needs only shuffles, since each warp holds the
+  whole row.
+- Softmax: each warp computes p only for its own 8 tokens. The warps exchange one row maximum per row through
+  shared memory; the row sums stay per warp and are added once at the end.
+- Each thread converts its token's 128 latent channels (the same number of elements as in v6), uses them for QK, and
+  stores them to a 16 KB E4M3 V tile in shared memory. P (16 x 32 E4M3) also goes through shared memory.
+- PV: warp w takes latent channels [128w, +128) over all 32 tokens. V fragments come from `ldmatrix.trans` and a byte
+  permute (no `movmatrix`). The V tile's channel order is chosen so that PV writes the same accumulator registers as
+  v6, and every shared-memory access pattern is XOR-swizzled to be bank-conflict free.
+- Shared memory is 40 KB with 2 stages (2 CTAs per SM); 3 barriers per tile instead of 2.
+
+Predictions:
+- Instructions per warp per tile: 715 -> about 420 (-40%): no cross-warp score sum (about -64), no `movmatrix`
+  (-32), a quarter of the softmax and P conversion (about -90), fewer tile-level reloads.
+- Registers about 220-240, no spills.
+- H=128 B64 64K, same run as v6: -20% to -30% (from about 3.6 ms to 2.6-2.9 ms).
+- H=16 (memory-bound): within 3%. Error against the BF16 cache within 2% of v6.
+- Decision rule: keep if H=128 B64 64K is 10% or more faster and no H=16 shape is more than 3% slower.
+
+### v9 result: faster where it is compute-bound, slower on small problems
+
+243 registers, no spills; output within 2e-4 of v6 (summation order). `ab.py` now times the two kernels alternately
+(5 rounds after a warm-up): two plain runs of the same build differed by up to 40% on 25-80 us shapes, depending on
+what ran before them.
+
+v9 time / v6 time (median of 5 rounds; the per-round spread is within 2% except where noted):
+
+| | B1 | B4 | B16 | B64 |
+|---|---|---|---|---|
+| H=128, 4K tokens | 1.15 | 1.16 | 0.97 | 0.91 |
+| H=128, 16K | 1.12 | 0.97 | 0.90 | 0.88 |
+| H=128, 64K | 1.01 | 0.89 | 0.87 | **0.86** |
+| H=16, 4K | 1.18 | 1.11 | 1.03 | 1.03 |
+| H=16, 16K | 1.24 | 1.07 | 1.03 | 1.00 |
+| H=16, 64K | 1.13 | 1.04 | 1.00 | 1.00 |
+
+ncu at H=128 B64 64K:
+
+| | v6 | v9 | predicted |
+|---|---|---|---|
+| instructions per warp per tile | 715 | 513 (-28%) | about 420 |
+| cross-warp sum (`FADD`) | 66 | 18 | |
+| `MOVM` | 32 | 0 | 0 |
+| softmax (`FFMA`, `MUFU`) | 52 | 16 | a quarter |
+| tensor pipe busy | 40% | 46% | |
+| kernel time | 3.71 ms | 3.08 ms (-17%) | -20% to -30% |
+
+- The mechanism works as intended, at about two thirds of the predicted size: the cross-warp score sum, the transposes
+  and three quarters of the softmax are gone. The largest stall source is now the conversion chain (`F2FP`, `HMUL2`,
+  `PRMT`: 31% of samples), then the MMAs (21%).
+- Small problems (batch 1-4) got 4-24% slower. Against v6 with 2 stages they are still 9-12% slower at H=16 batch 1,
+  so the stage count is not the whole cause. With few tiles per CTA these shapes are latency-bound, and v9's tile is
+  a longer serial chain (three barriers; P goes through shared memory).
+- The decision rule is not met: H=128 B64 64K improved by 14% (needed 10%), but H=16 shapes got up to 24% slower
+  (allowed 3%).
+- Decision, with that stated: v9 becomes the FP8 path. The rule assumed the FP8 path would also serve small and
+  memory-bound shapes, but there the BF16 path (v5) is as fast or faster than both FP8 versions and more accurate
+  (H=16 B1 64K: 0.043 ms vs 0.045 for v6 and 0.050 for v9). Choosing between the two paths per shape is a separate,
+  measured step before the FP8 path becomes the default.
+
 ### Later: B200
 
 FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:

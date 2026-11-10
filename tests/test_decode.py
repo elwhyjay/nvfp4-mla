@@ -84,13 +84,6 @@ def test_decode_fp8(num_splits, kv_lens, page_size, heads):
     assert rel_l2(out, ref) < 1.2 * rel_l2(run(c, splits=num_splits), ref)  # measured up to 1.11x
 
 
-@pytest.mark.parametrize("kv_lens,page_size,heads", CASES[1:3] + CASES[4:5])
-def test_fp8_stages_match(kv_lens, page_size, heads):
-    """Pipeline depth does not change the arithmetic: with the split fixed, 2 and 3 stages agree bitwise."""
-    c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
-    assert torch.equal(run(c, splits=3, stages=2, fp8=True), run(c, splits=3, fp8=True))
-
-
 def test_public_api():
     c = RandomCache([300, 70], page_size=16, heads=16, ckv_scale=0.5, kpe_scale=2.0)
     check(nvfp4_mla.decode(*c.args()), c, "nvfp4_mla.decode")
