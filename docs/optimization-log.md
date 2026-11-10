@@ -411,6 +411,65 @@ only B1 16K got faster.
   schedulers can switch to. Two small independent CTAs per SM give more of that than one large one.
 - Decision: drop the two-group CTA; its code is not kept on main.
 
+### v8 hypothesis: convert the next tile while the current one finishes
+
+The measurements since v6 point to the latency of each warp's chain, not to the amount of work: tensor pipe 40% busy,
+issue slots about 50%, and dependency stalls (`wait` and short scoreboard) 37% of all samples. Within a tile the
+chain is strictly ordered: read and convert K/V, QK, write the partial scores, wait for the other three warps, sum,
+softmax, PV. With 2 warps per scheduler, little else is ready while a warp waits.
+
+Change (FP8 path):
+- Convert one tile ahead. At iteration i the K/V of tile i are already E4M3 fragments in registers. The conversion
+  of tile i+1 (its smem reads plus about 210 conversion instructions) runs between the warp's arrival at the
+  cross-warp barrier and its wait, after the V transposes.
+- Tile i's shared memory is fully read during iteration i-1, so its stage can be refilled at iteration i. With the
+  same 3 stages the prefetch depth stays 2 tiles.
+- The current tile's fragments are dead after the V transposes, so the next tile's can reuse their registers.
+
+Predictions:
+- Registers 168 -> about 190; still 2 CTAs per SM (shared memory is the limit).
+- Instructions per tile about the same (within 3% of 715).
+- Issue slots 48% -> 55-60%; the share of dependency and barrier stalls drops.
+- H=128 B64 64K: 3.45 ms -> 3.0-3.2 ms (-7% to -13%). H=16 (memory-bound) within 3%.
+- Decision rule: keep if H=128 B64 64K improves by 5% or more and no measured shape gets more than 3% slower.
+
+### v8 result: slower, and the reason is in the structure
+
+Same-run A/B ([`ab.py`](../benchmarks/ab.py): the v6 source and v8 built side by side; outputs bitwise identical):
+
+| | v6 | v8 | predicted |
+|---|---|---|---|
+| H=128 B64 64K | 3.745 ms | 3.867 ms (+3.3%) | -7% to -13% |
+| other H=128 shapes | | +2% to +6% (B1 4K -16%) | |
+| H=16 shapes | | -1% to +6% | within 3% |
+| registers | 168 | 242 | about 190 |
+| instructions per warp per tile | 715 | 748 | about the same |
+| issue slots busy | 48% | 49% | 55-60% |
+| tensor pipe busy | 40% | 38% | |
+
+The v6 reference measured 3.745 ms here and 3.45-3.55 ms in earlier runs: run-to-run variation on the rented GPUs is
+up to 8%, so from here on comparisons are made within one run.
+
+- The next tile's fragments did not reuse the current tile's registers (242 instead of about 190), and computing
+  the next stage's addresses added about 50 integer instructions per tile.
+- No overlap was gained. All four warps of a CTA do the same work and reach the cross-warp barrier at nearly the
+  same time, so that wait was short to begin with. The softmax and PV after the barrier are a separate basic block
+  (the `try_wait` loop ends one), so the scheduler cannot interleave the conversion with them.
+- Decision: drop v8.
+
+Where the v6 warps actually wait (stall samples at H=128 B64 64K, by the instruction the warp waits at):
+
+| instruction | share | main reason |
+|---|---|---|
+| `QMMA` (FP8 MMA) | 20% | math pipe throttle (64%): QK issues 20 and PV 16 MMAs back to back, so the tensor pipe is saturated in bursts and idle in between |
+| `FADD` | 13% | short scoreboard (66%): the cross-warp sum waits for its shared-memory loads |
+| `MOVM` + `PRMT` | 13% | fixed-latency dependency: the V transpose chain |
+| `F2FP` (conversions) | 11% | |
+| `FMNMX` | 6% | short scoreboard: the row maximum waits for its shuffles |
+
+No single item dominates. The cross-warp sum and the row maximum (19% together) come from the decomposition
+itself: the four warps of a CTA split QK by channel, so every tile ends with a 4-way sum of 16 x 32 partial scores.
+
 ### Later: B200
 
 FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:
