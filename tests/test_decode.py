@@ -142,3 +142,15 @@ def test_query_terms(terms):
     err = rel_l2((lut[codes] * sf).sum(2) * g[..., None], q.float())
     print(f"{terms} terms: rel-L2 {err:.2e}")
     assert err < (3e-3 if terms == 3 else 3e-4)
+
+
+def test_rope_terms():
+    """The SM100 kernel's RoPE query: 3 E4M3 terms with one scale per row reconstruct the BF16 q_pe."""
+    g0 = torch.Generator(device="cuda").manual_seed(1)
+    q = (torch.randn(4, 32, 64, device="cuda", generator=g0)
+         * torch.exp(1.5 * torch.randn(64, device="cuda", generator=g0))).bfloat16()
+    q8, s = nvfp4_mla._load().rope_terms(q, 3)
+    rec = q8.view(torch.float8_e4m3fn).float().sum(2) * s[..., None]
+    err = rel_l2(rec, q.float())
+    print(f"rope terms: rel-L2 {err:.2e}")
+    assert err < 1e-4

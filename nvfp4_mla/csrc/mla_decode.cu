@@ -1201,6 +1201,44 @@ std::vector<torch::Tensor> query_terms(torch::Tensor q_nope, int64_t terms) {
   return {q4, qsf, g};
 }
 
+// q_pe as T E4M3 terms with one FP32 scale per row, s = amax / 448: q_pe ~ s * sum_t e4m3_t (the SM100 kernel's RoPE
+// MMA is E4M3 x E4M3 on the cache's kpe bytes). One warp per row; lane j owns channels 2j, 2j + 1.
+template <int T>
+__global__ void __launch_bounds__(128) rope_terms_kernel(const __nv_bfloat16* __restrict__ q, int rows,
+                                                         uint8_t* __restrict__ q8, float* __restrict__ s_out) {
+  const int row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
+  if (row >= rows) return;
+  float2 r = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(q + size_t(row) * KPE + 2 * lane));
+  float amax = fmaxf(fabsf(r.x), fabsf(r.y));
+#pragma unroll
+  for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, o));
+  const float sc = amax > 0.f ? amax / 448.f : 1.f, inv = 1.f / sc;
+  if (lane == 0) s_out[row] = sc;
+#pragma unroll
+  for (int t = 0; t < T; ++t) {
+    const uint32_t w = pack_e4m3x4(r.x * inv, r.y * inv, 0.f, 0.f) & 0xffff;
+    const uint32_t h = e4m3x2_to_f16x2(uint16_t(w));
+    const float2 d = __half22float2(*reinterpret_cast<const __half2*>(&h));
+    r.x -= d.x * sc, r.y -= d.y * sc;
+    *reinterpret_cast<uint16_t*>(q8 + (size_t(row) * T + t) * KPE + 2 * lane) = uint16_t(w);
+  }
+}
+
+// q_pe [B, H, 64] bf16 -> q8 [B, H, T, 64] (E4M3), s [B, H] (FP32): q_pe ~ s * sum_t q8_t.
+std::vector<torch::Tensor> rope_terms(torch::Tensor q_pe, int64_t terms) {
+  TORCH_CHECK(q_pe.dim() == 3 && q_pe.size(2) == KPE && q_pe.scalar_type() == at::kBFloat16 && q_pe.is_contiguous(),
+              "q_pe must be contiguous bfloat16 [batch, heads, 64]");
+  TORCH_CHECK(terms == 3, "terms must be 3");
+  const at::cuda::OptionalCUDAGuard guard(q_pe.device());
+  const int B = q_pe.size(0), H = q_pe.size(1), rows = B * H;
+  auto q8 = torch::empty({B, H, terms, KPE}, q_pe.options().dtype(at::kByte));
+  auto sc = torch::empty({B, H}, q_pe.options().dtype(at::kFloat));
+  rope_terms_kernel<3><<<(rows + 3) / 4, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_pe.data_ptr()), rows, q8.data_ptr<uint8_t>(), sc.data_ptr<float>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {q8, sc};
+}
+
 // Merge split-KV partials o_part [splits, B, H, 512] / lse_part [splits, B, H] (as decode writes them) into out.
 void combine(torch::Tensor o_part, torch::Tensor lse_part, torch::Tensor out) {
   TORCH_CHECK(o_part.dim() == 4 && o_part.size(3) == CKV && o_part.scalar_type() == at::kFloat && o_part.is_contiguous(),
@@ -1222,4 +1260,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode", &decode);
   m.def("dequantize", &dequantize);
   m.def("query_terms", &query_terms);
+  m.def("rope_terms", &rope_terms);
 }

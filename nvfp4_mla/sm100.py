@@ -124,6 +124,27 @@ def tmem_st16x256(taddr: Uint32, w0: Uint32, w1: Uint32, w2: Uint32, w3: Uint32,
                     has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 
+@dsl_user_op
+def cp_async16(dst: Uint32, src: Int64, nbytes: Uint32, *, loc=None, ip=None):
+    """16 bytes global -> shared, bypassing L1; nbytes = 0 zero-fills the destination without reading."""
+    llvm.inline_asm(None, [Uint32(dst).ir_value(loc=loc, ip=ip), Int64(src).ir_value(loc=loc, ip=ip),
+                           Uint32(nbytes).ir_value(loc=loc, ip=ip)],
+                    "cp.async.cg.shared.global [$0], [$1], 16, $2;", "r,l,r", has_side_effects=True,
+                    is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cp_async_commit(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], "cp.async.commit_group;", "", has_side_effects=True, is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cp_async_wait(pending: int, *, loc=None, ip=None):
+    llvm.inline_asm(None, [], f"cp.async.wait_group {pending};", "", has_side_effects=True, is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
 @cute.jit
 def store8(dst: cute.Tensor, u0: Uint32, u1: Uint32, u2: Uint32, u3: Uint32):
     """Store 16 bytes held as 4 words to a shared-memory slice of 16 bytes (8 f16 or 32 e2m1)."""
@@ -800,6 +821,568 @@ class DecodeV1:
         tmem.free(tmem_ptr)
 
 
+class DecodeV2:
+    """v2: v1b's data path with each step in its own warps, so consecutive tiles overlap.
+
+    Warps 0-3 load (thread = token: cp.async of the raw bytes into a ring of tiles, then the scale layouts from shared
+    memory), 4-7 convert V into TMEM, 8-11 run the softmax, warp 12 issues the MMAs; warps 13-15 only complete its
+    warpgroup. Within a role, warp w % 4 owns TMEM lanes 32 (w % 4) .. + 31, its threads' tokens / channels.
+    Registers are assigned per warpgroup, so a 13th warp would cost a whole one: 512 threads start at 128 registers
+    and setmaxnreg moves them from load and MMA to convert and softmax (ptxas drops setmaxnreg unless the launch
+    fixes the registers at entry: min_blocks_per_mp=1).
+
+    feat (v2.2, each on its own for the ablation):
+      lazy   a head's maximum moves only when it grows by more than 8 (log2), so most tiles skip the O rescale and
+             the wait for PV(i - 1); two P buffers.
+      rope8  RoPE as E4M3 x E4M3 on the raw kpe bytes (query as 3 E4M3 terms along K); the ring holds raw bytes only
+             (4 stages), the scale layouts made from them have 2 buffers.
+      qksm   QK(i + 1) issued by the first softmax warp right after S(i) is read; the MMA warp keeps only PV.
+      vhalf  V converted and consumed in two 64-token halves (PV half by half).
+    """
+
+    REGS = {0: 72, 1: 152, 2: 176, 3: 112}  # per role; sum x 128 threads = 65536
+    FEATS = ("lazy", "rope8", "qksm", "vhalf")
+
+    def __init__(self, n: int, page_size: int, terms: int, feat: str = "", stub: str = ""):
+        # stub (measurement only, wrong results): roles in it skip their work but keep their pipeline signals
+        self.n, self.ps, self.terms, self.stub = n, page_size, terms, stub
+        self.lazy, self.rope8, self.qksm, self.vhalf = (f in feat.split(",") for f in self.FEATS)
+        self.stages = 4 if self.rope8 else 2  # raw ring
+        self.nd = 2  # buffers of the scale layouts derived from the raw scales (tile index % nd)
+        self.np = 2 if self.lazy else 1  # P buffers
+        self.nv = 2 if self.vhalf else 1  # V parts
+
+    @cute.jit
+    def __call__(self, q4: cute.Tensor, qsf: cute.Tensor, qg: cute.Tensor, q_pe: cute.Tensor, qpe8: cute.Tensor,
+                 qps: cute.Tensor, ckv: cute.Tensor, sf: cute.Tensor, kpe: cute.Tensor, page_table: cute.Tensor,
+                 kv_lens: cute.Tensor, out: cute.Tensor, o_part: cute.Tensor, lse_part: cute.Tensor, chunk: Int32,
+                 splits: Int32, scale_log2: Float32, kpe_ratio: Float32, out_scale: Float32, stream):
+        n, terms, st = self.n, self.terms, self.stages
+        nq = terms * n
+        mma_qk = cute.make_tiled_mma(tcgen05.MmaMXF4NVF4Op(Float8E4M3FN, (TILE, nq, 64), tcgen05.CtaGroup.ONE,
+                                                           tcgen05.OperandSource.SMEM))
+        pe_t = Float8E4M3FN if self.rope8 else Float16
+        mma_pe = sm100_utils.make_trivial_tiled_mma(pe_t, pe_t, OperandMajorMode.K, OperandMajorMode.K, Float32,
+                                                    tcgen05.CtaGroup.ONE, (TILE, n))
+        mma_vp = sm100_utils.make_trivial_tiled_mma(Float16, Float16, OperandMajorMode.K, OperandMajorMode.MN,
+                                                    Float32, tcgen05.CtaGroup.ONE, (TILE, n), tcgen05.OperandSource.TMEM)
+        mma_sn = sm100_utils.make_trivial_tiled_mma(Float16, OperandMajorMode.K, OperandMajorMode.K, Float32,
+                                                    tcgen05.CtaGroup.ONE, (TILE, nq))
+        atom4 = tcgen05.make_smem_layout_atom(tcgen05.mma.SmemLayoutAtomKind.K_SW128, Float4E2M1FN)
+        kind_pe = tcgen05.mma.SmemLayoutAtomKind.K_SW64 if self.rope8 else tcgen05.mma.SmemLayoutAtomKind.K_SW128
+        atom_pe = tcgen05.make_smem_layout_atom(kind_pe, pe_t)
+        tiler = (TILE, nq, CKV)
+        npe = 3 if self.rope8 else 1  # query RoPE terms, along K
+        self.kernel(q4, qsf, qg, q_pe, qpe8, qps, ckv, sf, kpe, page_table, kv_lens, out, o_part, lse_part, chunk,
+                    scale_log2, kpe_ratio, out_scale, mma_qk, mma_pe, mma_vp, mma_sn,
+                    cute.tile_to_shape(atom4, (TILE, CKV, st), order=(0, 1, 2)),
+                    cute.tile_to_shape(atom4, (nq, CKV), order=(0, 1)),
+                    cute.tile_to_shape(atom_pe, (TILE, KPE, st if self.rope8 else self.nd), order=(0, 1, 2)),
+                    cute.tile_to_shape(atom_pe, (n, KPE, npe), order=(0, 1, 2)),
+                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), Float16, self.np),
+                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), Float16, 1),
+                    bsl.make_smem_layout_sfa(mma_qk, tiler, SF_VEC, self.nd),
+                    bsl.make_smem_layout_sfb(mma_qk, tiler, SF_VEC, 1)).launch(
+            grid=[q_pe.shape[1] // n, q_pe.shape[0], splits], block=[512, 1, 1], min_blocks_per_mp=1, stream=stream)
+
+    def views(self, mma_qk, mma_pe, mma_vp, mma_sn, lsfa, lsfb, lp1, tmem_ptr, sK4, sQ4, sKpe, sQpe, sP, sSFA, sSFB,
+              sG, sC, wt):
+        """Operand fragments, TMEM tensors and copy partitions. Called inside each role after its setmaxnreg, so none
+        of it is live across the register reassignment (unused parts are dead code in each role)."""
+        n, terms = self.n, self.terms
+        nq = terms * n
+        thr_qk = mma_qk.get_slice(0)
+        thr_pe = mma_pe.get_slice(0)
+        thr_vp = mma_vp.get_slice(0)
+        tCrK4 = mma_qk.make_fragment_A(thr_qk.partition_A(sK4))  # (MMA, 1, 8, stages)
+        tCrQ4 = mma_qk.make_fragment_B(thr_qk.partition_B(sQ4))  # (MMA, 1, 8)
+        tCrKpe = mma_pe.make_fragment_A(thr_pe.partition_A(sKpe))  # (MMA, 1, kpe k-steps, buffers)
+        tCrQpe = mma_pe.make_fragment_B(thr_pe.partition_B(sQpe))  # (MMA, 1, k-steps, query terms)
+        tCrP = mma_vp.make_fragment_B(sP)  # (MMA, 1, 8, P buffers)
+
+        # TMEM: S latent (terms x n), S RoPE (n), O^T (4 x n), SFA, SFB; V^T in columns 256-511
+        s_shape = mma_vp.partition_shape_C((TILE, n, 1))
+        s_layout = mma_vp.make_fragment_C(s_shape).layout
+        tCtSn = cute.make_tensor(tmem_ptr, mma_sn.make_fragment_C(mma_sn.partition_shape_C((TILE, nq, 1))).layout)
+        col_n = tcgen05.find_tmem_tensor_col_offset(tCtSn)
+        tCtSp = cute.make_tensor(tmem_ptr + col_n, s_layout)
+        col = tcgen05.find_tmem_tensor_col_offset(tCtSp)
+        tCtO = cute.make_tensor(tmem_ptr + col_n + col,
+                                mma_vp.make_fragment_C(mma_vp.partition_shape_C((TILE, n, 4))).layout)
+        col_sf = col_n + col + tcgen05.find_tmem_tensor_col_offset(tCtO)
+        tCtSFA = cute.make_tensor(cute.recast_ptr(tmem_ptr + col_sf, dtype=Float8E4M3FN),
+                                  bsl.make_tmem_layout_sfa(mma_qk, (TILE, n, CKV), SF_VEC,
+                                                           cute.slice_(lsfa, (None, None, None, 0))))
+        col_sfa = tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+        tCtSFB = cute.make_tensor(cute.recast_ptr(tmem_ptr + col_sf + col_sfa, dtype=Float8E4M3FN),
+                                  bsl.make_tmem_layout_sfb(mma_qk, (TILE, n, CKV), SF_VEC,
+                                                           cute.slice_(lsfb, (None, None, None, 0))))
+        tAtV = cute.make_tensor(cute.recast_ptr(tmem_ptr + 256, dtype=Float16),
+                                thr_vp.make_fragment_A(mma_vp.partition_shape_A((TILE, TILE, 4))).layout)
+
+        s2t = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE), Float8E4M3FN)
+        cp_sfa = tcgen05.make_s2t_copy(s2t, cute.filter_zeros(tCtSFA))
+        thr_cpa = cp_sfa.get_slice(0)
+        sfa_src = tcgen05.get_s2t_smem_desc_tensor(cp_sfa, thr_cpa.partition_S(cute.filter_zeros(sSFA)))
+        sfa_dst = thr_cpa.partition_D(cute.filter_zeros(tCtSFA))
+        cp_sfb = tcgen05.make_s2t_copy(s2t, cute.filter_zeros(tCtSFB))
+        thr_cpb = cp_sfb.get_slice(0)
+        sfb_src = tcgen05.get_s2t_smem_desc_tensor(cp_sfb, thr_cpb.partition_S(cute.filter_zeros(sSFB)))
+        sfb_dst = thr_cpb.partition_D(cute.filter_zeros(tCtSFB))
+
+        # P^T buffer b as the (token, head) C tile of QK, so softmax threads store their own rows
+        tCsP = [cute.composition(cute.make_tensor(cute.recast_ptr(sP.iterator + b * cute.cosize(lp1), lp1.inner,
+                                                                  dtype=Float16), lp1.outer),
+                                 cute.make_ordered_layout(s_shape, order=((2, 0), 3, 1, 4))) for b in range(self.np)]
+        rep = tcgen05.Repetition(n)
+        ld_s = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(rep), Float32), tCtSp[None, None, None, 0])
+        st_o = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.St32x32bOp(rep), Float32), tCtO[None, None, None, 0])
+        thr_ld = ld_s.get_slice(wt)
+        thr_st = st_o.get_slice(wt)
+        tStSn = [thr_ld.partition_S(cute.make_tensor(tmem_ptr + t * col, s_layout)) for t in range(terms)]
+        tStSp = thr_ld.partition_S(tCtSp)
+        tSsP = [thr_ld.partition_D(x) for x in tCsP]
+        tStO = thr_ld.partition_S(tCtO)
+        tOtO = thr_st.partition_D(tCtO)
+        bcast = cute.make_layout((TILE, n), stride=(0, 1))
+        tSsG = thr_ld.partition_D(thr_vp.partition_C(cute.make_tensor(sG.iterator, bcast)))
+        tSsC = thr_ld.partition_D(thr_vp.partition_C(cute.make_tensor(sC.iterator, bcast)))
+        tScS = thr_ld.partition_D(thr_vp.partition_C(cute.make_identity_tensor((TILE, n))))
+        frag = tSsP[0].shape[:-1]
+        return locals()
+
+    @cute.kernel
+    def kernel(self, mQ4: cute.Tensor, mQsf: cute.Tensor, mQg: cute.Tensor, mQp: cute.Tensor, mQp8: cute.Tensor,
+               mQps: cute.Tensor, mCkv: cute.Tensor, mSf: cute.Tensor, mKpe: cute.Tensor, mPt: cute.Tensor,
+               mLens: cute.Tensor, mOut: cute.Tensor, mOpart: cute.Tensor, mLse: cute.Tensor, chunk: Int32,
+               scale_log2: Float32, kpe_ratio: Float32, out_scale: Float32, mma_qk: cute.TiledMma,
+               mma_pe: cute.TiledMma, mma_vp: cute.TiledMma, mma_sn: cute.TiledMma, lk4: cute.ComposedLayout,
+               lq4: cute.ComposedLayout, lkpe: cute.ComposedLayout, lqpe: cute.ComposedLayout,
+               lp: cute.ComposedLayout, lp1: cute.ComposedLayout, lsfa: cute.Layout, lsfb: cute.Layout):
+        n, ps, terms, nst, nd, npb, nv = self.n, self.ps, self.terms, self.stages, self.nd, self.np, self.nv
+        nq = terms * n
+        tidx, _, _ = cute.arch.thread_idx()
+        warp = cute.arch.make_warp_uniform(tidx // 32)
+        lane = cute.arch.lane_idx()
+        role = warp // 4  # 0 load, 1 convert, 2 softmax, 3 MMA
+        lw, wt = warp % 4, tidx % 128  # TMEM quadrant, thread within the role
+        ht, b, z = cute.arch.block_idx()
+        _, _, splits = cute.arch.grid_dim()
+        h0 = ht * n
+
+        @cute.struct
+        class Storage:
+            kvm: cute.struct.MemRange[cutlass.Int64, 2 * nst]
+            kvc: cute.struct.MemRange[cutlass.Int64, 2 * nst]
+            s_bar: cute.struct.MemRange[cutlass.Int64, 2]
+            v_bar: cute.struct.MemRange[cutlass.Int64, 2 * nv]
+            p_bar: cute.struct.MemRange[cutlass.Int64, 2 * npb]
+            o_bar: cute.struct.MemRange[cutlass.Int64, 1]  # one arrival per finished PV (lazy)
+            tmem_buf: Int32
+
+        smem = utils.SmemAllocator()
+        stg = smem.allocate(Storage)
+        sK4 = smem.allocate_tensor(Float4E2M1FN, lk4.outer, 1024, lk4.inner)
+        sQ4 = smem.allocate_tensor(Float4E2M1FN, lq4.outer, 1024, lq4.inner)
+        pe_t = Float8E4M3FN if self.rope8 else Float16
+        sKpe = smem.allocate_tensor(pe_t, lkpe.outer, 1024, lkpe.inner)  # rope8: the raw ring; else FP16, nd buffers
+        sQpe = smem.allocate_tensor(pe_t, lqpe.outer, 1024, lqpe.inner)
+        sP = smem.allocate_tensor(Float16, lp.outer, 1024, lp.inner)
+        sSFA = smem.allocate_tensor(Float8E4M3FN, lsfa, 128)
+        sSFB = smem.allocate_tensor(Float8E4M3FN, lsfb, 128)
+        # block scales again, block-major: one 32-bit load gives 4 tokens' scales of one block
+        sSfT = smem.allocate_tensor(Uint32, cute.make_layout((CKV // 16, TILE // 4, nd), stride=(TILE // 4, 1, 1024)), 16)
+        sSfT8 = cute.make_tensor(cute.recast_ptr(sSfT.iterator, dtype=Uint8),
+                                 cute.make_layout((CKV // 16, TILE, nd), stride=(TILE, 1, 4096)))
+        # raw scales (and without rope8 the raw RoPE bytes) as copied, per stage: [token][32 B], [token][64 B]
+        sSfR = smem.allocate_tensor(Uint32, cute.make_layout((nst, TILE, 8), stride=(TILE * 8, 8, 1)), 16)
+        kr = (1, 1) if self.rope8 else (nst, TILE)  # rope8 copies RoPE straight into sKpe
+        sKpR = smem.allocate_tensor(Uint32, cute.make_layout((kr[0], kr[1], 16), stride=(kr[1] * 16, 16, 1)), 16)
+        sMx = smem.allocate_tensor(Float32, cute.make_layout((2, 4, n), stride=(4 * n, n, 1)), 16)  # tile maxima
+        sL = smem.allocate_tensor(Float32, cute.make_layout((4, n), stride=(n, 1)), 16)
+        sG = smem.allocate_tensor(Float32, cute.make_layout(n), 16)
+        sC = smem.allocate_tensor(Float32, cute.make_layout(n), 16)  # rope8: RoPE scale per head
+        # SF tiles as words: [m % 32, m / 32, j / 4] (byte 512 (j / 4) + 16 (m % 32) + 4 (m / 32) + j % 4)
+        sfa_w = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=Uint32),
+                                 cute.make_layout((32, 4, CKV // 64, nd), stride=(4, 1, 128, 1024)))
+        sfb_w = cute.make_tensor(cute.recast_ptr(sSFB.iterator, dtype=Uint32),
+                                 cute.make_layout((32, 4, CKV // 64), stride=(4, 1, 128)))
+        o_bar = stg.o_bar.data_ptr()
+
+        thr128 = lambda: pipeline.CooperativeGroup(pipeline.Agent.Thread, 128)
+        one = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        kvm = pipeline.PipelineAsyncUmma.create(num_stages=nst, producer_group=thr128(), consumer_group=one,
+                                                barrier_storage=stg.kvm.data_ptr(), defer_sync=True)
+        kvc = pipeline.PipelineAsync.create(num_stages=nst, producer_group=thr128(), consumer_group=thr128(),
+                                            barrier_storage=stg.kvc.data_ptr(), defer_sync=True)
+        _, kvm_c = kvm.make_participants()
+        _, kvc_c = kvc.make_participants()
+        s_p, s_c = pipeline.PipelineUmmaAsync.create(num_stages=1, producer_group=one, consumer_group=thr128(),
+                                                     barrier_storage=stg.s_bar.data_ptr(), defer_sync=True
+                                                     ).make_participants()
+        v_p, v_c = pipeline.PipelineAsyncUmma.create(num_stages=nv, producer_group=thr128(), consumer_group=one,
+                                                     barrier_storage=stg.v_bar.data_ptr(), defer_sync=True
+                                                     ).make_participants()
+        p_p, p_c = pipeline.PipelineAsyncUmma.create(num_stages=npb, producer_group=thr128(), consumer_group=one,
+                                                     barrier_storage=stg.p_bar.data_ptr(), defer_sync=True
+                                                     ).make_participants()
+        softmax_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
+        if tidx == 0:
+            cute.arch.mbarrier_init(o_bar, 1)
+        cute.arch.mbarrier_init_fence()
+        tmem = utils.TmemAllocator(stg.tmem_buf.ptr,
+                                   barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=512))
+        tmem.allocate(512)
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(Float32)
+
+        # ---- prologue (all 512 threads): query terms and scales; RoPE part (E4M3 terms, or FP16 x kpe / ckv scale)
+        for i in cutlass.range(tidx, 1024, 512):
+            sfb_w[i % 32, (i // 32) % 4, i // 128] = Uint32(0)
+        cute.arch.sync_threads()
+        for i in cutlass.range(tidx, n * terms * (CKV // 32), 512):
+            r, t, c = i // (terms * (CKV // 32)), (i // (CKV // 32)) % terms, i % (CKV // 32)
+            w = ld_v4(addr_of(mQ4) + ((Int64(b * mQ4.shape[1] + h0 + r) * terms + t) * (CKV // 2) + 16 * c))
+            store8(cute.local_tile(sQ4, (1, 32), (t * n + r, c)), w[0], w[1], w[2], w[3])
+        for i in cutlass.range(tidx, n * terms * (CKV // 64), 512):
+            r, t, a = i // (terms * (CKV // 64)), (i // (CKV // 64)) % terms, i % (CKV // 64)
+            sfb_w[(t * n + r) % 32, (t * n + r) // 32, a] = ld_u32(
+                addr_of(mQsf) + ((Int64(b * mQsf.shape[1] + h0 + r) * terms + t) * (CKV // 16) + 4 * a))
+        if cutlass.const_expr(self.rope8):
+            for i in cutlass.range(tidx, n * 3 * (KPE // 16), 512):
+                r, t, c = i // (3 * (KPE // 16)), (i // (KPE // 16)) % 3, i % (KPE // 16)
+                w = ld_v4(addr_of(mQp8) + ((Int64(b * mQp8.shape[1] + h0 + r) * 3 + t) * KPE + 16 * c))
+                store8(cute.local_tile(sQpe[None, None, t], (1, 16), (r, c)), w[0], w[1], w[2], w[3])
+            if tidx < n:
+                sC[tidx] = mQps[b, h0 + tidx] * kpe_ratio
+        else:
+            for i in cutlass.range(tidx, n * (KPE // 8), 512):
+                r, c = i // (KPE // 8), i % (KPE // 8)
+                w = ld_v4(addr_of(mQp) + (Int64(b * mQp.shape[1] + h0 + r) * KPE + c * 8) * 2)
+                store8(cute.local_tile(sQpe[None, None, 0], (1, 8), (r, c)), bf16x2_f16x2(w[0], kpe_ratio),
+                       bf16x2_f16x2(w[1], kpe_ratio), bf16x2_f16x2(w[2], kpe_ratio), bf16x2_f16x2(w[3], kpe_ratio))
+            if tidx < n:
+                sC[tidx] = Float32(1.0)
+        if tidx < n:
+            sG[tidx] = mQg[b, h0 + tidx]
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_threads()
+
+        t_beg = z * chunk
+        t_end = cutlass.min(mLens[b], t_beg + chunk)
+        n_tiles = cutlass.max(t_end - t_beg + TILE - 1, 0) // TILE
+        VA = (mma_qk, mma_pe, mma_vp, mma_sn, lsfa, lsfb, lp1, tmem_ptr, sK4, sQ4, sKpe, sQpe, sP, sSFA, sSFB, sG, sC, wt)
+
+        if role == 0:
+            cute.arch.setmaxregister_decrease(self.REGS[0])
+            # ---- load: iteration it starts the copies of tile it into its stage and finishes tile it - (stages - 1)
+            # (scale layouts; without rope8 also RoPE to FP16) once its copies have landed. Thread wt = token wt of the
+            # tile; rows past the end are zero-filled by the copies.
+            st_issue = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, nst)
+            st_done = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, nst)
+            k4b, sfrb = Uint32(sK4.iterator.toint()), Uint32(sSfR.iterator.toint())
+            kpb = Uint32(sKpe.iterator.toint()) if self.rope8 else Uint32(sKpR.iterator.toint())
+            nl = 0 if "load" in self.stub else 1  # stub: no global access at all (page table, copies)
+            for it in cutlass.range(n_tiles + nst - 1):
+                # Finish before acquiring: tile j is then published once tile j - 2 is released. Acquiring first
+                # waited for tile j - 1, which put this loop's own latency into every consumer's tile period.
+                if it >= nst - 1:
+                    cp_async_wait(nst - 2)
+                    sx = st_done.index
+                    dx = (it - (nst - 1)) % nd
+                    sfw = tuple(Uint32(0x38383838) if "load" in self.stub else sSfR[sx, wt, a] for a in range(8))
+                    for a in cutlass.range_constexpr(CKV // 64):
+                        sfa_w[wt % 32, wt // 32, a, dx] = sfw[a]
+                    for jj in cutlass.range_constexpr(CKV // 16):
+                        sSfT8[jj, wt, dx] = ((sfw[jj // 4] >> (8 * (jj % 4))) & Uint32(0xFF)).to(Uint8)
+                    if cutlass.const_expr(not self.rope8):
+                        for j in cutlass.range_constexpr(4):
+                            a0, a1 = e4m3x4_f16(sKpR[sx, wt, 4 * j])
+                            a2, a3 = e4m3x4_f16(sKpR[sx, wt, 4 * j + 1])
+                            store8(cute.local_tile(sKpe[None, None, dx], (1, 8), (wt, 2 * j)), a0, a1, a2, a3)
+                            a0, a1 = e4m3x4_f16(sKpR[sx, wt, 4 * j + 2])
+                            a2, a3 = e4m3x4_f16(sKpR[sx, wt, 4 * j + 3])
+                            store8(cute.local_tile(sKpe[None, None, dx], (1, 8), (wt, 2 * j + 1)), a0, a1, a2, a3)
+                    cute.arch.fence_view_async_shared()
+                    kvm.producer_commit(st_done)
+                    kvc.producer_commit(st_done)
+                    st_done.advance()
+                # Acquired even past the last tile: the previous iteration's acquire is what proves tile
+                # it - stages - 1 released, so the derived buffer (nd = 2) the step above overwrites is no longer read.
+                kvm.producer_acquire(st_issue)
+                kvc.producer_acquire(st_issue)
+                if it < n_tiles:
+                    sx = st_issue.index
+                    tok = t_beg + it * TILE + wt
+                    tokc = cutlass.min(tok, t_end - 1)
+                    slot = Int64(0)
+                    if cutlass.const_expr(nl == 1):
+                        slot = Int64(mPt[b, tokc // ps]) * ps + tokc % ps
+                    nb = Uint32(16) & Uint32(~((t_end - 1 - tok) >> 31))  # 16 for a valid row, 0 past the end
+                    for j in cutlass.range_constexpr(nl * 16):
+                        off = (j // 8) * 16384 + (wt // 8) * 1024 + (wt % 8) * 128 + ((j % 8) ^ (wt % 8)) * 16
+                        cp_async16(k4b + Uint32(sx * (TILE * CKV // 2) + off), addr_of(mCkv) + slot * (CKV // 2) + 16 * j, nb)
+                    for j in cutlass.range_constexpr(nl * 2):
+                        cp_async16(sfrb + Uint32((sx * TILE + wt) * 32 + 16 * j), addr_of(mSf) + slot * (CKV // 16) + 16 * j, nb)
+                    for j in cutlass.range_constexpr(nl * 4):
+                        if cutlass.const_expr(self.rope8):  # straight into the E4M3 MMA layout (64-byte rows, SW64)
+                            off = (wt // 8) * 512 + (wt % 8) * 64 + ((j ^ ((wt % 8) >> 1)) & 3) * 16
+                            cp_async16(kpb + Uint32(sx * (TILE * KPE) + off), addr_of(mKpe) + slot * KPE + 16 * j, nb)
+                        else:
+                            cp_async16(kpb + Uint32((sx * TILE + wt) * 64 + 16 * j), addr_of(mKpe) + slot * KPE + 16 * j, nb)
+                st_issue.advance()
+                cp_async_commit()
+
+        if role == 1:
+            cute.arch.setmaxregister_increase(self.REGS[1])
+            # ---- convert: V^T of the tile into TMEM (quadrant lw, chunk 4 dm + lw), in nv parts of 128 / nv tokens
+            tmem_v = Uint32(tmem_ptr.toint()) + Uint32(256)
+            k4_base = Uint32(sK4.iterator.toint())
+            t4 = lane % 4
+            for it in cutlass.range(n_tiles):
+                hk = kvc_c.wait_and_advance()
+                sx, dx = hk.index, it % nd
+                for part in cutlass.range_constexpr(nv):
+                    hv = v_p.acquire_and_advance()
+                    for dm in cutlass.range_constexpr(0 if "cvt" in self.stub else 4):
+                        for bb in cutlass.range_constexpr(TILE // 16 // nv):
+                            blk = part * (TILE // 16 // nv) + bb
+                            vrow = 16 * blk + lane % 16
+                            c = 4 * dm + lw
+                            off = (c // 8) * 16384 + (vrow // 8) * 1024 + (vrow % 8) * 128 + ((c % 8) ^ (vrow % 8)) * 16
+                            r = ldsm_t16(k4_base + Uint32(sx * (TILE * CKV // 2) + off))
+                            for G in cutlass.range_constexpr(2):
+                                w = v_words(r[G], sSfT[8 * dm + 2 * lw + G, 4 * blk + t4, dx])
+                                tmem_st16x256(tmem_v + Uint32(((32 * lw + 16 * G) << 16) + dm * 64 + blk * 8),
+                                              w[0], w[1], w[2], w[3])
+                    cute.arch.fence_view_async_tmem_store()
+                    hv.commit()
+                hk.release()
+
+        if role == 3:
+            cute.arch.setmaxregister_decrease(self.REGS[3])
+        if warp == 12:
+            # ---- MMA warp. Without qksm: SFB once; iteration it issues QK(it), then PV(it - 1). With qksm: PV only.
+            v = self.views(*VA)
+            tCrK4, tCrQ4, tCrKpe, tCrQpe, tCrP = v["tCrK4"], v["tCrQ4"], v["tCrKpe"], v["tCrQpe"], v["tCrP"]
+            tCtSn, tCtSp, tCtO, tCtSFA, tCtSFB, tAtV = (v["tCtSn"], v["tCtSp"], v["tCtO"], v["tCtSFA"], v["tCtSFB"],
+                                                        v["tAtV"])
+            cp_sfa, sfa_src, sfa_dst, cp_sfb, sfb_src, sfb_dst = (v["cp_sfa"], v["sfa_src"], v["sfa_dst"], v["cp_sfb"],
+                                                                  v["sfb_src"], v["sfb_dst"])
+            if cutlass.const_expr(not self.qksm):
+                if n_tiles > 0:
+                    cute.copy(cp_sfb, sfb_src[None, None, None, None, 0], sfb_dst)
+            for it in cutlass.range(n_tiles + 1):
+                if cutlass.const_expr(not self.qksm):
+                    if it < n_tiles:
+                        hk = kvm_c.wait_and_advance()
+                        hs = s_p.acquire_and_advance()
+                        cute.copy(cp_sfa, sfa_src[None, None, None, None, it % nd], sfa_dst)
+                        mma_qk.set(tcgen05.Field.ACCUMULATE, False)
+                        for k in cutlass.range_constexpr(0 if "qk" in self.stub else CKV // 64):
+                            mma_qk.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
+                            mma_qk.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
+                            cute.gemm(mma_qk, tCtSn[None, None, None, 0], tCrK4[None, None, k, hk.index],
+                                      tCrQ4[None, None, k], tCtSn[None, None, None, 0])
+                            mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+                        mma_pe.set(tcgen05.Field.ACCUMULATE, False)
+                        for t in cutlass.range_constexpr(3 if self.rope8 else 1):  # rope8: the 3 query terms along K
+                            for k in cutlass.range_constexpr(2 if self.rope8 else KPE // 16):
+                                cute.gemm(mma_pe, tCtSp[None, None, None, 0], tCrKpe[None, None, k, hk.index if self.rope8 else it % nd],
+                                          tCrQpe[None, None, k, t], tCtSp[None, None, None, 0])
+                                mma_pe.set(tcgen05.Field.ACCUMULATE, True)
+                        hs.commit()
+                        hk.release()
+                if it > 0:
+                    hp = p_c.wait_and_advance()
+                    for part in cutlass.range_constexpr(nv):
+                        hv = v_c.wait_and_advance()
+                        for dm in cutlass.range_constexpr(0 if "pv" in self.stub else 4):
+                            for kk in cutlass.range_constexpr(TILE // 16 // nv):
+                                k = part * (TILE // 16 // nv) + kk
+                                mma_vp.set(tcgen05.Field.ACCUMULATE, (it > 1) | (k > 0))
+                                cute.gemm(mma_vp, tCtO[None, None, None, dm], tAtV[None, None, k, dm],
+                                          tCrP[None, None, k, hp.index], tCtO[None, None, None, dm])
+                        hv.release()
+                    hp.release()
+                    if cutlass.const_expr(self.lazy):
+                        with cute.arch.elect_one():
+                            tcgen05.commit(o_bar)
+
+        if role == 2:
+            cute.arch.setmaxregister_increase(self.REGS[2])
+            # ---- softmax: thread wt = token row wt of S^T (TMEM lane wt)
+            v = self.views(*VA)
+            ld_s, st_o, tStSn, tStSp, tSsP, tStO, tOtO = (v["ld_s"], v["st_o"], v["tStSn"], v["tStSp"], v["tSsP"],
+                                                          v["tStO"], v["tOtO"])
+            tSsG, tSsC, tScS, frag = v["tSsG"], v["tSsC"], v["tScS"], v["frag"]
+            g_head = cute.make_rmem_tensor(frag, Float32)
+            cute.autovec_copy(tSsG, g_head)
+            c_head = cute.make_rmem_tensor(frag, Float32)
+            cute.autovec_copy(tSsC, c_head)
+            m_prev = cute.make_rmem_tensor(frag, Float32)
+            m_prev.fill(-Float32.inf)
+            l_acc = cute.make_rmem_tensor(frag, Float32)
+            l_acc.fill(0.0)
+            row = tScS[0][0]
+            if cutlass.const_expr(self.qksm):  # QK(0) from the first softmax warp
+                if lw == 0:
+                    if n_tiles > 0:
+                        cute.copy(v["cp_sfb"], v["sfb_src"][None, None, None, None, 0], v["sfb_dst"])
+                        hk = kvm_c.wait_and_advance()
+                        hs = s_p.acquire_and_advance()
+                        cute.copy(v["cp_sfa"], v["sfa_src"][None, None, None, None, 0], v["sfa_dst"])
+                        mma_qk.set(tcgen05.Field.ACCUMULATE, False)
+                        for k in cutlass.range_constexpr(0 if "qk" in self.stub else CKV // 64):
+                            mma_qk.set(tcgen05.Field.SFA, v["tCtSFA"][None, None, k].iterator)
+                            mma_qk.set(tcgen05.Field.SFB, v["tCtSFB"][None, None, k].iterator)
+                            cute.gemm(mma_qk, v["tCtSn"][None, None, None, 0], v["tCrK4"][None, None, k, hk.index],
+                                      v["tCrQ4"][None, None, k], v["tCtSn"][None, None, None, 0])
+                            mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+                        mma_pe.set(tcgen05.Field.ACCUMULATE, False)
+                        for t in cutlass.range_constexpr(3 if self.rope8 else 1):  # rope8: the 3 query terms along K
+                            for k in cutlass.range_constexpr(2 if self.rope8 else KPE // 16):
+                                cute.gemm(mma_pe, v["tCtSp"][None, None, None, 0], v["tCrKpe"][None, None, k, hk.index if self.rope8 else 0],
+                                          v["tCrQpe"][None, None, k, t], v["tCtSp"][None, None, None, 0])
+                                mma_pe.set(tcgen05.Field.ACCUMULATE, True)
+                        hs.commit()
+                        hk.release()
+            for it in cutlass.range(n_tiles):
+                hs = s_c.wait_and_advance()
+                sS = cute.make_rmem_tensor(frag, Float32)
+                sR = cute.make_rmem_tensor(frag, Float32)
+                cute.copy(ld_s, tStSn[0][None, None, None, None, 0], sS)
+                for t in cutlass.range_constexpr(1, terms):
+                    cute.copy(ld_s, tStSn[t][None, None, None, None, 0], sR)
+                    for i in cutlass.range_constexpr(n):
+                        sS[i] = sS[i] + sR[i]
+                cute.copy(ld_s, tStSp[None, None, None, None, 0], sR)
+                cute.arch.fence_view_async_tmem_load()
+                hs.release()
+                for i in cutlass.range_constexpr(n):
+                    sS[i] = sS[i] * g_head[i] + sR[i] * c_head[i]
+                if t_beg + it * TILE + row >= t_end:
+                    sS.fill(-Float32.inf)
+                # tile maximum per head: warp reduction, one slot per warp (parity double-buffered), named barrier
+                m_lane = Float32(0.0)
+                for i in cutlass.range_constexpr(n):
+                    mi = cute.arch.warp_redux_sync(sS[i], kind="fmax", nan=True)
+                    if i == lane:
+                        m_lane = mi
+                if lane < n:
+                    sMx[it % 2, lw, lane] = m_lane
+                softmax_bar.arrive_and_wait()  # also: all four warps have read S(it)
+                if cutlass.const_expr(self.qksm):
+                    if lw == 0:
+                        if it + 1 < n_tiles:
+                            hk = kvm_c.wait_and_advance()
+                            hs2 = s_p.acquire_and_advance()
+                            cute.copy(v["cp_sfa"], v["sfa_src"][None, None, None, None, (it + 1) % nd], v["sfa_dst"])
+                            mma_qk.set(tcgen05.Field.ACCUMULATE, False)
+                            for k in cutlass.range_constexpr(0 if "qk" in self.stub else CKV // 64):
+                                mma_qk.set(tcgen05.Field.SFA, v["tCtSFA"][None, None, k].iterator)
+                                mma_qk.set(tcgen05.Field.SFB, v["tCtSFB"][None, None, k].iterator)
+                                cute.gemm(mma_qk, v["tCtSn"][None, None, None, 0], v["tCrK4"][None, None, k, hk.index],
+                                          v["tCrQ4"][None, None, k], v["tCtSn"][None, None, None, 0])
+                                mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+                            mma_pe.set(tcgen05.Field.ACCUMULATE, False)
+                            for t in cutlass.range_constexpr(3 if self.rope8 else 1):  # rope8: the 3 query terms along K
+                                for k in cutlass.range_constexpr(2 if self.rope8 else KPE // 16):
+                                    cute.gemm(mma_pe, v["tCtSp"][None, None, None, 0], v["tCrKpe"][None, None, k, hk.index if self.rope8 else (it + 1) % nd],
+                                              v["tCrQpe"][None, None, k, t], v["tCtSp"][None, None, None, 0])
+                                    mma_pe.set(tcgen05.Field.ACCUMULATE, True)
+                            hs2.commit()
+                            hk.release()
+                pf = cute.make_rmem_tensor(frag, Float32)
+                corr = cute.make_rmem_tensor(frag, Float32)
+                need = Int32(0)
+                for i in cutlass.range_constexpr(n):
+                    hd = tScS[i][1]
+                    mt = cutlass.max(cutlass.max(sMx[it % 2, 0, hd], sMx[it % 2, 1, hd]),
+                                     cutlass.max(sMx[it % 2, 2, hd], sMx[it % 2, 3, hd]))
+                    m_new = cutlass.max(m_prev[i], mt)
+                    if cutlass.const_expr(self.lazy):  # keep the old maximum unless it grows by more than 2^8
+                        m_new = m_prev[i]
+                        # the load stub leaves stale shared memory as K: keep its rescale count at the real ~0
+                        if (mt - m_prev[i]) * scale_log2 > (Float32.inf if "load" in self.stub else 8.0):
+                            m_new = mt
+                            if it > 0:
+                                need = Int32(1)
+                    pf[i] = cute.math.exp2((sS[i] - m_new) * scale_log2, fastmath=True)
+                    corr[i] = cute.math.exp2((m_prev[i] - m_new) * scale_log2, fastmath=True)
+                    l_acc[i] = l_acc[i] * corr[i] + pf[i]
+                    m_prev[i] = m_new
+                hp = p_p.acquire_and_advance()  # P buffer free (PV(it - np) done)
+                if cutlass.const_expr(self.lazy):
+                    if need > 0:  # same in every softmax thread: wait for PV(it - 1), then rescale O
+                        cute.arch.mbarrier_wait(o_bar, (it - 1) % 2)
+                        self.rescale(ld_s, st_o, tStO, tOtO, corr, frag)
+                else:
+                    if it > 0:
+                        self.rescale(ld_s, st_o, tStO, tOtO, corr, frag)
+                p16 = cute.make_rmem_tensor(frag, Float16)
+                p16.store(pf.load().to(Float16))
+                if cutlass.const_expr(npb == 1):
+                    cute.autovec_copy(p16, tSsP[0][None, None, None, None, 0])
+                else:
+                    if hp.index == 0:
+                        cute.autovec_copy(p16, tSsP[0][None, None, None, None, 0])
+                    else:
+                        cute.autovec_copy(p16, tSsP[1][None, None, None, None, 0])
+                cute.arch.fence_view_async_shared()
+                hp.commit()
+
+            # ---- epilogue: wait for the last PV, then O^T / l
+            if cutlass.const_expr(self.lazy):
+                if n_tiles > 0:
+                    cute.arch.mbarrier_wait(o_bar, (n_tiles - 1) % 2)
+            else:
+                hp = p_p.acquire_and_advance()
+            l_lane = Float32(0.0)
+            for i in cutlass.range_constexpr(n):
+                li = cute.arch.warp_reduction_sum(l_acc[i])
+                if i == lane:
+                    l_lane = li
+            if lane < n:
+                sL[lw, lane] = l_lane
+            softmax_bar.arrive_and_wait()
+            for dm in cutlass.range_constexpr(4):
+                o = cute.make_rmem_tensor(frag, Float32)
+                if n_tiles > 0:
+                    cute.copy(ld_s, tStO[None, None, None, None, dm], o)
+                for i in cutlass.range_constexpr(n):
+                    head = tScS[i][1]
+                    l = sL[0, head] + sL[1, head] + sL[2, head] + sL[3, head]
+                    val = Float32(0.0)
+                    if l > 0.0:
+                        val = o[i] * (out_scale / l)
+                    lrow = tScS[i][0]
+                    ch = dm * TILE + ((lrow & 0x70) | ((lrow & 7) << 1) | ((lrow >> 3) & 1))
+                    if splits == 1:
+                        mOut[b, h0 + head, ch] = val.to(BFloat16)
+                    else:
+                        mOpart[z, b, h0 + head, ch] = val
+            if splits > 1 and lw == 0 and lane < n:
+                l = sL[0, lane] + sL[1, lane] + sL[2, lane] + sL[3, lane]
+                lse = -Float32.inf
+                if l > 0.0:
+                    lse = m_prev[lane] * scale_log2 + cute.math.log2(l, fastmath=False)
+                mLse[z, b, h0 + lane] = lse
+
+        cute.arch.sync_threads()
+        tmem.relinquish_alloc_permit()
+        tmem.free(tmem_ptr)
+
+    def rescale(self, ld_s, st_o, tStO, tOtO, corr, frag):
+        for dm in range(0 if "rescale" in self.stub else 4):
+            o = cute.make_rmem_tensor(frag, Float32)
+            cute.copy(ld_s, tStO[None, None, None, None, dm], o)
+            for i in range(self.n):
+                o[i] = o[i] * corr[i]
+            cute.copy(st_o, o, tOtO[None, None, None, None, dm])
+        cute.arch.fence_view_async_tmem_store()
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled(n: int, page_size: int):
     sym = cute.sym_int
@@ -835,9 +1418,31 @@ def _compiled1(n: int, page_size: int, terms: int, dbg: bool = False, v_tmem: bo
         options="--enable-tvm-ffi")
 
 
+@functools.lru_cache(maxsize=None)
+def _compiled2(n: int, page_size: int, terms: int, feat: str = "", stub: str = ""):
+    sym = cute.sym_int
+    b, h, p, mp, s = sym(), sym(), sym(), sym(), sym()
+
+    def t(dtype, shape, align=16):
+        return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape)))[::-1],
+                                                     assumed_align=align)
+
+    return cute.compile(
+        DecodeV2(n, page_size, terms, feat, stub), t(Uint8, (b, h, terms, CKV // 2)),
+        t(Uint8, (b, h, terms, CKV // 16), 4), t(Float32, (b, h), 4), t(BFloat16, (b, h, KPE)),
+        t(Uint8, (b, h, 3, KPE)), t(Float32, (b, h), 4), t(Uint8, (p, page_size, CKV // 2)),
+        t(Uint8, (p, page_size, CKV // 16)), t(Uint8, (p, page_size, KPE)), t(Int32, (b, mp), 4), t(Int32, (b,), 4),
+        t(BFloat16, (b, h, CKV)), t(Float32, (s, b, h, CKV)), t(Float32, (s, b, h), 4), Int32(TILE), Int32(1),
+        Float32(1.0), Float32(1.0), Float32(1.0), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi")
+
+
 def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale, ckv_scale=1.0,
-           kpe_scale=1.0, max_kv_len=None, num_splits=0, version=2, heads_per_cta=None, terms=4):
-    """Same contract as nvfp4_mla.decode (BF16-or-better accuracy); SM100 only. version 0, 1 (v1a') or 2 (v1b)."""
+           kpe_scale=1.0, max_kv_len=None, num_splits=0, version=3, heads_per_cta=None, terms=4,
+           feat="lazy,rope8"):
+    """Same contract as nvfp4_mla.decode (BF16-or-better accuracy); SM100 only.
+
+    version: 0 (v0), 1 (v1a'), 2 (v1b), 3 (v2, warp-specialized)."""
     from . import _load
 
     B, H = q_nope.shape[:2]
@@ -862,7 +1467,14 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
         _compiled(n, ckv_cache.shape[1])(q_nope, q_pe, *args)
     else:
         q4, qsf, g = _load().query_terms(q_nope, terms)
-        _compiled1(n, ckv_cache.shape[1], terms, False, version == 2)(q4, qsf, g, q_pe, *args)
+        if version == 3:
+            if "rope8" in feat:
+                qp8, qps = _load().rope_terms(q_pe, 3)
+            else:  # unused by the kernel
+                qp8, qps = q_pe.new_empty(B, H, 3, KPE, dtype=torch.uint8), g
+            _compiled2(n, ckv_cache.shape[1], terms, feat)(q4, qsf, g, q_pe, qp8, qps, *args)
+        else:
+            _compiled1(n, ckv_cache.shape[1], terms, False, version == 2)(q4, qsf, g, q_pe, *args)
     if splits > 1:
         _load().combine(o_part, lse_part, out)
     return out

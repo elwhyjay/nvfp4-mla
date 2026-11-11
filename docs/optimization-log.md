@@ -1168,3 +1168,364 @@ Same process, ms (16 heads per CTA for v1a' and v1b):
 - At H=128 the 16 heads per CTA cost more than the data path saves (v0 with 32 heads: 1.586 ms, v1b: 2.427 ms at
   B16 64K): every tile is loaded and converted by 8 CTAs per request instead of 4. 32 heads need 608 TMEM columns
   (512 exist), so the next version has to reuse columns or share the converted V between head groups.
+
+### v2 hypothesis: warp specialization
+
+v1b does one 128-token tile in about 5 us, one step after another. At the HBM floor an SM has to finish a tile every
+0.92 us (45 KB at 7.3 TB/s / 148 SMs). The steps themselves are short (estimates per tile and SM: V conversion about
+0.5 us of issue, softmax about 0.3 us, the MMAs well under that), so the hypothesis is that running them in separate
+warps on different tiles brings the tile period down to the slowest single role.
+
+Design (v2.0: v1b's data path, new structure; one CTA per SM, 16 heads per CTA, 416 threads):
+
+| role | warps | per tile |
+|---|---|---|
+| load | 0-3 | thread = token: global loads, raw FP4 tile, scale factors (MMA layout and a block-major copy), RoPE to FP16; 3-stage ring |
+| convert | 4-7 | V from the raw tile into TMEM (as v1b) |
+| softmax | 8-11 | S from TMEM, masks, row maximum (named barrier of these 4 warps only, maxima in a parity-double-buffered slot array), P to shared memory, O rescale |
+| MMA | 12 | QK of tile i+1 issued before PV of tile i, so QK overlaps the softmax |
+
+Pipelines (mbarriers): load -> MMA and load -> convert (two pipelines over the same 3 stages; the load warps wait for
+both to release a stage), MMA -> softmax (S ready), softmax -> MMA (S read, so QK(i+1) may overwrite it), convert ->
+MMA (V ready), MMA -> convert (PV done, V buffer free), softmax -> MMA (P ready, O rescaled), MMA -> softmax (PV done).
+TMEM stays at v1b's 464 columns: one S, one V, one O buffer. S is free as soon as the softmax has loaded it, and the
+V buffer is the only real serialization (convert(i+1) waits for PV(i)).
+
+Shared memory: 3 stages x 56 KB (FP4 tile 32 KB, two scale copies 8 KB, RoPE FP16 16 KB) + query, P, maxima: about
+195 KB.
+
+Predictions (H=16 B64 64K, against v1b's 1.275 ms and Cake's 0.319 ms):
+
+- The load warps hold one tile's loads in flight (22 x 16 B per thread, then the stores), about 45 KB per 1.0-1.3 us,
+  i.e. 35-45 GB/s per SM against the 49 GB/s the HBM floor needs. They should set the period, at 1.0-1.3 us per tile.
+- Time 0.30-0.45 ms (3-4x faster than v1b); DRAM throughput 45-65%; issue slots and tensor pipe both well above v1b's
+  21% and 6%.
+- If the time is well above that range, the stall breakdown per role decides: the convert-PV loop on the single V
+  buffer (V in two 64-token halves would split it), or the load warps (cp.async into the ring, v2.1).
+- Error unchanged.
+
+### v2 result: correct at once, but 3x slower than predicted
+
+| H=16 B64 64K | v1b | v2 | predicted |
+|---|---|---|---|
+| time | 1.279 ms | 1.086 ms (-15%) | 0.30-0.45 ms |
+| DRAM read throughput | | 16% | 45-65% |
+| issue slots / tensor pipe | 21% / 6% | 29% / 7% | well above v1b |
+| registers | 250 | 128 (7.4M local loads: spills) | |
+
+H=128 B16 64K: 2.436 -> 2.023 ms. The error is unchanged (0.0016-0.0017, all lengths 1-300 and the 5 check cases).
+The structure worked the first time (no deadlock), but the tile period only went from 5.0 to 4.2 us.
+
+Which role sets the period: each role's work removed in turn (stubs: wrong numbers, every pipeline signal kept), same
+process, H=16 B64 64K:
+
+| removed | time | | removed | time |
+|---|---|---|---|---|
+| nothing (v2) | 1.077 ms | | load + convert | 0.343 |
+| load | 0.524 (-51%) | | load + convert + PV + O rescale | 0.247 |
+| convert | 0.857 (-20%) | | PV MMAs | 1.103 (no change) |
+| O rescale | 0.899 (-17%) | | QK MMAs | 1.095 (no change) |
+
+H=128 B16 64K gives the same order (load -49%, convert -19%, O rescale -12%).
+
+- The load warps set the period, as predicted, but at 4.2 us per tile instead of 1.0-1.3 us. Each thread loads 22
+  x 16 B and stores them; ptxas capped the kernel at 128 registers (416 threads), so a thread cannot hold its 22
+  loads in flight and pays several global-memory round trips per tile.
+- Even with almost nothing left (load, convert, PV and rescale removed), the kernel takes 0.247 ms, about 1 us per
+  tile: QK(i+1) cannot start before the softmax has read S(i) out of the single S buffer, so QK, the TMEM load and the
+  barrier hops form a chain once per tile. That is already above the HBM floor (0.202 ms).
+
+### v2.1 hypothesis: cp.async for the raw bytes
+
+- Change: the load warps copy each token's raw bytes (ckv, scales, RoPE) with `cp.async` into a 3-stage ring, keeping
+  two tiles in flight, and only then turn the scales into the two layouts and the RoPE bytes into FP16 from shared
+  memory. No global load goes through registers; rows past the end are zero-filled by the copy itself.
+- Shared memory per stage: 32 KB FP4 + 4 KB raw scales + 8 KB raw RoPE + 8 KB scale layouts + 16 KB RoPE FP16 = 68 KB;
+  3 stages + query and P = about 230 KB, over the 227 KB limit, so this version uses 2 stages (one tile in flight
+  while one is processed) and leaves the RoPE path for later.
+- Prediction: the load role drops to about the cost of the "load removed" stub plus the scale and RoPE processing:
+  0.55-0.70 ms at H=16 B64 64K. DRAM throughput 25-35%. The next limits are then the conversion (-20% when removed),
+  the O rescale (-17%) and the QK-softmax chain (0.247 ms floor).
+
+### v2.1 result: no gain; two stages are one tile in flight
+
+Correct (all lengths, the 5 cases), but 1.122 ms at H=16 B64 64K (v2: 1.077, predicted 0.55-0.70). The same stubs:
+
+| removed (H=16 B64 64K) | v2 (3 stages, register loads) | v2.1 (2 stages, cp.async) |
+|---|---|---|
+| nothing | 1.077 ms | 1.122 ms |
+| load | 0.524 | 0.826 |
+| convert | 0.857 | 0.771 |
+| load + convert | 0.343 | 0.434 |
+| load + convert + PV + rescale | 0.247 | 0.365 |
+
+- The prediction assumed the copies of one tile would overlap the processing of the previous one. With 2 stages the
+  load warps can only start tile i + 1 once the consumers have released tile i - 1, so at most one tile's copies are in
+  flight and each iteration still waits about one memory latency. The loads moved out of registers, but not out of the
+  critical path; even the skeleton (everything removed) got slower, 0.247 -> 0.365 ms, for the same reason.
+- No single role explains the time: removing any one of load or convert leaves 0.77-0.83 ms, both 0.43 ms. The roles
+  wait on each other through three loops that each close once per tile: the load ring (stages), V (convert(i + 1) waits
+  for PV(i)), and S (QK(i + 1) waits for the softmax to read S(i)). Each loop costs one or more barrier round trips per
+  tile on top of the work.
+
+Next: more stages need less shared memory per stage. The FP16 RoPE tile (16 KB per stage, plus the raw copy it is
+made from) is the part that can go: RoPE as E4M3 x E4M3 (`kind::f8f6f4`) on the raw kpe bytes, with the query's RoPE
+part as 3 E4M3 terms (simulated error 0.0001-0.0003, the same as exact FP16). That gives 52 KB per stage, 3 stages in
+185 KB.
+
+### Register spills: fixed, and not the limit
+
+v2 and v2.1 ran at 128 registers with spills (7.4M local loads at H=16 B64 64K). Registers are handed out per
+warpgroup, so the 13th warp (the MMA warp) cost a whole warpgroup: 416 threads were budgeted as 512, 65536 / 512 = 128.
+The fix is the one CUTLASS's FMHA uses: 512 threads (the MMA warp's warpgroup gets 3 idle warps) and `setmaxnreg` per
+role. Two things had to be found first:
+
+- ptxas silently dropped every `setmaxnreg` (no `USETMAXREG` in the SASS) because the DSL only emits `reqntid`; with
+  `min_blocks_per_mp=1` on the launch the register count at entry is fixed and the instructions stay (the same rule
+  the SM120 probe hit).
+- The fragments, TMEM tensors and copy partitions were built once for all roles before the role branches, so they were
+  live across the reassignment; each role now builds its own after its `setmaxnreg`.
+
+Budgets tried (load / convert / softmax / MMA warpgroup), same process:
+
+| budget | H=16 B64 64K | H=128 B16 64K |
+|---|---|---|
+| v2.1, 416 threads, 128 each | 1.122 ms | 2.245 ms |
+| 80 / 168 / 200 / 64 | 1.160 | 2.302 |
+| 72 / 152 / 176 / 112 (kept) | 1.131 | 2.235 |
+| 64 / 152 / 168 / 128 | 1.152 | 2.276 |
+| 48 / 152 / 208 / 104 | 1.241 | 2.455 |
+
+With 72 / 152 / 176 / 112, ncu counts 1.17M local loads and 0.67M local stores (from 7.4M and 2.9M), and the time is
+the same. The spills were outside the critical path; the stall samples are still half mbarrier waits (the per-tile
+loops of the v2.1 entry), plus 19% for the three idle warps parked at the exit barrier. The 512-thread layout stays:
+it costs nothing, and the idle warps have room for a later role (the O rescale, -17% when removed, is FA4's
+"correction" warpgroup).
+
+### v2.2 hypotheses: four changes, one ablation
+
+A review of v2.1 agreed with the three per-tile loops and added two points: the single MMA warp ties the S loop and
+the V loop together (it issues QK(i + 1) only after PV(i - 1), so a late V also holds back QK), and the load ring needs
+Little's law worth of bytes in flight: 49 GB/s per SM x 1.5-2 us under load = 75-100 KB, i.e. at least two raw tiles
+in flight, three stages minimum and four safe. The changes:
+
+- F1, lazy O rescale and two P buffers (as SM120 v11): a head's running maximum only moves when the tile maximum is
+  more than 8 (log2 units) above it, so P <= 256, fine in FP16. Every softmax thread holds all heads and reads the same
+  maxima, so the decision is uniform. Only a tile that rescales waits for PV(i - 1); with two P buffers the others
+  write P(i) while PV(i - 1) still reads P(i - 1).
+- F2, RoPE as E4M3 x E4M3 (`kind::f8f6f4`) on the raw kpe bytes, the query's RoPE part as 3 E4M3 terms (one scale per
+  head) stacked along K into the same 16 columns; no FP16 RoPE tile, so the ring holds raw bytes only (44 KB per tile)
+  and goes to 4 stages; the scale layouts derived from the raw scales get two buffers.
+- F3, QK issued by the first softmax warp right after the 4 softmax warps have read S(i) (the existing named
+  barrier), so the S loop no longer passes through the MMA warp, which keeps only PV.
+- F4, V in two 64-token halves: PV issued half by half with a commit each, so the conversion of tile i + 1's first half
+  overlaps PV of tile i's second half (TMEM unchanged).
+
+Ablation, one process on B200, alternating rounds: none, all, all but one (x4), only one (x4); every configuration is
+checked for correctness first. Predictions at H=16 B64 64K against v2 (1.131 ms): F1 alone -15% to -25%, F2 alone -20%
+to -35%, F3 alone -5% to -15%, F4 alone -5% to -15%; all four 0.40-0.55 ms, with the all-but-one losses larger than the
+only-one gains (each loop hides the others). A change stays if removing it from "all" costs at least 3%.
+
+### v2.2 result: one change helps a little, the predictions were 2x off
+
+Every configuration was first checked against the reference (5 cases, lengths 1-5000, page 16/32/64, splits).
+rope8 was wrong in every configuration that had it and right in none that did not, which located the bug at once:
+with 4 raw stages and 2 derived scale buffers, the load warps' last iterations (no new tile to copy) also skipped the
+stage acquire, and that acquire was the only proof that the tile two back had been consumed, so the last two tiles'
+scale layouts could be overwritten while still in use (error 0.045 at 32 tiles, 0.17 at 8, exact at 2). The acquire
+now happens in every iteration.
+
+Same process on B200, ms:
+
+| configuration | H=16 B64 64K | H=128 B16 64K |
+|---|---|---|
+| none (v2 after the spill fix) | 1.132 | 2.241 |
+| only lazy | 1.118 (-1%) | 2.236 |
+| only rope8 | 1.037 (-8%) | 2.060 (-8%) |
+| only qksm | 1.279 (+13%) | 2.536 (+13%) |
+| only vhalf | 1.125 (-1%) | 2.226 (-1%) |
+| all four | 1.158 | 2.310 |
+| all but lazy | 1.197 | 2.382 |
+| all but rope8 | 1.216 | 2.432 |
+| all but qksm | 1.045 | 2.076 |
+| all but vhalf | 1.175 | 2.343 |
+
+- By the rule written before the run (keep a change if removing it from "all" costs 3% or more): rope8 (+5%) and lazy
+  (+3.4%) stay; vhalf (+1.5%) and qksm (-10%: better without it) go.
+- The predictions missed by about 2x: all four were to give 0.40-0.55 ms, and the best configuration is 1.04 ms. Only
+  the deeper ring (rope8) moves the time at all, and only by 8%. Removing the O rescale and its wait (lazy), splitting
+  the V loop (vhalf) or the S loop (qksm) changes almost nothing. So none of the three loops is what holds the tile
+  period near 4 us; they were inferred from stubs that removed whole roles, which also removed those roles' issue
+  slots, shared-memory traffic and TMEM traffic, not only their waits.
+- qksm makes it worse: the first softmax warp now waits for the next tile's loads before it can go on with its own
+  softmax, so a quarter of the softmax runs late every tile.
+
+Next: measure the critical path instead of inferring it. Each role will record, per tile, the clock at the start of
+its wait and at the end of its work, so the gaps show which role every other one waits on.
+
+### Before the clocks: clean stubs and the stall samples per barrier
+
+A review of the entries above found two gaps in the evidence.
+
+- The stall breakdown per role, which the v2 hypothesis said would decide, was never done. In a loop structure,
+  removing a role also removes its waits, so the stubs show what a role costs but not which barrier edge the time
+  goes into.
+- The "load" stub was not clean. It removed only the ckv and kpe copies. The page-table read (a synchronous global
+  load per tile), the two scale copies, the scale layouts and, without rope8, the RoPE conversion still ran. So "load
+  removed" and the skeleton still made one global round trip per tile through the shallow ring. The skeleton's step
+  from v2 to v2.1 (0.247 -> 0.365 ms, 0.46 us per tile, about one DRAM latency) fits that. The "QK-softmax chain floor
+  of about 1 us per tile" above was measured with this stub.
+
+Changes to the measurement:
+
+- The load stub now makes no global access: no page table, no copies, and constant scales (E4M3 1.0). K is then stale
+  shared memory, so in that stub the lazy rescale threshold is infinite; the stub never rescales, like the real run
+  after the first tile on random data, instead of rescaling at random.
+- `dev/ncu_waits.py` sorts the stall samples of the ncu SASS source page by role (the `setmaxnreg` markers bound each
+  role's code) and by barrier. Each try_wait names its mbarrier by its shared-memory offset, and its samples sit on
+  the branch to its out-of-line retry loop.
+
+The script on the old v2.1 profile (2 stages, H=16 B64 64K), as a share of each role's samples:
+
+| role | waiting for | work |
+|---|---|---|
+| load (4 warps) | convert to free a stage 37%, QK to free a stage 12% | 50% (copy issue) |
+| convert (4 warps) | a loaded tile 47%, PV to free V 17% | 36% |
+| MMA (1 warp) | a loaded tile 81% | 17% |
+| softmax (4 warps) | S 62% | 38% |
+
+The three idle warps parked at the exit barrier are another 19% of all samples. This is the 2-stage ring: the load
+waits for convert to free a stage, convert waits for the load to fill the next one, and the MMA and softmax wait behind
+both.
+
+Predictions for the current default (lazy, rope8: 4 stages, 1.04 ms at H=16 B64 64K; 256 tiles per CTA, so 1 ms is
+3.9 us per tile):
+
+- Clean skeleton (load, convert, PV and rescale removed): if the round trip was the floor, it falls below 0.15 ms
+  (0.6 us per tile) and the "1 us chain floor" claim is withdrawn. If it stays above 0.22 ms, the floor stands and is
+  in the QK-softmax chain itself.
+- Stall samples: with 4 stages the load should mostly wait for free stages, and the role that waits least while the
+  others wait on it sets the period. My guess is convert (its work share the largest, the MMA warp waiting mostly for
+  V). If instead the MMA warp still waits mostly for loaded tiles, the ring is still too shallow or the copies are
+  issued too slowly, and the next change is in the load role (TMA).
+
+### Result: the load loop publishes each tile one release too late
+
+Clean stubs, same process on B200, ms:
+
+| removed | H=16 B64 64K, lazy+rope8 | none | H=128 B16 64K, lazy+rope8 | none |
+|---|---|---|---|---|
+| nothing | 1.031 | 1.118 | 2.077 | 2.238 |
+| load (no global access) | 0.581 | 0.760 | 1.143 | 1.505 |
+| convert | 0.620 | 0.728 | 1.234 | 1.431 |
+| PV / QK / rescale | 0.966 / 0.955 / 1.037 | 1.051 / 1.030 / 1.114 | | |
+| load + convert | 0.263 | 0.367 | 0.513 | 0.718 |
+| load + convert + PV + rescale | 0.232 | 0.318 | 0.451 | 0.620 |
+| ... + QK | 0.172 | 0.277 | 0.330 | 0.540 |
+
+- By the rule written above, the floor stands: the clean skeleton is 0.232 ms (0.91 us per tile), above 0.22 ms.
+  The global round trip was a small part of it (the 2-stage skeleton went from 0.365 to 0.318 ms, and that build
+  also has the spill fix). But the floor is not the "QK-softmax chain" either: without the QK MMAs it is still
+  0.172 ms. It is mostly barrier hand-offs, and the stall samples show which ones.
+
+Stall samples, current default (lazy, rope8: 4 stages), H=16 B64 64K, as a share of each role's samples:
+
+| role | waiting for | work |
+|---|---|---|
+| load | convert to free a stage 41%, QK to free a stage 14% | 44% (30% long scoreboard: page-table read, copy issue) |
+| convert | a loaded tile 41%, PV to free V 19% | 40% |
+| MMA | a loaded tile 79% | 19% |
+| softmax | S 60% | 39% |
+
+This is the same picture as with 2 stages, and the two top waits contradict a deep ring: the load waits for
+convert to free a stage while convert waits for the load to publish the next tile. The reason is the order inside
+the load loop. Iteration it first acquires the stage of tile it (so tile it - 4 must be released), issues its copies,
+and only then finishes tile it - 3 (waits for its copies, writes the scale layouts, commits). So tile j is
+published only after tile j - 1 is released, whatever the ring depth:
+
+convert finishes tile j - 1 -> the load warps wake -> page-table read and 22 copy issues for tile j + 3 -> scale
+layouts of tile j -> commit -> convert wakes for tile j
+
+Each tile period therefore holds convert's work (40% of 4.0 us), the load loop's own latency (44%) and two barrier
+hops, which adds up to the 4 us. The ring prefetches the bytes (they landed long ago) but not the hand-off. This also
+explains three earlier results: four stages (rope8) gained only 8%, "load removed" gained 44-51% (it shortens the
+load loop inside the cycle, not the bytes), and the skeleton keeps a floor of about 0.9 us per tile (the hand-off
+cycle with no work in it). My guess before the run (convert sets the period) was wrong; convert is in the cycle, but
+the cycle is made by the load loop.
+
+### v2.3 hypothesis: finish before acquiring
+
+- E (`early`): each iteration first finishes tile it - 3 (wait for its copies, scale layouts, commit), then acquires
+  the stage of tile it and issues its copies. Tile j is then published once tile j - 2 is released, so the consumers
+  have one tile of slack and the load loop's latency leaves their period. The derived scale buffers stay safe: the
+  previous iteration's acquire proves tile it - 5 released, and nd = 2 buffers need only that.
+- P (`ptpf`): the page-table entry of tile it + 1 is read right after tile it's copies are issued, so its latency
+  overlaps the next acquire instead of delaying the copy issue.
+
+Predictions at H=16 B64 64K (1.031 ms now):
+
+- E alone: convert's "waiting for a loaded tile" share falls from 41% to under 10% and the MMA warp's from 79% to
+  under 40%; time 0.45-0.65 ms. The next limit should be the V loop (convert(j + 1) waits for PV(j)), which costs
+  at least convert's work, about 1.6 us per tile (0.42 ms).
+- P alone: -5% to -15% (a shorter load loop inside the cycle). With E, P changes less than 3%.
+- With E and P, vhalf (V in two halves, no gain in v2.2) should now help, since the V loop becomes the limit.
+- Rule: E stays if it gives 10% or more; P and vhalf stay if removing them costs 3% or more.
+
+### v2.3 result: the hand-off was the period; convert is now the limit
+
+Every configuration is correct (the 5 cases up to 16K x 8 at H=128 and lengths 1-5000: error 0.0017, as before).
+Same process on B200, ms, H=16 B64 64K / H=128 B16 64K:
+
+| configuration | run 1 | run 2 |
+|---|---|---|
+| lazy + rope8 (v2.2 default) | 1.047 / 2.083 | 1.045 / 2.080 |
+| + E | 0.765 / 1.496 | 0.763 / 1.494 |
+| + P | 1.083 / 2.159 | |
+| + E + P | 0.777 / 1.523 | |
+| + E + vhalf | | 0.750 / 1.459 |
+| + E + P + vhalf | 0.741 / 1.442 | 0.747 / 1.438 |
+| + E + P, 2 stages (no rope8) | 0.789 / 1.564 | |
+
+With E as the only order in the code (third run): lazy + rope8 0.764 / 1.494, none 0.837 / 1.556, + vhalf 0.749 /
+1.458.
+
+- E: -27% at both shapes. It stays, as the only load order. The time is above the predicted 0.45-0.65 ms.
+- P: +3% alone and +1.6% with E. It goes; the code is removed. Reading the page table one tile early is not useful
+  once the load loop is outside the consumers' period.
+- vhalf: -1.7% to -2.5% on top of E in both runs, under the 3% rule, so it stays off.
+- The ring depth now matters little: with E and P, 2 stages are only 1.5% slower than 4.
+
+Stall samples with E (and vhalf), H=16 B64 64K (0.759 ms under ncu):
+
+| role | waiting for | work |
+|---|---|---|
+| load | convert to free a stage 35%, QK 1% | 64% |
+| convert | PV to free V 5%, a loaded tile 1% | 94% |
+| MMA | a loaded tile 33%, V 18% | 47% |
+| softmax | S 22% | 77% |
+
+- The hand-off is gone as predicted: convert's wait for a loaded tile fell from 41% to 1% (predicted under 10%), the
+  MMA warp's from 79% to 33% (predicted under 40%).
+- The time missed because convert's work per tile was not 1.6 us, as I took from the v2.2 samples, but 94% of a
+  2.96 us period, about 2.8 us. Its instruction count did not change (1106 per warp and tile). Its work samples are
+  mostly stalls, and those grew once the other roles ran at the same time instead of in turn.
+- The V loop is not the limit (convert waits for PV 5% of its time), which is why vhalf gives little.
+
+What convert does per tile and warp (1106 instructions): per 8 V elements, 4 `cvt` e2m1, 2 `cvt` e4m3 (scales),
+4 `prmt` and 4 `mul`; and per tile 64 LDS (scales), 32 LDSM and 64 `tcgen05.st`. No pipe is busy (ALU 40%, issue
+slots 38%). One convert warp per SM sub-partition cannot hide the latency. The scale conversions wait for their LDS
+(short scoreboard, 18% of convert's samples), and LDS and LDSM wait on the MIO queue (15% and 12%). The
+sub-partition shares that queue with the load warp's 22 `cp.async` and 40 scale-layout stores per tile.
+
+The per-role clocks planned above are not needed for this question: the stall samples named the barrier edge
+directly, and the change made from them confirmed it. They stay in reserve for a profile that does not separate the
+roles this clearly.
+
+Options for v2.4:
+
+- (a) Fewer shared-memory instructions in convert. Lay out the transposed scales with the 8 blocks of a tile
+  contiguous, so one LDS.128 replaces 4 loads (64 -> 16 per tile). Use `ldmatrix` .x2 (32 -> 16). Optionally the
+  load warps could write ready f16x2 scale pairs, which removes the 128 e4m3 conversions and their wait.
+- (b) More conversion warps. TMA for the raw tile (one thread issues the copies; page size >= 32, with cp.async
+  kept for smaller pages) frees most of the load warpgroup, so 8 warps convert, two per sub-partition.
+- (c) Word stores instead of byte stores for the transposed scales (32 `st.shared.u8` per thread and tile).
