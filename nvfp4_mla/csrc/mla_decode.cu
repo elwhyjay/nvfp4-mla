@@ -209,6 +209,16 @@ __device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint16_t x) {
   return d;
 }
 
+// e2m1 x e4m3 reaches 6 x 448 = 2688, past E4M3's 448 when the global scale is calibrated to amax / (6 x 448) (block
+// scales near 448). The FP8 paths round K and V as (e2m1 x scale) / 8 (at most 336) and undo the 8 in the score
+// scale and the output; only values below 2^-6 (normal E4M3) x 8 relative to the cache scale lose precision.
+constexpr float kFp8Shift = 8.f;
+__device__ __forceinline__ uint32_t e4m3x2_to_f16x2_div8(uint16_t x) {  // exact: a power of two, no f16 underflow
+  uint32_t d;
+  asm("{\n.reg .b32 t, c;\ncvt.rn.f16x2.e4m3x2 t, %1;\nmov.b32 c, 0x30003000;\nmul.rn.f16x2 %0, t, c;\n}" : "=r"(d) : "h"(x));
+  return d;
+}
+
 // four floats to four e4m3 bytes, a in the lowest byte
 __device__ __forceinline__ uint32_t pack_e4m3x4(float a, float b, float c, float d) {
   uint32_t r;
@@ -441,8 +451,8 @@ __device__ __forceinline__ void load_q_fp8(const Frag& f, const __nv_bfloat16* q
     for (int j = 0; j < 16; ++j) pack8(qn[j], 448.f / an, q.qa[j][r], q.qa[j][2 + r]);
 #pragma unroll
     for (int k = 0; k < 2; ++k) pack8(qp[k], 448.f / ap, q.qpa[k][r], q.qpa[k][2 + r]);
-    q.scale[r] = sm_scale_log2 * ckv_scale * (an / 448.f);
-    q.kpe_ratio[r] = (ap * kpe_scale) / (an * ckv_scale);
+    q.scale[r] = sm_scale_log2 * ckv_scale * kFp8Shift * (an / 448.f);  // K is rounded as (e2m1 x scale) / 8
+    q.kpe_ratio[r] = (ap * kpe_scale) / (an * ckv_scale * kFp8Shift);
   }
 }
 
@@ -576,7 +586,7 @@ __device__ __forceinline__ void store_out8(Acc& a, const Frag& f, __nv_bfloat16*
   for (int r = 0; r < 2; ++r) {
     a.l[r] += __shfl_xor_sync(~0u, a.l[r], 1);
     a.l[r] += __shfl_xor_sync(~0u, a.l[r], 2);
-    const float s = a.l[r] > 0.f ? ckv_scale / a.l[r] : 0.f;
+    const float s = a.l[r] > 0.f ? ckv_scale * kFp8Shift / a.l[r] : 0.f;  // V / 8
     __nv_bfloat16* dst = out + (r ? row1 : row0) * CKV + 128 * f.w + 2 * f.t4;
 #pragma unroll
     for (int k = 0; k < 8; ++k)
@@ -593,7 +603,7 @@ __device__ __forceinline__ void store_partial8(Acc& a, const Frag& f, float* o_p
     a.l[r] += __shfl_xor_sync(~0u, a.l[r], 1);
     a.l[r] += __shfl_xor_sync(~0u, a.l[r], 2);
     const size_t row = r ? row1 : row0;
-    const float s = a.l[r] > 0.f ? ckv_scale / a.l[r] : 0.f;
+    const float s = a.l[r] > 0.f ? ckv_scale * kFp8Shift / a.l[r] : 0.f;  // V / 8
     float* dst = o_part + row * CKV + 128 * f.w + 2 * f.t4;
 #pragma unroll
     for (int k = 0; k < 8; ++k)
@@ -667,7 +677,7 @@ __device__ __forceinline__ void tile_fp8(Acc& a, const Frag& f, const QF8& q, co
   const uint32_t* rw = &raw[0].x;
 #pragma unroll
   for (int b = 0; b < 4; ++b) {  // scale blocks 2b, 2b + 1 = words 4b..4b+3
-    const uint32_t s01 = e4m3x2_to_f16x2(uint16_t((b < 2 ? sf8.x : sf8.y) >> (16 * (b % 2))));
+    const uint32_t s01 = e4m3x2_to_f16x2_div8(uint16_t((b < 2 ? sf8.x : sf8.y) >> (16 * (b % 2))));
     const uint32_t sc[2] = {__byte_perm(s01, 0, 0x1010), __byte_perm(s01, 0, 0x3232)};
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -728,7 +738,7 @@ __device__ __forceinline__ void tile_fp4q(Acc& a, const Frag& f, const QF4& q, c
   const uint32_t sel = (t >> 1) | ((2 + (t >> 1)) << 4);
 #pragma unroll
   for (int k = 0; k < 8; ++k) {
-    const uint32_t s01 = e4m3x2_to_f16x2(uint16_t(__byte_perm(sfb[k], 0, sel)));
+    const uint32_t s01 = e4m3x2_to_f16x2_div8(uint16_t(__byte_perm(sfb[k], 0, sel)));
     const uint32_t sc[2] = {__byte_perm(s01, 0, 0x1010), __byte_perm(s01, 0, 0x3232)};
 #pragma unroll
     for (int h = 0; h < 2; ++h) {

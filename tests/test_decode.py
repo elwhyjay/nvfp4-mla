@@ -10,6 +10,9 @@ import nvfp4_mla  # noqa: E402
 from nvfp4_mla.testing import RandomCache, fa2_on_dequantized, rel_l2  # noqa: E402
 
 BUILDS = {"native": (), "fast_math": ("--use_fast_math",), "compat_cvt": ("-DNVFP4_MLA_COMPAT_CVT",)}
+# a global scale calibrated as a serving engine sets it (amax / (6 x 448)): block scales near the E4M3 maximum, so
+# e2m1 x scale reaches 2688 and must not saturate when rounded to E4M3; RoPE bytes near 448
+SCALES = {"scale 0.5": (0.5, 2.0), "calibrated": (2.0 ** -9, 2.0 ** -6)}
 
 CASES = [  # (kv_lens, page_size, heads)
     ([1], 1, 16),
@@ -71,12 +74,13 @@ def test_compat_cvt_matches_native(kv_lens, page_size, heads):
     assert torch.equal(run(c, "compat_cvt"), run(c))
 
 
+@pytest.mark.parametrize("scales", SCALES.values(), ids=SCALES.keys())
 @pytest.mark.parametrize("num_splits", [0, 3])
 @pytest.mark.parametrize("kv_lens,page_size,heads", CASES)
-def test_decode_fp8(num_splits, kv_lens, page_size, heads):
+def test_decode_fp8(num_splits, kv_lens, page_size, heads, scales):
     """FP8 QK and PV: a few percent of extra error over the dequantized cache, and close to the BF16 path against
     the unquantized cache."""
-    c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
+    c = RandomCache(kv_lens, page_size, heads, *scales)
     out = run(c, splits=num_splits, precision=1)
     assert not out.isnan().any()
     assert rel_l2(out, c.reference()) < 0.08  # E4M3 rounding of Q, K, V and P; measured up to 0.061
@@ -84,13 +88,14 @@ def test_decode_fp8(num_splits, kv_lens, page_size, heads):
     assert rel_l2(out, ref) < 1.2 * rel_l2(run(c, splits=num_splits), ref)  # measured up to 1.11x
 
 
+@pytest.mark.parametrize("scales", SCALES.values(), ids=SCALES.keys())
 @pytest.mark.parametrize("num_splits", [0, 3])
 @pytest.mark.parametrize("kv_lens,page_size,heads", CASES)
-def test_decode_fp4_qk(num_splits, kv_lens, page_size, heads):
+def test_decode_fp4_qk(num_splits, kv_lens, page_size, heads, scales):
     """FP4 QK (FP4 query): more error than the FP8 path, about FlashInfer Cake's."""
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("block-scaled mma.sync is SM12x only")
-    c = RandomCache(kv_lens, page_size, heads, ckv_scale=0.5, kpe_scale=2.0)
+    c = RandomCache(kv_lens, page_size, heads, *scales)
     out = run(c, splits=num_splits, precision=2)
     assert not out.isnan().any()
     assert rel_l2(out, c.reference()) < 0.2  # measured up to 0.133

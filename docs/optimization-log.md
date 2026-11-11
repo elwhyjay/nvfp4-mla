@@ -1381,8 +1381,8 @@ Changes to the measurement:
 - The load stub now makes no global access: no page table, no copies, and constant scales (E4M3 1.0). K is then stale
   shared memory, so in that stub the lazy rescale threshold is infinite; the stub never rescales, like the real run
   after the first tile on random data, instead of rescaling at random.
-- `dev/ncu_waits.py` sorts the stall samples of the ncu SASS source page by role (the `setmaxnreg` markers bound each
-  role's code) and by barrier. Each try_wait names its mbarrier by its shared-memory offset, and its samples sit on
+- [`benchmarks/ncu_waits.py`](../benchmarks/ncu_waits.py) sorts the stall samples of the ncu SASS source page by
+  role (markers in the SASS such as `setmaxnreg` bound each role's code) and by barrier. Each try_wait names its mbarrier by its shared-memory offset, and its samples sit on
   the branch to its out-of-line retry loop.
 
 The script on the old v2.1 profile (2 stages, H=16 B64 64K), as a share of each role's samples:
@@ -1592,9 +1592,9 @@ Stall samples, `tma` + `cvt8`, H=16 B64 64K (0.48 ms under ncu; DRAM throughput 
 | role | waiting for | work |
 |---|---|---|
 | convert (8 warps) | PV to free V 17%, a loaded tile 3% | 80% |
-| TMA warp | convert to free a stage 85% | 13% |
+| TMA warp | convert to free a stage 83%, QK 2% | 16% |
 | scale warps (2) | tile j - 2 released 42%, the TMA 2% | 56% |
-| MMA | a published tile 39%, V 18% | 40% |
+| MMA | a published tile 40%, V 19% | 38% |
 | softmax | S 22% | 77% |
 
 The idle warps at the exit barrier fell from 19% to 2% of all samples. The loads are now ahead: the TMA warp waits
@@ -1623,3 +1623,87 @@ CUDA kernel from about 16 x 16K tokens, but below that it is slower, and slower 
 start, pipeline and end), 2.3 us query terms, 1.7 us RoPE terms, 2.7 us split merge. v0 has no query split kernels
 and a shorter start (no TMA warp, no role setup), 23 us cold. The fixed cost is a separate item from the tile
 period and not addressed yet.
+
+### Accuracy is now judged against the unquantized KV
+
+Until now the kernels were checked against attention over the dequantized cache, which is the right test for bugs
+(the error there is the kernel's own arithmetic, 1.6e-3 to 1.9e-3) but the wrong measure for a choice of precision:
+it counts every extra rounding as if it were the whole error, while the user sees the error against the unquantized
+(BF16) KV, where the FP4 format already costs 0.08-0.12. From here on, a precision change is judged by its error
+against the unquantized KV, relative to the CUDA kernel's BF16 mode on the same cache (`benchmarks/accuracy.py`);
+the dequantized reference stays as the bug check in the tests.
+
+The new measurement also uses a global scale calibrated the way a serving engine sets it (amax / (6 x 448), so the
+block scales reach the E4M3 maximum), besides the scale of 1 used so far. It found a bug in the CUDA kernel's FP8 and
+FP4-QK modes: they round e2m1 x block scale to E4M3, but that product reaches 6 x 448 = 2688 and E4M3 stops at 448,
+so with a calibrated scale the large values saturated. The error against the unquantized KV was 0.62-0.69 (5.6-8x
+the BF16 mode) instead of 0.08-0.13; the tests used small scales only and missed it. The fix rounds (e2m1 x scale) / 8
+(at most 336) and puts the 8 back in the score scale and the output; dividing the f16 scale by 8 is exact. The tests
+now run both scales.
+
+On B200, both scales: the SM100 kernel's error against the unquantized KV equals the CUDA kernel's BF16 mode (ratio
+1.00); FlashInfer Cake's is 1.38-1.71x.
+
+### v2.5 hypothesis: V and P in E4M3, 32 heads per CTA
+
+With 128 heads the SM100 kernel reads the cache 8 times per request, because a CTA holds 16 heads. 32 heads do not
+fit in tensor memory with an FP16 V (S 128 + RoPE S 32 + O 128 + scales 64 + V 256 = 608 of 512 columns). With V in
+E4M3 it is 480. PV then becomes `kind::f8f6f4`, which needs P in E4M3 as well (P <= 256 with the lazy rescale). V is
+rounded as (e2m1 x scale) / 8, as in the CUDA fix above, and the 8 goes into the output scale.
+
+Two more limits at 32 heads: shared memory (the query terms grow by 16 KB to about 244 KB of 227 KB, so the raw ring
+goes from 4 to 3 stages, which cost 1.5% in v2.3) and the softmax registers (8 arrays of one value per head; the
+softmax handles the heads in two halves of 16).
+
+Changes, measured as an ablation in one process:
+
+- `v8`: V and P in E4M3, 16 heads. The conversion needs about 20 instructions per 8 values instead of 14 (the
+  rounding to E4M3 and the scale shift), but half the TMEM stores and half the PV MMAs.
+- `st3`: 3 raw stages instead of 4.
+- 32 heads per CTA (needs `v8` and `st3`), for head counts that are a multiple of 32.
+
+Predictions (H=128 B16 64K, now 0.852 ms; H=16 B64 64K, now 0.451 ms):
+
+- Accuracy: `v8` adds at most 3% to the error against the unquantized KV (only V and P are rounded; the CUDA FP8
+  mode, which also rounds Q and K, adds 0-11%). If it adds more, V stays FP16 and 32 heads wait.
+- `v8` at 16 heads: 0-10% slower (convert is the busiest role and does more ALU work per value).
+- 32 heads: 0.47-0.65 ms at H=128 B16 64K (-24% to -45%). Half the tiles per head; per tile the convert work stays
+  the same and the softmax work doubles, so the softmax (now about 1.4 us per tile) may set a period of about 2.8 us.
+- Rule: 32 heads become the default for head counts divisible by 32 if they gain 10% or more at H=128; `v8` and
+  `st3` stay only where they are needed for that.
+
+### v2.5 result: 32 heads per CTA work, but gain only 1-2%
+
+Every configuration is correct: against the dequantized cache 0.0017 (FP16 V) and 0.029 (`v8`, the E4M3 rounding of
+V and P, about 2% per value); against the unquantized KV, `v8` is at most 3.3% above the FP16-V kernel, at
+lengths 1-300 where the rounding does not average out, and 1-2% on the `benchmarks/accuracy.py` shapes (4K and 16K
+tokens). By the accuracy rule (judged on those shapes) `v8` passes; the 3.3% at short lengths is noted here.
+
+Same process on B200, ms:
+
+| configuration | H=16 B64 64K | H=128 B16 64K | H=128 B64 64K |
+|---|---|---|---|
+| v2.4 (FP16 V, 4 stages, 16 heads) | 0.454 | 0.852 | 3.382 |
+| + v8 | 0.495 (+9%) | 0.928 (+9%) | 3.695 |
+| + v8 + st3 | 0.526 (+16%) | 0.997 (+17%) | 3.954 |
+| + v8 + st3 + h32 | | 0.844 (-1%) | 3.309 (-2%) |
+
+- 32 heads alone are worth -15% (0.997 -> 0.844), but E4M3 V (+9%) and 3 stages (+7%) cost about as much, so the
+  result is -1% to -2% instead of the predicted -24% to -45%. By the rule (10% at H=128), 32 heads are not the
+  default; `v8`, `st3` and `h32` stay as options.
+- `v8` costs 9% at 16 heads as predicted (0-10%): the conversion does more ALU work per value.
+
+Stall samples with 32 heads, H=128 B16 64K (0.86 ms under ncu):
+
+| role | waiting for | work |
+|---|---|---|
+| convert (8 warps) | PV to free V 40% | 59% |
+| softmax | S 1% | 99% |
+| MMA | P 74% | 23% |
+| TMA warp | convert to free a stage 85%, QK 4% | 11% |
+
+The softmax is the limit: with 32 heads it does twice the work per tile (4 latent and 1 RoPE score loads of 32
+columns, the sums, 32 exponentials per thread), and at 232 registers it still spills (77 local loads in its code).
+The MMA warp waits for P, so PV frees V late and convert waits for V. Two ways to cut the softmax's work, for a
+later step: QK with the query terms along K instead of N (the MMA sums the 4 terms, so the softmax loads one score
+column block instead of four), and a softmax split over more warps.

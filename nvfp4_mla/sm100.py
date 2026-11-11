@@ -117,6 +117,36 @@ def v_words(w: Uint32, sf4: Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def v_words8(w: Uint32, sf4: Uint32, *, loc=None, ip=None):
+    """As v_words, rounded to E4M3: (channel 2c: tokens 0-3), (channel 2c + 1: tokens 0-3), token 0 in the low byte.
+    The values are (e2m1 x scale) / 8, at most 336: e2m1 x scale reaches 2688, past E4M3's 448, when the cache's
+    global scale is calibrated (block scales near 448)."""
+    r = _asm(llvm.StructType.get_literal([T.i32()] * 2), [Uint32(w), Uint32(sf4)],
+             "{\n.reg .b8 b0, b1, b2, b3;\n.reg .b16 s0, s1, q0, q1, q2, q3;\n"
+             ".reg .b32 h0, h1, h2, h3, p01, p23, e, f, g, k, c;\n"
+             "mov.b32 {b0, b1, b2, b3}, $2;\nmov.b32 {s0, s1}, $3;\nmov.b32 c, 0x30003000;\n"
+             "cvt.rn.f16x2.e4m3x2 p01, s0;\ncvt.rn.f16x2.e4m3x2 p23, s1;\n"
+             "mul.rn.f16x2 p01, p01, c;\nmul.rn.f16x2 p23, p23, c;\n"
+             "cvt.rn.f16x2.e2m1x2 h0, b0;\ncvt.rn.f16x2.e2m1x2 h1, b1;\n"
+             "cvt.rn.f16x2.e2m1x2 h2, b2;\ncvt.rn.f16x2.e2m1x2 h3, b3;\n"
+             "prmt.b32 e, h0, h1, 0x5410;\nmul.rn.f16x2 e, e, p01;\nprmt.b32 f, h2, h3, 0x5410;\nmul.rn.f16x2 f, f, p23;\n"
+             "prmt.b32 g, h0, h1, 0x7632;\nmul.rn.f16x2 g, g, p01;\nprmt.b32 k, h2, h3, 0x7632;\nmul.rn.f16x2 k, k, p23;\n"
+             "cvt.rn.satfinite.e4m3x2.f16x2 q0, e;\ncvt.rn.satfinite.e4m3x2.f16x2 q1, f;\n"
+             "cvt.rn.satfinite.e4m3x2.f16x2 q2, g;\ncvt.rn.satfinite.e4m3x2.f16x2 q3, k;\n"
+             "mov.b32 $0, {q0, q1};\nmov.b32 $1, {q2, q3};\n}",
+             "=r,=r,r,r", loc, ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@dsl_user_op
+def tmem_st16x128(taddr: Uint32, w0: Uint32, w1: Uint32, *, loc=None, ip=None):
+    """tcgen05.st.16x128b.x1: thread (g, t) writes lane g column t (w0) and lane g + 8 column t (w1)."""
+    llvm.inline_asm(None, [Uint32(x).ir_value(loc=loc, ip=ip) for x in (taddr, w0, w1)],
+                    "tcgen05.st.sync.aligned.16x128b.x1.b32 [$0], {$1, $2};", "r,r,r",
+                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def tmem_st16x256(taddr: Uint32, w0: Uint32, w1: Uint32, w2: Uint32, w3: Uint32, *, loc=None, ip=None):
     """tcgen05.st.16x256b.x1: thread (g, t) writes lane g columns 2t, 2t + 1 (w0, w1) and lane g + 8 (w2, w3)."""
     llvm.inline_asm(None, [Uint32(x).ir_value(loc=loc, ip=ip) for x in (taddr, w0, w1, w2, w3)],
@@ -843,20 +873,33 @@ class DecodeV2:
              write the scale layouts.
       cvt8   (needs tma) warps 0-3 convert too, two 128-channel chunks per warp; warps 14-15 write the scale
              layouts.
+    feat (v2.5):
+      v8     V and P in E4M3 (PV is kind::f8f6f4; V rounded as value / 8, P <= 256), so V takes 128 TMEM columns.
+      st3    3 raw stages instead of 4.
+      h32    32 heads per CTA (needs v8 for TMEM, st3 for shared memory, cvt8): the cache is read once per 32
+             heads. The softmax gets 232 registers and reads the per-head scales from shared memory.
     """
 
     REGS = {0: 72, 1: 152, 2: 176, 3: 112}  # per role; sum x 128 threads = 65536
     REGS8 = {0: 128, 1: 128, 2: 176, 3: 80}  # cvt8
-    FEATS = ("lazy", "rope8", "qksm", "vhalf", "tma", "cvt8")
+    REGS32 = {0: 104, 1: 104, 2: 232, 3: 72}  # h32: the softmax holds one value per head in 6 arrays
+    FEATS = ("lazy", "rope8", "qksm", "vhalf", "tma", "cvt8", "v8", "st3", "h32")
 
     def __init__(self, n: int, page_size: int, terms: int, feat: str = "", stub: str = ""):
         # stub (measurement only, wrong results): roles in it skip their work but keep their pipeline signals
         self.n, self.ps, self.terms, self.stub = n, page_size, terms, stub
-        self.lazy, self.rope8, self.qksm, self.vhalf, self.tma, self.cvt8 = (f in feat.split(",") for f in self.FEATS)
+        (self.lazy, self.rope8, self.qksm, self.vhalf, self.tma, self.cvt8, self.v8, self.st3,
+         self.h32) = (f in feat.split(",") for f in self.FEATS)
+        if self.h32 != (n == 32) or self.h32 and not (self.v8 and self.st3 and self.cvt8):
+            raise ValueError("32 heads per CTA go with h32, which needs v8, st3 and cvt8")
+        self.regs = self.REGS32 if self.h32 else self.REGS8 if self.cvt8 else self.REGS
         if self.tma and not (self.rope8 and page_size >= 16) or self.cvt8 and not self.tma:
             raise ValueError("tma needs rope8 and page size >= 16; cvt8 needs tma")
         self.box = min(page_size, TILE)  # tokens per TMA box (one page, or a 128-token part of one)
-        self.stages = 4 if self.rope8 else 2  # raw ring
+        self.stages = 3 if self.st3 else 4 if self.rope8 else 2  # raw ring
+        self.pv_t = Float8E4M3FN if self.v8 else Float16  # V and P: the PV MMA operands
+        self.vbase = 512 - TILE * self.pv_t.width // 8  # TMEM column of V^T: 4 chunks of TILE x TILE values at the end
+        self.vshift = 8.0 if self.v8 else 1.0  # v8 rounds V as value / 8
         self.nd = 2  # buffers of the scale layouts derived from the raw scales (tile index % nd)
         self.np = 2 if self.lazy else 1  # P buffers
         self.nv = 2 if self.vhalf else 1  # V parts
@@ -873,7 +916,7 @@ class DecodeV2:
         pe_t = Float8E4M3FN if self.rope8 else Float16
         mma_pe = sm100_utils.make_trivial_tiled_mma(pe_t, pe_t, OperandMajorMode.K, OperandMajorMode.K, Float32,
                                                     tcgen05.CtaGroup.ONE, (TILE, n))
-        mma_vp = sm100_utils.make_trivial_tiled_mma(Float16, Float16, OperandMajorMode.K, OperandMajorMode.MN,
+        mma_vp = sm100_utils.make_trivial_tiled_mma(self.pv_t, self.pv_t, OperandMajorMode.K, OperandMajorMode.MN,
                                                     Float32, tcgen05.CtaGroup.ONE, (TILE, n), tcgen05.OperandSource.TMEM)
         mma_sn = sm100_utils.make_trivial_tiled_mma(Float16, OperandMajorMode.K, OperandMajorMode.K, Float32,
                                                     tcgen05.CtaGroup.ONE, (TILE, nq))
@@ -899,8 +942,8 @@ class DecodeV2:
                     cute.tile_to_shape(atom4, (nq, CKV), order=(0, 1)),
                     cute.tile_to_shape(atom_pe, (TILE, KPE, st if self.rope8 else self.nd), order=(0, 1, 2)),
                     cute.tile_to_shape(atom_pe, (n, KPE, npe), order=(0, 1, 2)),
-                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), Float16, self.np),
-                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), Float16, 1),
+                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), self.pv_t, self.np),
+                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), self.pv_t, 1),
                     bsl.make_smem_layout_sfa(mma_qk, tiler, SF_VEC, self.nd),
                     bsl.make_smem_layout_sfb(mma_qk, tiler, SF_VEC, 1)).launch(
             grid=[q_pe.shape[1] // n, q_pe.shape[0], splits], block=[512, 1, 1], min_blocks_per_mp=1, stream=stream)
@@ -937,7 +980,7 @@ class DecodeV2:
         tCtSFB = cute.make_tensor(cute.recast_ptr(tmem_ptr + col_sf + col_sfa, dtype=Float8E4M3FN),
                                   bsl.make_tmem_layout_sfb(mma_qk, (TILE, n, CKV), SF_VEC,
                                                            cute.slice_(lsfb, (None, None, None, 0))))
-        tAtV = cute.make_tensor(cute.recast_ptr(tmem_ptr + 256, dtype=Float16),
+        tAtV = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.vbase, dtype=self.pv_t),
                                 thr_vp.make_fragment_A(mma_vp.partition_shape_A((TILE, TILE, 4))).layout)
 
         s2t = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE), Float8E4M3FN)
@@ -952,7 +995,7 @@ class DecodeV2:
 
         # P^T buffer b as the (token, head) C tile of QK, so softmax threads store their own rows
         tCsP = [cute.composition(cute.make_tensor(cute.recast_ptr(sP.iterator + b * cute.cosize(lp1), lp1.inner,
-                                                                  dtype=Float16), lp1.outer),
+                                                                  dtype=self.pv_t), lp1.outer),
                                  cute.make_ordered_layout(s_shape, order=((2, 0), 3, 1, 4))) for b in range(self.np)]
         rep = tcgen05.Repetition(n)
         ld_s = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(rep), Float32), tCtSp[None, None, None, 0])
@@ -1009,7 +1052,7 @@ class DecodeV2:
         pe_t = Float8E4M3FN if self.rope8 else Float16
         sKpe = smem.allocate_tensor(pe_t, lkpe.outer, 1024, lkpe.inner)  # rope8: the raw ring; else FP16, nd buffers
         sQpe = smem.allocate_tensor(pe_t, lqpe.outer, 1024, lqpe.inner)
-        sP = smem.allocate_tensor(Float16, lp.outer, 1024, lp.inner)
+        sP = smem.allocate_tensor(self.pv_t, lp.outer, 1024, lp.inner)
         sSFA = smem.allocate_tensor(Float8E4M3FN, lsfa, 128)
         sSFB = smem.allocate_tensor(Float8E4M3FN, lsfb, 128)
         # block scales again, block-major: one 32-bit load gives 4 tokens' scales of one block
@@ -1160,11 +1203,13 @@ class DecodeV2:
         if role <= 1 and role >= (0 if self.cvt8 else 1):
             if cutlass.const_expr(not self.cvt8):
                 cute.arch.setmaxregister_increase(self.REGS[1])
+            elif cutlass.const_expr(self.regs[1] < 128):
+                cute.arch.setmaxregister_decrease(self.regs[1])
             # ---- convert: V^T of the tile into TMEM (quadrant lw, chunk 4 dm + lw), in nv parts of 128 / nv tokens.
             # cvt8: warpgroup r converts dm = 2 r, 2 r + 1.
             ndm = 2 if self.cvt8 else 4
             dm0 = 2 * role if self.cvt8 else 0
-            tmem_v = Uint32(tmem_ptr.toint()) + Uint32(256)
+            tmem_v = Uint32(tmem_ptr.toint()) + Uint32(self.vbase)
             k4_base = Uint32(sK4.iterator.toint())
             t4 = lane % 4
             for it in cutlass.range(n_tiles):
@@ -1181,15 +1226,19 @@ class DecodeV2:
                             off = (c // 8) * 16384 + (vrow // 8) * 1024 + (vrow % 8) * 128 + ((c % 8) ^ (vrow % 8)) * 16
                             r = ldsm_t16(k4_base + Uint32(sx * (TILE * CKV // 2) + off))
                             for G in cutlass.range_constexpr(2):
-                                w = v_words(r[G], sSfT[8 * dm + 2 * lw + G, 4 * blk + t4, dx])
-                                tmem_st16x256(tmem_v + Uint32(((32 * lw + 16 * G) << 16) + dm * 64 + blk * 8),
-                                              w[0], w[1], w[2], w[3])
+                                lanes = (32 * lw + 16 * G) << 16
+                                if cutlass.const_expr(self.v8):  # 4 tokens per column
+                                    w = v_words8(r[G], sSfT[8 * dm + 2 * lw + G, 4 * blk + t4, dx])
+                                    tmem_st16x128(tmem_v + Uint32(lanes + dm * 32 + blk * 4), w[0], w[1])
+                                else:
+                                    w = v_words(r[G], sSfT[8 * dm + 2 * lw + G, 4 * blk + t4, dx])
+                                    tmem_st16x256(tmem_v + Uint32(lanes + dm * 64 + blk * 8), w[0], w[1], w[2], w[3])
                     cute.arch.fence_view_async_tmem_store()
                     hv.commit()
                 hk.release()
 
         if role == 3:
-            cute.arch.setmaxregister_decrease(self.REGS8[3] if self.cvt8 else self.REGS[3])
+            cute.arch.setmaxregister_decrease(self.regs[3])
         if cutlass.const_expr(self.tma):
             if warp == 13:
                 # ---- TMA warp: tile it into its stage as soon as the stage is free
@@ -1261,8 +1310,9 @@ class DecodeV2:
                     for part in cutlass.range_constexpr(nv):
                         hv = v_c.wait_and_advance()
                         for dm in cutlass.range_constexpr(0 if "pv" in self.stub else 4):
-                            for kk in cutlass.range_constexpr(TILE // 16 // nv):
-                                k = part * (TILE // 16 // nv) + kk
+                            nk = TILE // (32 if self.v8 else 16) // nv  # MMA k-steps per V part
+                            for kk in cutlass.range_constexpr(nk):
+                                k = part * nk + kk
                                 mma_vp.set(tcgen05.Field.ACCUMULATE, (it > 1) | (k > 0))
                                 cute.gemm(mma_vp, tCtO[None, None, None, dm], tAtV[None, None, k, dm],
                                           tCrP[None, None, k, hp.index], tCtO[None, None, None, dm])
@@ -1273,16 +1323,17 @@ class DecodeV2:
                             tcgen05.commit(o_bar)
 
         if role == 2:
-            cute.arch.setmaxregister_increase(self.REGS[2])
+            cute.arch.setmaxregister_increase(self.regs[2])
             # ---- softmax: thread wt = token row wt of S^T (TMEM lane wt)
             v = self.views(*VA)
             ld_s, st_o, tStSn, tStSp, tSsP, tStO, tOtO = (v["ld_s"], v["st_o"], v["tStSn"], v["tStSp"], v["tSsP"],
                                                           v["tStO"], v["tOtO"])
             tSsG, tSsC, tScS, frag = v["tSsG"], v["tSsC"], v["tScS"], v["frag"]
             g_head = cute.make_rmem_tensor(frag, Float32)
-            cute.autovec_copy(tSsG, g_head)
             c_head = cute.make_rmem_tensor(frag, Float32)
-            cute.autovec_copy(tSsC, c_head)
+            if cutlass.const_expr(not self.h32):  # h32 reads them from shared memory each tile
+                cute.autovec_copy(tSsG, g_head)
+                cute.autovec_copy(tSsC, c_head)
             m_prev = cute.make_rmem_tensor(frag, Float32)
             m_prev.fill(-Float32.inf)
             l_acc = cute.make_rmem_tensor(frag, Float32)
@@ -1323,7 +1374,10 @@ class DecodeV2:
                 cute.arch.fence_view_async_tmem_load()
                 hs.release()
                 for i in cutlass.range_constexpr(n):
-                    sS[i] = sS[i] * g_head[i] + sR[i] * c_head[i]
+                    if cutlass.const_expr(self.h32):
+                        sS[i] = sS[i] * sG[tScS[i][1]] + sR[i] * sC[tScS[i][1]]
+                    else:
+                        sS[i] = sS[i] * g_head[i] + sR[i] * c_head[i]
                 if t_beg + it * TILE + row >= t_end:
                     sS.fill(-Float32.inf)
                 # tile maximum per head: warp reduction, one slot per warp (parity double-buffered), named barrier
@@ -1383,8 +1437,8 @@ class DecodeV2:
                 else:
                     if it > 0:
                         self.rescale(ld_s, st_o, tStO, tOtO, corr, frag)
-                p16 = cute.make_rmem_tensor(frag, Float16)
-                p16.store(pf.load().to(Float16))
+                p16 = cute.make_rmem_tensor(frag, self.pv_t)
+                p16.store(pf.load().to(self.pv_t))
                 if cutlass.const_expr(npb == 1):
                     cute.autovec_copy(p16, tSsP[0][None, None, None, None, 0])
                 else:
@@ -1418,7 +1472,7 @@ class DecodeV2:
                     l = sL[0, head] + sL[1, head] + sL[2, head] + sL[3, head]
                     val = Float32(0.0)
                     if l > 0.0:
-                        val = o[i] * (out_scale / l)
+                        val = o[i] * (out_scale * self.vshift / l)
                     lrow = tScS[i][0]
                     ch = dm * TILE + ((lrow & 0x70) | ((lrow & 7) << 1) | ((lrow >> 3) & 1))
                     if splits == 1:
@@ -1548,6 +1602,11 @@ def _compiled2(n: int, page_size: int, terms: int, feat: str = "", stub: str = "
         options="--enable-tvm-ffi")
 
 
+def default_feat(page_size: int) -> str:
+    """DecodeV2 options used by decode(); TMA boxes are whole pages, so pages under 16 tokens keep the cp.async load."""
+    return "lazy,rope8,tma,cvt8,vhalf" if page_size >= 16 else "lazy,rope8"
+
+
 def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale, ckv_scale=1.0,
            kpe_scale=1.0, max_kv_len=None, num_splits=0, version=3, heads_per_cta=None, terms=4,
            feat=None):
@@ -1559,8 +1618,14 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
     B, H = q_nope.shape[:2]
     if H % 16:
         raise ValueError(f"heads must be a multiple of 16, got {H}")
-    # v1a keeps v0's FP16 V tile in shared memory and v1b keeps V in TMEM: both leave room for 16 heads per CTA only
-    n = heads_per_cta or (32 if version == 0 and H % 32 == 0 else 16)
+    if version == 3 and feat is None:
+        feat = default_feat(ckv_cache.shape[1])
+    h32 = version == 3 and "h32" in feat.split(",")
+    if h32 and H % 32:
+        raise ValueError(f"h32 needs a multiple of 32 heads, got {H}")
+    # v1a keeps v0's FP16 V tile in shared memory and v1b keeps V in TMEM: both leave room for 16 heads per CTA only;
+    # v2 with E4M3 V (v8) has room for 32 (h32)
+    n = heads_per_cta or (32 if (version == 0 and H % 32 == 0) or h32 else 16)
     max_len = max(int(kv_lens.max()) if max_kv_len is None else int(max_kv_len), 1)
     tiles = -(-max_len // TILE)
     if num_splits <= 0:  # ponytail: one wave of one CTA per SM; v0 has no tuned split policy
@@ -1579,8 +1644,6 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
     else:
         q4, qsf, g = _load().query_terms(q_nope, terms)
         if version == 3:
-            if feat is None:  # TMA boxes are whole pages: 8 per tile at most
-                feat = "lazy,rope8,tma,cvt8,vhalf" if ckv_cache.shape[1] >= 16 else "lazy,rope8"
             if "rope8" in feat:
                 qp8, qps = _load().rope_terms(q_pe, 3)
             else:  # unused by the kernel

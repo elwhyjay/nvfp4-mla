@@ -116,19 +116,31 @@ head dims 512 + 64 (DeepSeek-V2/V3/R1, Kimi-K2).
 
 ## Accuracy
 
-- Kernel vs an FP32 PyTorch reference on the same dequantized cache: relative L2 error at most 1.9e-3, from rounding
-  the output and P to BF16.
-- The in-kernel dequantization is bitwise equal to the PyTorch reference, also with `--use_fast_math`.
-- Quantization error of the format itself (random data, NVFP4 cache vs BF16 cache): relative L2 0.08-0.12, cosine
-  about 0.995. For comparison, FP8 KV with FP8 Q (Triton FP8, XQA) has cosine 0.998 against BF16.
-- `precision="fp8"`: 0.02-0.06 against the dequantized cache (E4M3 rounding of Q, K, V and P); against the BF16 cache
-  0-11% more error than the default, because the cache format dominates. `precision="fp4-qk"`: 25-55% more.
-  [`benchmarks/precision.py`](benchmarks/precision.py) simulates the options on the CPU.
-- SM100 kernel: 1.6e-3 to 1.7e-3 against the same reference. Its QK runs on the cache's FP4 bytes with block-scaled
-  FP4 MMA, but the BF16 query is not rounded to one NVFP4 value: it is written as a sum of 4 NVFP4 terms with one
-  shared scale per head (rest 5.5e-5), and the RoPE part as 3 E4M3 terms (rest 1.2e-5).
-- FlashInfer Cake also quantizes the query to NVFP4. On the same caches its relative L2 error against BF16 is
-  0.13-0.17, 1.4-1.7x the error of this kernel's default (`benchmarks/accuracy.py` on B200, three shapes).
+What a user of the cache sees is the error against attention over the **unquantized** (BF16) KV: the format's own
+rounding plus the kernel's. Relative L2 error, random data, three shapes (4K and 16K tokens, 16 and 128 heads),
+each with a global scale of 1 and with one calibrated as a serving engine sets it (amax / (6 x 448), so the block
+scales reach the E4M3 maximum); `benchmarks/accuracy.py` on RTX PRO 6000 and B200:
+
+| path | vs unquantized KV | relative to the BF16 mode |
+|---|---|---|
+| CUDA kernel, `precision="bf16"` (default) | 0.078-0.126 | 1.00 |
+| CUDA kernel, `precision="fp8"` (E4M3 Q, K, V, P) | 0.085-0.136 | 1.07-1.11 |
+| CUDA kernel, `precision="fp4-qk"` (NVFP4 query, SM120) | 0.13-0.17 | 1.36-1.70 |
+| SM100 kernel (`nvfp4_mla.sm100`) | 0.078-0.123 | 1.00 |
+| FlashInfer Cake (NVFP4 query, SM100) | 0.13-0.17 | 1.38-1.71 |
+
+- Most of it is the format: NVFP4 KV alone costs 0.08-0.12 (cosine about 0.995); FP8 KV with an FP8 query (Triton
+  FP8, XQA) has cosine 0.998 against BF16.
+- The SM100 kernel's QK runs on the cache's FP4 bytes with block-scaled FP4 MMA, but the BF16 query is not rounded
+  to one NVFP4 value: it is a sum of 4 NVFP4 terms with one shared scale per head (rest 5.5e-5), and the RoPE part 3
+  E4M3 terms (rest 1.2e-5). Cake rounds the query to one NVFP4 value, hence its 1.4-1.7x.
+- Until 2026-11-11 the `fp8` and `fp4-qk` modes saturated with a calibrated global scale: they round
+  e2m1 x block scale (up to 2688) to E4M3 (up to 448), and their error was 0.62-0.69. They now round the value / 8 and
+  undo the 8 in the score scale and the output; the tests run both scales.
+- Kernel correctness, against attention over the dequantized cache: relative L2 at most 1.9e-3 (the CUDA kernel's
+  BF16 mode; rounding of the output and P to BF16) and 1.7e-3 (the SM100 kernel). The in-kernel dequantization is
+  bitwise equal to the PyTorch reference, also with `--use_fast_math`.
+  [`benchmarks/precision.py`](benchmarks/precision.py) simulates the precision options on the CPU.
 
 ## Performance
 
@@ -256,10 +268,11 @@ builds (v2-v2.2, 1.04-1.13 ms at 16 heads x 64 x 64K) are in the log only; the c
 
 ```bash
 pip install -e ".[test,bench]"
-pytest tests                       # correctness; the first run builds the extension three ways (~3 min)
+pytest tests                       # correctness; the first run builds the extension three ways (~3 min);
+                                   # tests/test_sm100.py runs on SM100 with ".[sm100]" installed
 python benchmarks/roofline.py      # achievable read BW and BF16 mma.sync peak of this GPU
 python benchmarks/baselines.py     # sanity check: every baseline agrees with FlashInfer fa2
-python benchmarks/accuracy.py      # error against the dequantized and the BF16 reference
+python benchmarks/accuracy.py      # error against the unquantized KV, per precision path
 python benchmarks/bench.py         # full sweep; --batch / --s-kv / --heads / --providers to narrow it
                                    # (nvfp4-tc: the SM100 kernel, needs ".[sm100]")
 uv run --with matplotlib python benchmarks/plot.py   # redraw docs/img from benchmarks/results
