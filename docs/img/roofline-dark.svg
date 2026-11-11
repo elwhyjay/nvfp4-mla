@@ -509,37 +509,37 @@ z
 " style="stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
     </defs>
     <g clip-path="url(#pec596ec866)">
-     <use xlink:href="#mb589e91ddf" x="135.908324" y="136.529678" style="fill: #52514e; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
+     <use xlink:href="#mb589e91ddf" x="135.908324" y="136.476942" style="fill: #52514e; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_15">
     <g id="patch_5">
-     <path d="M 58.927855 157.174678 
-L 127.658324 157.174678 
-L 127.658324 137.779678 
-L 58.927855 137.779678 
+     <path d="M 58.927855 157.121942 
+L 127.658324 157.121942 
+L 127.658324 137.726942 
+L 58.927855 137.726942 
 z
 " style="fill: #1a1a19"/>
     </g>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(59.677855 145.774678)">SGLang Triton (FP8)</text>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(108.654027 154.722178)">H=16</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(59.677855 145.721942)">SGLang Triton (FP8)</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(108.654027 154.669442)">H=16</text>
    </g>
    <g id="line2d_64">
     <g clip-path="url(#pec596ec866)">
-     <use xlink:href="#mb589e91ddf" x="237.668603" y="79.752969" style="fill: #52514e; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
+     <use xlink:href="#mb589e91ddf" x="237.668603" y="81.235344" style="fill: #52514e; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_16">
     <g id="patch_6">
-     <path d="M 242.918603 76.502969 
-L 278.865868 76.502969 
-L 278.865868 57.107969 
-L 242.918603 57.107969 
+     <path d="M 242.918603 77.985344 
+L 278.865868 77.985344 
+L 278.865868 58.590344 
+L 242.918603 58.590344 
 z
 " style="fill: #1a1a19"/>
     </g>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(243.668603 65.102969)">XQA (FP8)</text>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(243.668603 74.050469)">H=128</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(243.668603 66.585344)">XQA (FP8)</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(243.668603 75.532844)">H=128</text>
    </g>
    <g id="text_17">
     <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="47.865" y="19.47" transform="rotate(-0 47.865 19.47)">RTX PRO 6000</text>

@@ -16,7 +16,7 @@ import triton_mla
 CKV, KPE, QK_NOPE = 512, 64, 128
 SM_SCALE = (QK_NOPE + KPE) ** -0.5
 PROVIDERS = ["fa2", "cutlass", "cutile", "cute-dsl-monolithic", "cute-dsl-modular", "trtllm:bf16", "trtllm:fp8",
-             "triton:bf16", "triton:fp8"]
+             "triton:bf16", "triton:fp8", "b12x:bf16", "b12x:fp8"]
 PACKED = ("cutlass", "cute-dsl-monolithic", "cute-dsl-modular")  # these take [.., 576] query and KV
 
 
@@ -94,6 +94,64 @@ def trtllm(inp, variant):
         bmm1_scale=SM_SCALE, bmm2_scale=1.0, backend=backend)
 
 
+def b12x(inp, variant):
+    """FlashInfer's experimental b12x dense MLA (SM12x only), BF16 or FP8 (E4M3) KV in the combined 576-wide record.
+    With an FP8 cache the BF16 query goes through b12x's static FP8 quantizer (inside the timed call) with a per-call
+    scale, amax / 448, computed beforehand. Its only tuning knob is the KV split count; b12x's own autotuner needs
+    compiler worker processes that do not see the GPU on Modal, so the same candidates (powers of two up to one split
+    per 64 tokens, and its default) are timed here and the fastest is used."""
+    cap = max(1, (inp.s_kv + 63) // 64)
+    best = None
+    for splits in [None] + [1 << k for k in range(8) if 1 << k <= cap]:
+        f, close = _b12x_call(inp, variant, splits)
+        t = gpu_ms(f, iters=5)
+        if best is None or t < best[0]:
+            best, close = (t, f, close), best and best[2]
+        if close:  # a candidate that lost: close its session as b12x's tests do, not left to the garbage collector
+            close()
+    return best[1]
+
+
+def _b12x_call(inp, variant, max_splits):
+    from b12x.attention import dense_mla
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    dt = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}[variant]
+    B, H, dev = inp.batch, inp.heads, inp.q_nope.device
+    q = torch.cat([inp.q_nope, inp.q_pe], -1).contiguous()
+    kv = torch.cat([inp.ckv, inp.kpe], -1).to(dt).contiguous()
+    kw = dict(q=q, kv_cache=kv, output=torch.empty(B, H, CKV, dtype=torch.bfloat16, device=dev),
+              page_table=inp.page_table, cache_seqlens=inp.kv_lens,
+              cu_seqlens_q=torch.arange(B + 1, dtype=torch.int32, device=dev),
+              kv_scale=torch.ones((), device=dev) if variant == "fp8" else None,
+              q_scale=(q.abs().amax().float() / 448).reshape(()) if variant == "fp8" else None)
+    plan = dense_mla.plan(dense_mla.Caps(
+        device=dev, mode="decode", kv_dtype=dt, q_dtype=torch.bfloat16, num_q_heads=H, page_size=inp.page_size,
+        max_total_q=B, max_batch=B, max_cache_tokens=inp.s_kv, max_page_table_width=inp.page_table.shape[1],
+        num_cache_pages=kv.shape[0]), override=None if max_splits is None else dense_mla.DenseMlaConfig(max_splits=max_splits))
+
+    def call(state):  # b12x's prepared-call lifecycle: scratch, bind, prime
+        (spec,) = state.scratch_specs()
+        scr = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        binding = state.bind(scratch=scr, sm_scale=SM_SCALE, **kw)
+        state.prime(binding)
+        return PreparedCall(run=lambda: state.run(binding), output=kw["output"], owners=(scr, binding))
+
+    session = PreparationSession(device=dev, autotune=False)
+    result = session.prepare((plan.request(name="bench", prepare_call=call),))
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = dense_mla.bind(plan, scratch=scratch, sm_scale=SM_SCALE, **kw)
+    keep = (session, result, scratch)
+
+    def close():
+        torch.cuda.synchronize()
+        result.close()
+        session.close()
+
+    return (lambda: (keep, dense_mla.run(binding=binding)[0])[1]), close
+
+
 def make(provider, inp):
     kind, _, variant = provider.partition(":")
     if kind in ("fa2", "cutile") or kind in PACKED:
@@ -102,6 +160,8 @@ def make(provider, inp):
         return trtllm(inp, variant)
     if kind == "triton":
         return triton(inp, variant)
+    if kind == "b12x":
+        return b12x(inp, variant)
     raise ValueError(f"unknown provider {provider!r}; one of {PROVIDERS}")
 
 

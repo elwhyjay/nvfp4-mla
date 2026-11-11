@@ -52,7 +52,8 @@ def name(provider, gpu):
             "cutile": "FlashInfer cuTile (BF16)", "cute-dsl-monolithic": "FlashInfer CuTe DSL (BF16)",
             "cake": "FlashInfer Cake (NVFP4)", "triton:fp8": "SGLang Triton (FP8)",
             "triton:bf16": "SGLang Triton (BF16)", "fa2": "FlashInfer fa2 (BF16)", "cutlass": "cutlass (BF16)",
-            "trtllm:bf16": "trtllm-gen (BF16)", "nvfp4+fa2": "dequant + fa2"}[provider]
+            "trtllm:bf16": "trtllm-gen (BF16)", "nvfp4+fa2": "dequant + fa2", "b12x:fp8": "FlashInfer b12x (FP8)",
+            "b12x:bf16": "FlashInfer b12x (BF16)"}[provider]
 
 
 def kv_bytes(provider):

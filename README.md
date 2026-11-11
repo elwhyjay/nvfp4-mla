@@ -19,12 +19,13 @@ kernel from a serial `tcgen05` version to TMA and warp specialization:
 
 ## Why
 
-FlashInfer can write an MLA KV cache in NVFP4 (#4676). Who can read it back for dense decode, as of 2026-11-10
+FlashInfer can write an MLA KV cache in NVFP4 (#4676). Who can read it back for dense decode, as of 2026-11-11
 (FlashInfer v0.7.3 and v0.7.4rc1, vLLM v0.33.0, SGLang v0.5.23, TensorRT-LLM v1.4.0rc3):
 
 - **SM12x** (RTX PRO 6000 and RTX 50 series are SM120, DGX Spark is SM121): FlashInfer, vLLM and SGLang have no
-  dense NVFP4 MLA decode. vLLM's dense MLA backends take BF16 or FP8 KV only, and its NVFP4 MLA cache
-  (`nvfp4_ds_mla`) is for sparse MLA on SM100 only. SGLang's FP4 MLA cache uses its own layout and is dequantized to
+  dense NVFP4 MLA decode. FlashInfer's experimental b12x package (SM12x) has a dense MLA for BF16 and FP8 caches
+  (compared below) and NVFP4 records only for its sparse MLA, in its own record layout. vLLM's dense MLA backends
+  take BF16 or FP8 KV only, and its NVFP4 MLA cache (`nvfp4_ds_mla`) is for sparse MLA on SM100 only. SGLang's FP4 MLA cache uses its own layout and is dequantized to
   BF16 before attention. TensorRT-LLM's `fp4_mla` (FP4 query, KV and P, its own cache layout) is validated on SM100
   and SM107 only.
 - **SM100:** FlashInfer v0.7.3 added `cake_mla_nvfp4_paged_decode` (experimental, needs CUDA 13.4), which reads
@@ -151,7 +152,8 @@ random data. Full sweeps (H 16/128, batch 1-64, 1K-64K tokens): [rtx_pro_6000.cs
 
 Baselines: FlashInfer `BatchMLAPagedAttentionWrapper` (fa2, BF16 KV); FlashInfer
 `trtllm_batch_decode_with_kv_cache_mla` (XQA on SM120, trtllm-gen on SM100); FlashInfer `cake_mla_nvfp4_paged_decode`
-(SM100, same NVFP4 cache, NVFP4 query); SGLang's Triton MLA decode (the vLLM/SGLang default on SM120, vendored in
+(SM100, same NVFP4 cache, NVFP4 query); FlashInfer's experimental b12x dense MLA (SM12x, FP8 KV; its one tuning
+knob, the KV split count, set to the fastest of its candidates for each shape); SGLang's Triton MLA decode (the vLLM/SGLang default on SM120, vendored in
 `benchmarks/triton_mla.py`); and "dequantize + fa2" (`nvfp4_mla.dequantize` to BF16, then fa2).
 
 **RTX PRO 6000 (SM120)**
@@ -161,15 +163,15 @@ Baselines: FlashInfer `BatchMLAPagedAttentionWrapper` (fa2, BF16 KV); FlashInfer
   <img alt="Latency of nvfp4-mla and other MLA decode kernels on RTX PRO 6000 for four shapes" src="docs/img/compare-rtx-pro-6000-light.svg">
 </picture>
 
-| heads | batch x kv_len | nvfp4 bf16 | nvfp4 fp8 | nvfp4 fp4-qk | Triton FP8 | fa2 BF16 | dequantize + fa2 | XQA FP8 |
-|---|---|---|---|---|---|---|---|---|
-| 16 | 1 x 4K | **0.018** | 0.019 | 0.021 | 0.045 | 0.036 | 0.038 | n/a (needs 128 heads) |
-| 16 | 1 x 64K | **0.046** | 0.052 | 0.052 | 0.116 | 0.128 | 0.179 | n/a |
-| 16 | 16 x 64K | 0.332 | **0.324** | 0.325 | 0.574 | 1.518 | 2.613 | n/a |
-| 16 | 64 x 64K | 1.121 | **1.105** | **1.105** | 1.852 | 6.790 | 11.23 | n/a |
-| 128 | 1 x 64K | 0.105 | **0.080** | **0.080** | 0.226 | 0.164 | 0.213 | 1.110 |
-| 128 | 16 x 64K | 1.353 | **0.778** | 0.797 | 2.195 | 3.180 | 4.264 | 1.120 |
-| 128 | 64 x 64K | 4.815 | 2.836 | 2.762 | 8.156 | 9.750 | 14.16 | **2.306** |
+| heads | batch x kv_len | nvfp4 bf16 | nvfp4 fp8 | nvfp4 fp4-qk | Triton FP8 | fa2 BF16 | dequantize + fa2 | XQA FP8 | b12x FP8 |
+|---|---|---|---|---|---|---|---|---|---|
+| 16 | 1 x 4K | **0.017** | 0.019 | 0.021 | 0.045 | 0.036 | 0.039 | n/a (needs 128 heads) | 0.021 |
+| 16 | 1 x 64K | **0.043** | 0.048 | 0.049 | 0.115 | 0.127 | 0.182 | n/a | 0.077 |
+| 16 | 16 x 64K | 0.330 | **0.324** | 0.325 | 0.581 | 1.516 | 2.619 | n/a | 0.700 |
+| 16 | 64 x 64K | 1.124 | **1.108** | 1.109 | 1.849 | 6.828 | 11.27 | n/a | 2.760 |
+| 128 | 1 x 64K | 0.104 | **0.084** | **0.084** | 0.224 | 0.162 | 0.215 | 1.124 | 0.326 |
+| 128 | 16 x 64K | 1.347 | 0.810 | **0.791** | 2.193 | 3.206 | 4.305 | 1.134 | 4.710 |
+| 128 | 64 x 64K | 5.102 | 2.877 | 2.806 | 8.468 | 10.14 | 14.56 | **2.421** | 19.00 |
 
 **B200 (SM100)**
 
@@ -190,18 +192,21 @@ Baselines: FlashInfer `BatchMLAPagedAttentionWrapper` (fa2, BF16 KV); FlashInfer
 
 How to read these numbers:
 
-- **SM120, 16 heads** (memory bound): the default mode is the fastest in all 16 measured shapes (batch 1-64, 1K-64K
-  tokens): 1.6-3.3x faster than Triton FP8 and 1.5-6.1x faster than fa2. At 64 x 64K it reads 1.32 TB/s, 85% of the
-  achievable 1.56 TB/s (`benchmarks/roofline.py`). Triton FP8 reaches the same fraction there, so the 1.65x gain is
-  the byte ratio 576 / 352. The FP8 mode changes little here (0.8-1.03x).
-- **SM120, 128 heads** (not memory bound from batch 16): the FP8 mode is 1.3-1.7x faster than the default from batch 4.
-  It is the fastest at batch 1-4 (XQA has no KV split and is slow with long contexts) and at batch 16 with 16K tokens
-  or more, and faster than Triton FP8 (1.2-2.9x) and fa2 (1.1-4.1x) in all shapes. XQA's FP8 cache still wins at
-  batch 64 (1.23x at 64 x 64K). This is not a hardware floor: ncu shows the kernel bound by latency (38.6% of issue
+- **SM120, 16 heads** (memory bound): the default mode, or the FP8 mode within 1.5%, is the fastest in all 16 measured
+  shapes (batch 1-64, 1K-64K tokens): 1.6-3.4x faster than Triton FP8, 1.5-6.1x faster than fa2 and 1.2-2.5x faster
+  than b12x FP8. At 64 x 64K it reads 1.31 TB/s, 84% of the achievable 1.56 TB/s (`benchmarks/roofline.py`). Triton
+  FP8 reaches about the same fraction there, so the 1.65x gain is the byte ratio 576 / 352.
+- **SM120, 128 heads** (not memory bound from batch 16): the FP8 mode is up to 1.8x faster than the default from
+  batch 4. This kernel is the fastest at batch 1-4 (XQA has no KV split and is slow with long contexts; b12x is
+  faster only at 1 x 1K) and at batch 16 with 16K tokens or more. It is faster than Triton FP8 (1.1-2.9x) in all
+  shapes and than fa2 (up to 4.0x) in all but one. XQA's FP8 cache still wins at batch 64 (1.16x over the fp4-qk
+  mode at 64 x 64K). This is not a hardware floor: ncu shows the kernel bound by latency (38.6% of issue
   slots, tensor pipe 49%). Test builds with wrong numbers bound each part: removing the FP4 -> FP8 conversion (46% of
   the instructions) saves 12%, removing both per-tile barriers 5%, and both together leave 2.44 ms, still above XQA.
   The rest is how the MMAs are issued, in bursts by 2 warps per scheduler, which the register budget does not let grow
   ([optimization log](docs/optimization-log.md#e3-and-e4-results-sm120-stops-at-v11c)).
+- **FlashInfer b12x** (SM12x dense MLA, FP8 KV): correct (cosine 0.9986-0.9988 against fa2), but in this setup
+  slower than this kernel at 16 heads (1.2-2.5x) and, at 128 heads, up to 7.9x slower than XQA.
 - **B200, 16 heads**: FlashInfer Cake is the fastest in 11 of the 16 shapes. The SM100 kernel is 1.4x slower than
   Cake at 64 x 64K (it reads 3.2 TB/s, 44% of the achievable 7.3 TB/s; Cake 63%) and 1.5x slower at 16 x 64K. It is
   faster than the CUDA kernel from 16 x 16K tokens (up to 1.6x) and than trtllm-gen BF16 in the same shapes (up to

@@ -13,6 +13,7 @@ GB/s counts each format's own bytes per token: NVFP4 352, FP8 576, BF16 1152. Pr
   fa2, cutlass    FlashInfer BatchMLAPagedAttentionWrapper, BF16 KV
   cutile          the same wrapper's cuTile backend; cute-dsl-monolithic, cute-dsl-modular: its CuTe DSL backends
   trtllm:bf16|fp8 FlashInfer trtllm_batch_decode_with_kv_cache_mla (trtllm-gen on SM100, XQA on SM120)
+  b12x:bf16|fp8   FlashInfer's experimental b12x dense MLA (SM12x), BF16 or FP8 (E4M3) KV
   triton:bf16|fp8 SGLang's Triton MLA decode kernel (vendored in triton_mla.py), the vLLM/SGLang default on SM120
   cake            FlashInfer Cake NVFP4 MLA decode on the same cache (SM100, CUDA 13.4, FlashInfer >= 0.7.4rc1);
                   its query is NVFP4, quantized once outside the timed call
