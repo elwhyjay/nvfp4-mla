@@ -818,3 +818,50 @@ At 1K the conversion costs 3% and the gap stays at 1.64x, so the short-context l
   that is a different kernel design, not a step from v11.
 
 SM120 ends at v11c: the FP8 mode at 2.82 ms and the FP4 QK mode at 2.65 ms on H=128 B64 64K, against 2.30 ms for XQA.
+
+### A new SM120 structure? Pre-tests E3 and E4
+
+After E1, two redesigns were proposed for the H=128 gap: (a) v13, converter warps plus software pipelining inside the
+MMA warps (QK of tile i+1 issued before the softmax of tile i) and a ping-pong of two head groups; (b) a finer split,
+8 warps of 16 heads x 256 channels, to fit 4 warps per scheduler in 128 registers. Both bet that the remaining time is
+latency the scheduler could hide. On SM120, `mma.sync` is issued in order (unlike Hopper's `wgmma`), so what (a) can
+hide is mainly the latency around the two per-tile barriers (row-max exchange, P exchange); (b) adds warps but brings
+back a cross-warp score sum (removed in v9 for -14%) and needs a register budget v8 suggests is out of reach.
+
+Before building either, two more stubs of v11c measure what the barriers cost (wrong numbers, same work otherwise):
+
+- E3: no cross-warp row-max exchange; each warp uses its own maximum (one `STS` and two `LDS.128` fewer per tile).
+- E4: no barrier between the P stores and PV (PV may read a stale P).
+- E34: both; E134: both and no conversion (E1).
+
+Decision rule, written before the run (H=128 B64 64K, same-run A/B against v11c):
+
+- E34 at least 20% faster: the barriers are the main remaining limit, and (a) is worth building.
+- E34 less than 10% faster: the barriers are not the limit either; with the conversion at 12% (E1), no single part of
+  the chain is worth a new kernel, and the SM120 work stops at v11c.
+- In between: (a) only if E134 lands below XQA's time (2.33 ms in the same-process run).
+
+### E3 and E4 results: SM120 stops at v11c
+
+Same-run A/B against v11c, FP8 mode (time of the stub, and how much faster than v11c):
+
+| H=128 | E3 (no row-max exchange) | E4 (no P barrier) | E34 (both) | E134 (both, no conversion) |
+|---|---|---|---|---|
+| B16 16K | 0.238 ms (-3%) | 0.243 (-1%) | 0.236 (-4%) | 0.222 (-10%) |
+| B16 64K | 0.789 (-4%) | 0.811 (-1%) | 0.780 (-5%) | 0.712 (-13%) |
+| B64 16K | 0.811 (-4%) | 0.833 (-1%) | 0.802 (-5%) | 0.737 (-13%) |
+| B64 64K | 2.760 (-4%) | 2.807 (-1%) | 2.700 (-6%) | 2.444 (-14%) |
+
+Registers stay at 245 (254 with the conversion stubbed).
+
+- Both per-tile barriers together cost 4-6%, below the 10% line written before the run. With the conversion
+  (E1, 12%) they add up to 14%: even a kernel with neither would take 2.44 ms at H=128 B64 64K, still above XQA's
+  2.33 ms. Hiding barrier latency, the main thing software pipelining with in-order `mma.sync` could do, has little to
+  win, so v13 is not built.
+- What remains is the MMA work itself as this structure issues it: per scheduler, one warp from each of the two CTAs,
+  each alternating a burst of 18 QK and 16 PV MMAs (math throttle) with non-MMA work, while the tensor pipe is busy 49-56%
+  of the time. Filling it needs more independent warps per scheduler, which the register budget does not allow; the
+  finer-split proposal (b) is the only design aimed at that, and it was not tested: its 128-register budget is the
+  first thing that would have to be shown.
+- SM120 summary at H=128 B64 64K: v11c 2.82-2.89 ms (FP8) / 2.65-2.74 ms (FP4 QK) against XQA 2.30-2.33 ms. The
+  conversion explains 12% of v11c's time, the two per-tile barriers 5%, and the rest is the MMA-issue structure.

@@ -166,10 +166,10 @@ How to read these numbers:
   It is the fastest at batch 1-4 (XQA has no KV split and is slow with long contexts) and at batch 16 with 16K tokens
   or more, and faster than Triton FP8 (1.2-2.9x) and fa2 (1.1-4.1x) in all shapes. XQA's FP8 cache still wins at
   batch 64 (1.23x at 64 x 64K). This is not a hardware floor: ncu shows the kernel bound by latency (38.6% of issue
-  slots, tensor pipe 49%). The FP4 -> FP8 conversion is 46% of the instructions, but removing it entirely (a test
-  build with wrong numbers) saves only 11-13% and leaves the kernel at about XQA's time; the rest of each warp's
-  serial chain (MMA bursts, the cross-warp row max, softmax) with 2 warps per scheduler is what separates them
-  ([optimization log](docs/optimization-log.md#v11c-and-e1-results-v12-is-not-built)).
+  slots, tensor pipe 49%). Test builds with wrong numbers bound each part: removing the FP4 -> FP8 conversion (46% of
+  the instructions) saves 12%, removing both per-tile barriers 5%, and both together leave 2.44 ms, still above XQA.
+  The rest is how the MMAs are issued, in bursts by 2 warps per scheduler, which the register budget does not let grow
+  ([optimization log](docs/optimization-log.md#e3-and-e4-results-sm120-stops-at-v11c)).
 - **B200, 16 heads**: FlashInfer Cake (`tcgen05` MMA) is the fastest in most shapes, up to 2.3x faster than this
   kernel; this kernel is faster only at batch 1-4 with up to 4K tokens. It is faster than trtllm-gen BF16 in all
   16 shapes (1.03-1.47x), than fa2 (1.6-3.3x) and than Triton FP8 (2.5-5.1x). This kernel uses `mma.sync` on both
