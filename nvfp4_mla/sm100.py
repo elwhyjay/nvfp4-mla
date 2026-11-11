@@ -878,18 +878,25 @@ class DecodeV2:
       st3    3 raw stages instead of 4.
       h32    32 heads per CTA (needs v8 for TMEM, st3 for shared memory, cvt8): the cache is read once per 32
              heads. The softmax gets 232 registers and reads the per-head scales from shared memory.
+    feat (v2.6):
+      tk     the query terms along K: per 64-channel step one MMA per term (N = heads) into one score block, each
+             term with its own scale factors (4 TMEM regions, 4 shared-memory stages; needs st3); the softmax loads
+             one latent score block instead of four.
     """
 
     REGS = {0: 72, 1: 152, 2: 176, 3: 112}  # per role; sum x 128 threads = 65536
     REGS8 = {0: 128, 1: 128, 2: 176, 3: 80}  # cvt8
     REGS32 = {0: 104, 1: 104, 2: 232, 3: 72}  # h32: the softmax holds one value per head in 6 arrays
-    FEATS = ("lazy", "rope8", "qksm", "vhalf", "tma", "cvt8", "v8", "st3", "h32")
+    FEATS = ("lazy", "rope8", "qksm", "vhalf", "tma", "cvt8", "v8", "st3", "h32", "tk")
 
     def __init__(self, n: int, page_size: int, terms: int, feat: str = "", stub: str = ""):
         # stub (measurement only, wrong results): roles in it skip their work but keep their pipeline signals
         self.n, self.ps, self.terms, self.stub = n, page_size, terms, stub
-        (self.lazy, self.rope8, self.qksm, self.vhalf, self.tma, self.cvt8, self.v8, self.st3,
-         self.h32) = (f in feat.split(",") for f in self.FEATS)
+        (self.lazy, self.rope8, self.qksm, self.vhalf, self.tma, self.cvt8, self.v8, self.st3, self.h32,
+         self.tk) = (f in feat.split(",") for f in self.FEATS)
+        if self.tk and (self.qksm or not self.st3):
+            raise ValueError("tk needs st3 (shared memory for 4 scale stages) and does not go with qksm")
+        self.nsfb = terms if self.tk else 1  # scale-factor sets of the query (B operand of QK)
         if self.h32 != (n == 32) or self.h32 and not (self.v8 and self.st3 and self.cvt8):
             raise ValueError("32 heads per CTA go with h32, which needs v8, st3 and cvt8")
         self.regs = self.REGS32 if self.h32 else self.REGS8 if self.cvt8 else self.REGS
@@ -911,7 +918,8 @@ class DecodeV2:
                  splits: Int32, scale_log2: Float32, kpe_ratio: Float32, out_scale: Float32, stream):
         n, terms, st = self.n, self.terms, self.stages
         nq = terms * n
-        mma_qk = cute.make_tiled_mma(tcgen05.MmaMXF4NVF4Op(Float8E4M3FN, (TILE, nq, 64), tcgen05.CtaGroup.ONE,
+        nqk = n if self.tk else nq  # QK's N: the heads (terms along K) or terms x heads (terms along N)
+        mma_qk = cute.make_tiled_mma(tcgen05.MmaMXF4NVF4Op(Float8E4M3FN, (TILE, nqk, 64), tcgen05.CtaGroup.ONE,
                                                            tcgen05.OperandSource.SMEM))
         pe_t = Float8E4M3FN if self.rope8 else Float16
         mma_pe = sm100_utils.make_trivial_tiled_mma(pe_t, pe_t, OperandMajorMode.K, OperandMajorMode.K, Float32,
@@ -919,11 +927,11 @@ class DecodeV2:
         mma_vp = sm100_utils.make_trivial_tiled_mma(self.pv_t, self.pv_t, OperandMajorMode.K, OperandMajorMode.MN,
                                                     Float32, tcgen05.CtaGroup.ONE, (TILE, n), tcgen05.OperandSource.TMEM)
         mma_sn = sm100_utils.make_trivial_tiled_mma(Float16, OperandMajorMode.K, OperandMajorMode.K, Float32,
-                                                    tcgen05.CtaGroup.ONE, (TILE, nq))
+                                                    tcgen05.CtaGroup.ONE, (TILE, nqk))
         atom4 = tcgen05.make_smem_layout_atom(tcgen05.mma.SmemLayoutAtomKind.K_SW128, Float4E2M1FN)
         kind_pe = tcgen05.mma.SmemLayoutAtomKind.K_SW64 if self.rope8 else tcgen05.mma.SmemLayoutAtomKind.K_SW128
         atom_pe = tcgen05.make_smem_layout_atom(kind_pe, pe_t)
-        tiler = (TILE, nq, CKV)
+        tiler = (TILE, nqk, CKV)
         npe = 3 if self.rope8 else 1  # query RoPE terms, along K
         tma = (None,) * 6
         if cutlass.const_expr(self.tma):  # the cache as [pages x page size, bytes per token]; one box = one page
@@ -945,7 +953,7 @@ class DecodeV2:
                     sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), self.pv_t, self.np),
                     sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), self.pv_t, 1),
                     bsl.make_smem_layout_sfa(mma_qk, tiler, SF_VEC, self.nd),
-                    bsl.make_smem_layout_sfb(mma_qk, tiler, SF_VEC, 1)).launch(
+                    bsl.make_smem_layout_sfb(mma_qk, tiler, SF_VEC, self.nsfb)).launch(
             grid=[q_pe.shape[1] // n, q_pe.shape[0], splits], block=[512, 1, 1], min_blocks_per_mp=1, stream=stream)
 
     def views(self, mma_qk, mma_pe, mma_vp, mma_sn, lsfa, lsfb, lp1, tmem_ptr, sK4, sQ4, sKpe, sQpe, sP, sSFA, sSFB,
@@ -958,7 +966,9 @@ class DecodeV2:
         thr_pe = mma_pe.get_slice(0)
         thr_vp = mma_vp.get_slice(0)
         tCrK4 = mma_qk.make_fragment_A(thr_qk.partition_A(sK4))  # (MMA, 1, 8, stages)
-        tCrQ4 = mma_qk.make_fragment_B(thr_qk.partition_B(sQ4))  # (MMA, 1, 8)
+        # per scale-factor set: [all terms] along N, or [term t] along K, each (MMA, 1, 8)
+        tCrQ4 = ([mma_qk.make_fragment_B(thr_qk.partition_B(cute.local_tile(sQ4, (n, CKV), (t, 0))))
+                  for t in range(terms)] if self.tk else [mma_qk.make_fragment_B(thr_qk.partition_B(sQ4))])
         tCrKpe = mma_pe.make_fragment_A(thr_pe.partition_A(sKpe))  # (MMA, 1, kpe k-steps, buffers)
         tCrQpe = mma_pe.make_fragment_B(thr_pe.partition_B(sQpe))  # (MMA, 1, k-steps, query terms)
         tCrP = mma_vp.make_fragment_B(sP)  # (MMA, 1, 8, P buffers)
@@ -966,7 +976,8 @@ class DecodeV2:
         # TMEM: S latent (terms x n), S RoPE (n), O^T (4 x n), SFA, SFB; V^T in columns 256-511
         s_shape = mma_vp.partition_shape_C((TILE, n, 1))
         s_layout = mma_vp.make_fragment_C(s_shape).layout
-        tCtSn = cute.make_tensor(tmem_ptr, mma_sn.make_fragment_C(mma_sn.partition_shape_C((TILE, nq, 1))).layout)
+        tCtSn = cute.make_tensor(tmem_ptr, mma_sn.make_fragment_C(
+            mma_sn.partition_shape_C((TILE, n if self.tk else nq, 1))).layout)
         col_n = tcgen05.find_tmem_tensor_col_offset(tCtSn)
         tCtSp = cute.make_tensor(tmem_ptr + col_n, s_layout)
         col = tcgen05.find_tmem_tensor_col_offset(tCtSp)
@@ -977,9 +988,11 @@ class DecodeV2:
                                   bsl.make_tmem_layout_sfa(mma_qk, (TILE, n, CKV), SF_VEC,
                                                            cute.slice_(lsfa, (None, None, None, 0))))
         col_sfa = tcgen05.find_tmem_tensor_col_offset(tCtSFA)
-        tCtSFB = cute.make_tensor(cute.recast_ptr(tmem_ptr + col_sf + col_sfa, dtype=Float8E4M3FN),
-                                  bsl.make_tmem_layout_sfb(mma_qk, (TILE, n, CKV), SF_VEC,
-                                                           cute.slice_(lsfb, (None, None, None, 0))))
+        lsfb_t = bsl.make_tmem_layout_sfb(mma_qk, (TILE, n, CKV), SF_VEC, cute.slice_(lsfb, (None, None, None, 0)))
+        sfb0 = cute.make_tensor(cute.recast_ptr(tmem_ptr + col_sf + col_sfa, dtype=Float8E4M3FN), lsfb_t)
+        col_sfb = tcgen05.find_tmem_tensor_col_offset(sfb0)
+        tCtSFB = [cute.make_tensor(cute.recast_ptr(tmem_ptr + col_sf + col_sfa + t * col_sfb, dtype=Float8E4M3FN),
+                                   lsfb_t) for t in range(self.nsfb)]
         tAtV = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.vbase, dtype=self.pv_t),
                                 thr_vp.make_fragment_A(mma_vp.partition_shape_A((TILE, TILE, 4))).layout)
 
@@ -988,10 +1001,10 @@ class DecodeV2:
         thr_cpa = cp_sfa.get_slice(0)
         sfa_src = tcgen05.get_s2t_smem_desc_tensor(cp_sfa, thr_cpa.partition_S(cute.filter_zeros(sSFA)))
         sfa_dst = thr_cpa.partition_D(cute.filter_zeros(tCtSFA))
-        cp_sfb = tcgen05.make_s2t_copy(s2t, cute.filter_zeros(tCtSFB))
+        cp_sfb = tcgen05.make_s2t_copy(s2t, cute.filter_zeros(tCtSFB[0]))
         thr_cpb = cp_sfb.get_slice(0)
         sfb_src = tcgen05.get_s2t_smem_desc_tensor(cp_sfb, thr_cpb.partition_S(cute.filter_zeros(sSFB)))
-        sfb_dst = thr_cpb.partition_D(cute.filter_zeros(tCtSFB))
+        sfb_dst = [thr_cpb.partition_D(cute.filter_zeros(x)) for x in tCtSFB]
 
         # P^T buffer b as the (token, head) C tile of QK, so softmax threads store their own rows
         tCsP = [cute.composition(cute.make_tensor(cute.recast_ptr(sP.iterator + b * cute.cosize(lp1), lp1.inner,
@@ -1002,7 +1015,7 @@ class DecodeV2:
         st_o = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.St32x32bOp(rep), Float32), tCtO[None, None, None, 0])
         thr_ld = ld_s.get_slice(wt)
         thr_st = st_o.get_slice(wt)
-        tStSn = [thr_ld.partition_S(cute.make_tensor(tmem_ptr + t * col, s_layout)) for t in range(terms)]
+        tStSn = [thr_ld.partition_S(cute.make_tensor(tmem_ptr + t * col, s_layout)) for t in range(1 if self.tk else terms)]
         tStSp = thr_ld.partition_S(tCtSp)
         tSsP = [thr_ld.partition_D(x) for x in tCsP]
         tStO = thr_ld.partition_S(tCtO)
@@ -1071,7 +1084,7 @@ class DecodeV2:
         sfa_w = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=Uint32),
                                  cute.make_layout((32, 4, CKV // 64, nd), stride=(4, 1, 128, 1024)))
         sfb_w = cute.make_tensor(cute.recast_ptr(sSFB.iterator, dtype=Uint32),
-                                 cute.make_layout((32, 4, CKV // 64), stride=(4, 1, 128)))
+                                 cute.make_layout((32, 4, CKV // 64, self.nsfb), stride=(4, 1, 128, 1024)))
         o_bar, tma_bar = stg.o_bar.data_ptr(), stg.tma_bar.data_ptr()
 
         thr128 = lambda: pipeline.CooperativeGroup(pipeline.Agent.Thread, 128)
@@ -1108,8 +1121,8 @@ class DecodeV2:
         tmem_ptr = tmem.retrieve_ptr(Float32)
 
         # ---- prologue (all 512 threads): query terms and scales; RoPE part (E4M3 terms, or FP16 x kpe / ckv scale)
-        for i in cutlass.range(tidx, 1024, 512):
-            sfb_w[i % 32, (i // 32) % 4, i // 128] = Uint32(0)
+        for i in cutlass.range(tidx, 1024 * self.nsfb, 512):
+            sfb_w[i % 32, (i // 32) % 4, (i // 128) % 8, i // 1024] = Uint32(0)
         cute.arch.sync_threads()
         for i in cutlass.range(tidx, n * terms * (CKV // 32), 512):
             r, t, c = i // (terms * (CKV // 32)), (i // (CKV // 32)) % terms, i % (CKV // 32)
@@ -1117,8 +1130,11 @@ class DecodeV2:
             store8(cute.local_tile(sQ4, (1, 32), (t * n + r, c)), w[0], w[1], w[2], w[3])
         for i in cutlass.range(tidx, n * terms * (CKV // 64), 512):
             r, t, a = i // (terms * (CKV // 64)), (i // (CKV // 64)) % terms, i % (CKV // 64)
-            sfb_w[(t * n + r) % 32, (t * n + r) // 32, a] = ld_u32(
-                addr_of(mQsf) + ((Int64(b * mQsf.shape[1] + h0 + r) * terms + t) * (CKV // 16) + 4 * a))
+            w = ld_u32(addr_of(mQsf) + ((Int64(b * mQsf.shape[1] + h0 + r) * terms + t) * (CKV // 16) + 4 * a))
+            if cutlass.const_expr(self.tk):  # terms along K: one SF stage per term
+                sfb_w[r % 32, r // 32, a, t] = w
+            else:
+                sfb_w[(t * n + r) % 32, (t * n + r) // 32, a, 0] = w
         if cutlass.const_expr(self.rope8):
             for i in cutlass.range(tidx, n * 3 * (KPE // 16), 512):
                 r, t, c = i // (3 * (KPE // 16)), (i // (KPE // 16)) % 3, i % (KPE // 16)
@@ -1283,7 +1299,8 @@ class DecodeV2:
                                                                   v["sfb_src"], v["sfb_dst"])
             if cutlass.const_expr(not self.qksm):
                 if n_tiles > 0:
-                    cute.copy(cp_sfb, sfb_src[None, None, None, None, 0], sfb_dst)
+                    for t in cutlass.range_constexpr(self.nsfb):
+                        cute.copy(cp_sfb, sfb_src[None, None, None, None, t], sfb_dst[t])
             for it in cutlass.range(n_tiles + 1):
                 if cutlass.const_expr(not self.qksm):
                     if it < n_tiles:
@@ -1293,10 +1310,11 @@ class DecodeV2:
                         mma_qk.set(tcgen05.Field.ACCUMULATE, False)
                         for k in cutlass.range_constexpr(0 if "qk" in self.stub else CKV // 64):
                             mma_qk.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
-                            mma_qk.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
-                            cute.gemm(mma_qk, tCtSn[None, None, None, 0], tCrK4[None, None, k, hk.index],
-                                      tCrQ4[None, None, k], tCtSn[None, None, None, 0])
-                            mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+                            for t in cutlass.range_constexpr(self.nsfb):  # tk: the terms accumulate into one S
+                                mma_qk.set(tcgen05.Field.SFB, tCtSFB[t][None, None, k].iterator)
+                                cute.gemm(mma_qk, tCtSn[None, None, None, 0], tCrK4[None, None, k, hk.index],
+                                          tCrQ4[t][None, None, k], tCtSn[None, None, None, 0])
+                                mma_qk.set(tcgen05.Field.ACCUMULATE, True)
                         mma_pe.set(tcgen05.Field.ACCUMULATE, False)
                         for t in cutlass.range_constexpr(3 if self.rope8 else 1):  # rope8: the 3 query terms along K
                             for k in cutlass.range_constexpr(2 if self.rope8 else KPE // 16):
@@ -1342,16 +1360,16 @@ class DecodeV2:
             if cutlass.const_expr(self.qksm):  # QK(0) from the first softmax warp
                 if lw == 0:
                     if n_tiles > 0:
-                        cute.copy(v["cp_sfb"], v["sfb_src"][None, None, None, None, 0], v["sfb_dst"])
+                        cute.copy(v["cp_sfb"], v["sfb_src"][None, None, None, None, 0], v["sfb_dst"][0])
                         hk = kvm_c.wait_and_advance()
                         hs = s_p.acquire_and_advance()
                         cute.copy(v["cp_sfa"], v["sfa_src"][None, None, None, None, 0], v["sfa_dst"])
                         mma_qk.set(tcgen05.Field.ACCUMULATE, False)
                         for k in cutlass.range_constexpr(0 if "qk" in self.stub else CKV // 64):
                             mma_qk.set(tcgen05.Field.SFA, v["tCtSFA"][None, None, k].iterator)
-                            mma_qk.set(tcgen05.Field.SFB, v["tCtSFB"][None, None, k].iterator)
+                            mma_qk.set(tcgen05.Field.SFB, v["tCtSFB"][0][None, None, k].iterator)
                             cute.gemm(mma_qk, v["tCtSn"][None, None, None, 0], v["tCrK4"][None, None, k, hk.index],
-                                      v["tCrQ4"][None, None, k], v["tCtSn"][None, None, None, 0])
+                                      v["tCrQ4"][0][None, None, k], v["tCtSn"][None, None, None, 0])
                             mma_qk.set(tcgen05.Field.ACCUMULATE, True)
                         mma_pe.set(tcgen05.Field.ACCUMULATE, False)
                         for t in cutlass.range_constexpr(3 if self.rope8 else 1):  # rope8: the 3 query terms along K
@@ -1366,7 +1384,7 @@ class DecodeV2:
                 sS = cute.make_rmem_tensor(frag, Float32)
                 sR = cute.make_rmem_tensor(frag, Float32)
                 cute.copy(ld_s, tStSn[0][None, None, None, None, 0], sS)
-                for t in cutlass.range_constexpr(1, terms):
+                for t in cutlass.range_constexpr(1, 1 if self.tk else terms):
                     cute.copy(ld_s, tStSn[t][None, None, None, None, 0], sR)
                     for i in cutlass.range_constexpr(n):
                         sS[i] = sS[i] + sR[i]
@@ -1398,9 +1416,9 @@ class DecodeV2:
                             mma_qk.set(tcgen05.Field.ACCUMULATE, False)
                             for k in cutlass.range_constexpr(0 if "qk" in self.stub else CKV // 64):
                                 mma_qk.set(tcgen05.Field.SFA, v["tCtSFA"][None, None, k].iterator)
-                                mma_qk.set(tcgen05.Field.SFB, v["tCtSFB"][None, None, k].iterator)
+                                mma_qk.set(tcgen05.Field.SFB, v["tCtSFB"][0][None, None, k].iterator)
                                 cute.gemm(mma_qk, v["tCtSn"][None, None, None, 0], v["tCrK4"][None, None, k, hk.index],
-                                          v["tCrQ4"][None, None, k], v["tCtSn"][None, None, None, 0])
+                                          v["tCrQ4"][0][None, None, k], v["tCtSn"][None, None, None, 0])
                                 mma_qk.set(tcgen05.Field.ACCUMULATE, True)
                             mma_pe.set(tcgen05.Field.ACCUMULATE, False)
                             for t in cutlass.range_constexpr(3 if self.rope8 else 1):  # rope8: the 3 query terms along K

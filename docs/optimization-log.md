@@ -1707,3 +1707,99 @@ columns, the sums, 32 exponentials per thread), and at 232 registers it still sp
 The MMA warp waits for P, so PV frees V late and convert waits for V. Two ways to cut the softmax's work, for a
 later step: QK with the query terms along K instead of N (the MMA sums the 4 terms, so the softmax loads one score
 column block instead of four), and a softmax split over more warps.
+
+### v2.6 hypothesis: the query terms along K
+
+With 32 heads the softmax sets the period (v2.5): per tile it loads 4 latent score blocks and 1 RoPE block of 32
+columns and adds them. The 4 blocks exist only because the query terms are stacked along N, so that one MMA per
+64-channel step serves all terms.
+
+- Change `tk`: for each 64-channel step, 4 MMAs, one per query term, with N = the CTA's heads, accumulating into
+  one score block. The tensor work is the same; the MMA warp issues 32 QK instructions per tile instead of 8 (it is
+  idle 60% of the time). Each term has its own block scales, so the query's scale factors get 4 TMEM regions and 4
+  shared-memory stages.
+- TMEM: the latent scores shrink from 4n to n columns, the SFB regions grow by 3; 16 heads with FP16 V: 512 of 512
+  columns, 32 heads with E4M3 V: 480. Shared memory grows by 12 KB, which does not fit 4 raw stages with 16 heads,
+  so `tk` goes with `st3`.
+- The softmax then loads 2 score blocks instead of 5 and drops 3n adds per thread per tile.
+
+Predictions:
+
+- 32 heads (`v8`, `st3`, `h32`, `tk`) at H=128 B16 64K: 0.65-0.75 ms (-12% to -24% against v2.4, 0.852), B64 64K
+  2.6-3.0 ms (3.38). The softmax still has twice the exponentials of 16 heads, so it stays near the limit.
+- 16 heads (`st3`, `tk`): within 3% of v2.4; convert sets the period there.
+- Rule: `tk` stays if removing it costs 3% or more in its configuration. 32 heads become the default for head
+  counts divisible by 32 if they are 10% or more faster than v2.4 at H=128 with both batch 16 and batch 64.
+
+### v2.6 result: correct, but the cost moves to the MMA warp
+
+Correct in every configuration (0.0017 against the dequantized cache with FP16 V; with `v8`, as v2.5). Same process
+on B200, ms:
+
+| configuration | H=16 B64 64K | H=128 B16 64K | H=128 B64 64K |
+|---|---|---|---|
+| v2.4 | 0.453 | 0.854 | 3.377 |
+| + st3 | 0.462 | 0.871 | 3.448 |
+| + st3 + tk | 0.532 (+15%) | 1.005 | 3.984 |
+| + v8 + st3 + h32 (v2.5) | | 0.862 | 3.312 |
+| + v8 + st3 + h32 + tk | | 0.886 (+3%) | 3.772 (+14%) |
+
+The prediction (-12% to -24% with 32 heads) was wrong in sign. By the rule `tk` goes, and 32 heads stay an option.
+
+Stall samples with `st3` + `tk`, H=16 B64 64K (0.55 ms under ncu): the MMA warp works 79% of its time (38% in v2.4)
+and convert waits for PV to free V 32% of its time (17%). The tensor pipe is busy only 15%, so it is not the
+smaller MMAs: it is the issue path. One warp now issues 32 QK MMAs per tile instead of 8, each with a new scale-factor
+field, and the MMA warpgroup spills at its 72-80 registers (6.0M local loads). Since that warp issues QK(i + 1)
+before PV(i), PV starts later, V is freed later and convert waits. Terms along K would need a cheaper issue path
+first: a second warp for QK, or descriptors prepared once instead of per instruction.
+
+### Where the SM100 kernel stops for now
+
+B200, ms, every version in one process (`versions.csv`; v2-v2.2, v2.5 and v2.6 from their own runs above) and Cake from the
+same sweep (`b200.csv`):
+
+| version | H=16 B64 64K | H=128 B16 64K | H=128 B64 64K |
+|---|---|---|---|
+| v0 (FP16 tile in shared memory, 32 heads per CTA) | 1.349 | 1.578 | 6.152 |
+| v1a' (QK on the raw FP4 bytes) | 1.447 | 2.753 | 10.68 |
+| v1b (V straight into TMEM) | 1.276 | 2.410 | 9.428 |
+| v2-v2.2 (warp roles; log only) | 1.04-1.13 | 2.02-2.24 | |
+| v2.3 (load loop finishes before it acquires) | 0.769 | 1.498 | 5.888 |
+| v2.4 (TMA, 8 convert warps; the default) | 0.455 | 0.854 | 3.378 |
+| v2.5 (E4M3 V and P, 3 stages, 32 heads per CTA; options, ablation run) | 0.526 (16 heads: no `h32`) | 0.844 | 3.309 |
+| v2.6 (query terms along K; option, ablation run) | 0.532 (with `st3`) | 0.886 (with v2.5) | 3.772 (with v2.5) |
+| FlashInfer Cake (NVFP4 query) | 0.320 | 0.301 | 0.541 |
+
+v2.5 and v2.6 are not the default: by the rules written before their ablations, 32 heads gain 1-2% (the softmax
+sets the period), which does not pay for the E4M3 rounding of V and P (1-3% more error against the unquantized KV),
+and the query terms along K are slower (the single MMA warp becomes the limit). They stay as the options `v8`,
+`st3`, `h32` and `tk`.
+
+With the query kept at BF16-level accuracy (error against the unquantized KV equal to the CUDA kernel's BF16 mode,
+where Cake's is 1.4-1.7x), the kernel is 1.4x behind Cake at 16 heads and 2.8-6.2x behind at 128 heads.
+
+What the B200 work showed about the method:
+
+- Stubs that remove a role's work also remove its waits, so in a loop of roles they say what a role costs, not where
+  the period comes from. Stall samples per barrier named the edge directly (the load loop's order in v2.3, -27%).
+- Predictions from per-role stall shares missed in both directions (v2.2 2x too optimistic, v2.4 better than
+  predicted, v2.5 far too optimistic): a share of samples is not time on the critical path, which the SM120 work had
+  already shown.
+- Measurements need a calibrated global scale as well as a scale of 1: the FP8 saturation bug only shows with block
+  scales near the E4M3 maximum.
+
+What limits it now, and the next steps in order of expected gain:
+
+1. 128 heads: a CTA holds 16 heads, so the cache is read 8 times. 32 heads per CTA work (v2.5) but the softmax then
+   sets the period (99% busy, spilling at 232 registers). The query terms along K would cut the softmax's score
+   loads from 5 to 2, but with one MMA warp the 4x QK instructions delay PV (v2.6). Next: QK issued by its own warp
+   (all 16 warps have a role now, so this needs a new split, e.g. one scale-layout warp instead of two), or the
+   descriptors prepared once instead of per instruction; then the terms along K and 32 heads.
+2. 16 heads: convert is the busiest role (80% work, 17% waiting for PV to free V). Next: fewer shared-memory
+   instructions in the conversion (scales as LDS.128, `ldmatrix` .x2) and word stores of the transposed scales.
+3. Small shapes: a call costs at least about 40 us with a cold L2 (24 us warm: 18 us for one tile through the
+   kernel, 7 us for the query split and merge kernels). Next: the query split inside the decode kernel's prologue,
+   and a profile of the kernel's start.
+4. Not started, outside the kernel: attention throughput at a fixed KV memory budget (NVFP4 holds 1.64x the tokens
+   of FP8), and the accuracy comparison with Cake on real model KV (DeepSeek-V2-Lite: layer-wise attention output
+   against BF16), which random data cannot replace.

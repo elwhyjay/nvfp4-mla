@@ -260,7 +260,10 @@ runs one serial chain of `tcgen05` MMAs. v1a' runs QK on the raw FP4 bytes with 
 as 4 NVFP4 terms). v1b converts V from the raw tile straight into tensor memory. v2.3 gives each step its own warps
 (load, convert, MMA, softmax) and fixes the order of the load loop: stall samples per barrier showed that it
 published every tile one release too late, so its own latency was in every tile's period. v2.4 loads the tiles by
-TMA and converts V in 8 warps instead of 4. With 128 heads, v1a' and v1b are slower than v0 because they handle 16
+TMA and converts V in 8 warps instead of 4. v2.5 (V and P in E4M3, so that 32 heads fit in tensor memory) is
+correct but gains only 1-2% at 128 heads, because the softmax then sets the period; v2.6 (the query terms
+summed by the MMA, so the softmax loads one score block instead of four) moves the cost to the single MMA warp and
+is slower. Both stay as options. With 128 heads, v1a' and v1b are slower than v0 because they handle 16
 heads per CTA instead of 32 (tensor memory), so they read the cache twice as often. The first warp-specialized
 builds (v2-v2.2, 1.04-1.13 ms at 16 heads x 64 x 64K) are in the log only; the current code no longer builds them.
 
@@ -350,9 +353,12 @@ Dequantization: `ckv = e2m1 * scale * ckv_scale`, `kpe = fp8 * kpe_scale`.
 
 ## Roadmap
 
-- SM100 kernel: the remaining gap to FlashInfer Cake. The V conversion is now the busiest role, each call has a
-  fixed cost of about 40 µs (mostly the kernel's start and one tile's latency), and with 128 heads the cache is read
-  once per 16 heads.
+- SM100 kernel: the remaining gap to FlashInfer Cake. With 128 heads the cache is read once per 16 heads (32 heads
+  per CTA work, but the softmax then sets the period, and summing the query terms in the MMA needs a second MMA
+  warp first), the V conversion is the busiest role at 16 heads, and each call has a fixed cost of about 40 µs. The next steps are in the
+  [optimization log](docs/optimization-log.md#where-the-sm100-kernel-stops-for-now).
+- Accuracy on real model KV: layer-wise attention output of DeepSeek-V2-Lite against BF16, this kernel and Cake.
+- Attention throughput at a fixed KV memory budget, where NVFP4 holds 1.64x the tokens of FP8.
 - MTP / speculative decode (2-4 query tokens per request).
 - An SGLang integration (attention backend plugin plus a KV pool in this layout).
 
