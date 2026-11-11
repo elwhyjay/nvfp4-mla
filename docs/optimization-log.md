@@ -1529,3 +1529,89 @@ Options for v2.4:
 - (b) More conversion warps. TMA for the raw tile (one thread issues the copies; page size >= 32, with cp.async
   kept for smaller pages) frees most of the load warpgroup, so 8 warps convert, two per sub-partition.
 - (c) Word stores instead of byte stores for the transposed scales (32 `st.shared.u8` per thread and tile).
+
+### v2.4 hypothesis: TMA for the raw tile, two convert warps per sub-partition
+
+Option (b). Two flags, measured together with v2.3 in one run:
+
+- `tma`: the raw bytes of a tile (FP4 latent, scales, E4M3 RoPE) come by TMA instead of 22 `cp.async` per thread.
+  The cache is viewed as [pages x page size, bytes per token] and each page is one box; the shared-memory layouts
+  stay the same (the FP4 tile is the SWIZZLE_128B box layout, the RoPE tile the SWIZZLE_64B one). One thread reads
+  the page table and issues the copies; boxes entirely past the end are not issued. Rows past the end are no longer
+  zero-filled, so the scale layouts set the scales of those tokens to 0 (V is then exactly 0 there; S is already
+  masked with a select). In this flag alone the load warpgroup still writes the scale layouts.
+- `cvt8` (needs `tma`): warpgroup 0 becomes a second convert warpgroup. Each of the 8 convert warps converts 2 of
+  the 4 128-channel chunks, so every sub-partition runs two convert warps. Warp 13 issues the TMA and warps 14-15
+  write the scale layouts (2 tokens per thread). These are no longer the threads that acquire the stage, so before
+  writing the layouts of tile j they wait for tile j - 2 to be released (the empty barriers of its stage); that
+  replaces the proof the acquire gave. Registers: 128 / 128 / 176 / 80 (convert, convert, softmax, MMA + TMA +
+  scales).
+- Page size >= 16 only (128 / page size boxes per tile); smaller pages keep the cp.async load.
+
+Predictions at H=16 B64 64K (v2.3: 0.764 ms):
+
+- `tma` alone: -5% to -15%. The load warp leaves the MIO queue it shares with each convert warp (the LDS and LDSM
+  of convert wait on that queue for 27% of their samples).
+- `tma` + `cvt8`: 0.55-0.65 ms. With two warps per sub-partition, convert's 2.8 us per tile should about halve, and
+  the softmax (77% busy, about 2.3 us per tile) becomes the limit.
+- Rule as before: a flag stays if removing it costs 3% or more; correctness first for every configuration.
+
+### v2.4 result: TMA and 8 convert warps, -39%
+
+Two problems on the way:
+
+- The DSL wraps each TMA copy in its own `elect_one`. Issuing the copies from one thread (`if lane == 0`)
+  deadlocked. A whole warp now calls the copies, and only the expect-tx arrive is inside `elect_one`.
+- The first `tma`-only build issued the TMA from warp 0 inside the load warpgroup's lagged loop. It was wrong in 6
+  of 36 runs (error up to 0.21, only with 3 or more tiles per CTA) and never in the `cvt8` build, which issues from
+  warp 13. Extra waits for the derived buffers changed nothing. A named barrier over the 4 load warps after the TMA
+  issue removed the errors; one before the issue, or before the acquire, did not. I did not find the missing
+  ordering. `tma` now uses the `cvt8` structure (warp 13 issues the copies, warps 0-3 only write the scale layouts).
+  That is also the cleaner ablation: the two flags then differ only in which warps convert. After that, 0 of 36 runs
+  were wrong for every configuration.
+- One early run measured 0.742 ms for `tma` + `cvt8`. The code this configuration runs did not change after that,
+  and the three later runs give 0.466-0.468 ms. I do not know the cause; the table uses the later builds.
+
+Same process on B200, ms, H=16 B64 64K / H=128 B16 64K (two runs, the second one shown where they differ by more
+than 0.002):
+
+| configuration | time |
+|---|---|
+| v2.3 (lazy, rope8) | 0.767 / 1.497 |
+| + tma | 0.639 / 1.230 (-17% / -18%) |
+| + tma + cvt8 | 0.468 / 0.881 (-39% / -41%) |
+| + tma + cvt8 + vhalf | 0.451 / 0.852 |
+
+- `tma` alone: -17%, a little more than predicted (-5% to -15%). `tma` + `cvt8`: 0.468 ms, better than the
+  predicted 0.55-0.65 ms.
+- vhalf now passes the rule (removing it costs 3.4-3.8%), because the V loop has become visible (below).
+- Default for page size >= 16: lazy, rope8, tma, cvt8, vhalf; smaller pages keep lazy, rope8 (cp.async).
+
+Stall samples, `tma` + `cvt8`, H=16 B64 64K (0.48 ms under ncu; DRAM throughput 38%, from 24%):
+
+| role | waiting for | work |
+|---|---|---|
+| convert (8 warps) | PV to free V 17%, a loaded tile 3% | 80% |
+| TMA warp | convert to free a stage 85% | 13% |
+| scale warps (2) | tile j - 2 released 42%, the TMA 2% | 56% |
+| MMA | a published tile 39%, V 18% | 40% |
+| softmax | S 22% | 77% |
+
+The idle warps at the exit barrier fell from 19% to 2% of all samples. The loads are now ahead: the TMA warp waits
+for free stages. Convert is still the busiest role, not the softmax as I predicted. The tile period is 1.83 us, and
+convert works 80% of it and waits for PV(j - 1) to free V another 17%.
+
+Against Cake (0.319 ms): 0.451 ms, 1.41x.
+
+The default checked on pages of 1-128 tokens and lengths 1-300 (error 0.0017 everywhere, the cp.async path below 16
+tokens per page included). B200, page size 64, ms:
+
+| H | B | 4K | 16K | 64K | v2.3 at 64K |
+|---|---|---|---|---|---|
+| 16 | 16 | 0.043 | 0.060 | 0.133 | 0.196 |
+| 16 | 64 | 0.069 | 0.148 | 0.454 | 0.764 |
+| 128 | 16 | 0.079 | 0.233 | 0.852 | 1.494 |
+| 128 | 64 | 0.284 | 0.898 | 3.381 | 5.868 |
+
+H=128 still reads the cache once per 16 heads (8 CTAs per sequence), which is the next structural item after the
+convert role.
