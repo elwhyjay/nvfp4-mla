@@ -1121,7 +1121,105 @@ std::vector<torch::Tensor> dequantize(torch::Tensor ckv, torch::Tensor sf, torch
   return {ckv_out, kpe_out};
 }
 
+// Query as T NVFP4 terms that share one FP32 scale per row, g = amax / (6 * 448): q ~ g * sum_t e2m1_t * sf_t, with
+// 16-channel E4M3 block scales sf_t. One shared scale lets the terms accumulate into one S in the SM100 kernel's
+// block-scaled MMAs. Each term quantizes what the previous ones left. One warp per row; lane j owns channels
+// 16j .. 16j + 15, i.e. scale block j.
+template <int T>
+__global__ void __launch_bounds__(128) query_terms_kernel(const __nv_bfloat16* __restrict__ q, int rows,
+                                                          uint8_t* __restrict__ q4, uint8_t* __restrict__ qsf,
+                                                          float* __restrict__ g_out) {
+  const int row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
+  if (row >= rows) return;
+  float r[16];
+  const uint4* src = reinterpret_cast<const uint4*>(q + size_t(row) * CKV + 16 * lane);
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const uint4 w = src[h];
+    const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ws[i]));
+      r[8 * h + 2 * i] = f.x, r[8 * h + 2 * i + 1] = f.y;
+    }
+  }
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(r[i]));
+#pragma unroll
+  for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, o));
+  const float g = amax > 0.f ? amax / (6.f * 448.f) : 1.f;
+  if (lane == 0) g_out[row] = g;
+#pragma unroll
+  for (int t = 0; t < T; ++t) {
+    float bm = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) bm = fmaxf(bm, fabsf(r[i]));
+    const uint32_t s8 = pack_e4m3x4(bm / (6.f * g), 0.f, 0.f, 0.f) & 0xff;
+    const float sd = __half2float(__ushort_as_half(uint16_t(e4m3x2_to_f16x2(uint16_t(s8)))));
+    uint32_t w[2] = {0, 0};
+    if (sd > 0.f) {
+      const float inv = 1.f / (sd * g), back = sd * g;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = r[8 * h + i] * inv;
+        w[h] = pack_e2m1x8(v);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {  // subtract what this term holds: decode its codes back (exact in f16)
+          uint32_t d;
+          asm("{\n.reg .b8 b;\ncvt.u8.u32 b, %1;\ncvt.rn.f16x2.e2m1x2 %0, b;\n}" : "=r"(d) : "r"((w[h] >> (8 * i)) & 0xff));
+          const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&d));
+          r[8 * h + 2 * i] -= f.x * back, r[8 * h + 2 * i + 1] -= f.y * back;
+        }
+      }
+    }
+    *reinterpret_cast<uint2*>(q4 + (size_t(row) * T + t) * (CKV / 2) + 8 * lane) = make_uint2(w[0], w[1]);
+    qsf[(size_t(row) * T + t) * (CKV / 16) + lane] = uint8_t(s8);
+  }
+}
+
+// q_nope [B, H, 512] bf16 -> q4 [B, H, T, 256] (E2M1, even channel in the low nibble), qsf [B, H, T, 32] (E4M3),
+// g [B, H] (FP32): q_nope ~ g * sum_t q4_t * qsf_t.
+std::vector<torch::Tensor> query_terms(torch::Tensor q_nope, int64_t terms) {
+  TORCH_CHECK(q_nope.dim() == 3 && q_nope.size(2) == CKV && q_nope.scalar_type() == at::kBFloat16 &&
+                  q_nope.is_contiguous(), "q_nope must be contiguous bfloat16 [batch, heads, 512]");
+  TORCH_CHECK(terms == 3 || terms == 4, "terms must be 3 or 4");
+  const at::cuda::OptionalCUDAGuard guard(q_nope.device());
+  const int B = q_nope.size(0), H = q_nope.size(1), rows = B * H;
+  auto u8 = q_nope.options().dtype(at::kByte);
+  auto q4 = torch::empty({B, H, terms, CKV / 2}, u8), qsf = torch::empty({B, H, terms, CKV / 16}, u8);
+  auto g = torch::empty({B, H}, q_nope.options().dtype(at::kFloat));
+  auto launch = [&](auto kernel) {
+    kernel<<<(rows + 3) / 4, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q_nope.data_ptr()), rows, q4.data_ptr<uint8_t>(),
+        qsf.data_ptr<uint8_t>(), g.data_ptr<float>());
+  };
+  terms == 3 ? launch(query_terms_kernel<3>) : launch(query_terms_kernel<4>);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {q4, qsf, g};
+}
+
+// Merge split-KV partials o_part [splits, B, H, 512] / lse_part [splits, B, H] (as decode writes them) into out.
+void combine(torch::Tensor o_part, torch::Tensor lse_part, torch::Tensor out) {
+  TORCH_CHECK(o_part.dim() == 4 && o_part.size(3) == CKV && o_part.scalar_type() == at::kFloat && o_part.is_contiguous(),
+              "o_part must be contiguous float32 [splits, batch, heads, 512]");
+  TORCH_CHECK(lse_part.scalar_type() == at::kFloat && lse_part.is_contiguous() &&
+                  lse_part.numel() * CKV == o_part.numel(), "lse_part must be contiguous float32 [splits, batch, heads]");
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous() && out.numel() * o_part.size(0) == o_part.numel(),
+              "out must be contiguous bfloat16 [batch, heads, 512]");
+  const at::cuda::OptionalCUDAGuard guard(out.device());
+  const int splits = o_part.size(0), rows = o_part.size(1) * o_part.size(2);
+  mla_combine<<<dim3(rows, CKV / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+      o_part.data_ptr<float>(), lse_part.data_ptr<float>(), splits, rows,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("combine", &combine);
   m.def("decode", &decode);
   m.def("dequantize", &dequantize);
+  m.def("query_terms", &query_terms);
 }

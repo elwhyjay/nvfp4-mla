@@ -16,6 +16,7 @@ dependencies = ["torch>=2.7", "ninja"]
 [project.optional-dependencies]
 test = ["pytest", "flashinfer-python>=0.7.0"]
 bench = ["flashinfer-python>=0.7.0", "triton"]
+sm100 = ["nvidia-cutlass-dsl[cu13]>=4.8.1"]  # nvfp4_mla.sm100: the tcgen05 kernel in CuTe DSL
 
 [tool.setuptools]
 packages = ["nvfp4_mla"]

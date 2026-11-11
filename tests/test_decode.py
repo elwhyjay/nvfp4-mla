@@ -127,3 +127,18 @@ def test_reference_vs_fa2():
     """The fp32 reference agrees with an independent kernel on the same (dequantized) data."""
     c = RandomCache([1000, 4097, 3, 64], page_size=64, heads=128)
     assert rel_l2(fa2_on_dequantized(c)(), c.reference()) < 4e-3
+
+
+@pytest.mark.parametrize("terms", [3, 4])
+def test_query_terms(terms):
+    """The SM100 kernel's query: NVFP4 terms with one shared scale per row reconstruct the BF16 query."""
+    g0 = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(4, 32, 512, device="cuda", generator=g0)
+    q = (q * torch.exp(1.5 * torch.randn(512, device="cuda", generator=g0))).bfloat16()  # outlier channels
+    q4, qsf, g = nvfp4_mla._load().query_terms(q, terms)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+    codes = torch.stack([q4 & 15, q4 >> 4], -1).flatten(-2).long()  # even channel in the low nibble
+    sf = qsf.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
+    err = rel_l2((lut[codes] * sf).sum(2) * g[..., None], q.float())
+    print(f"{terms} terms: rel-L2 {err:.2e}")
+    assert err < (3e-3 if terms == 3 else 3e-4)

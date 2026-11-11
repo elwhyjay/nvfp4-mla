@@ -865,3 +865,306 @@ Registers stay at 245 (254 with the conversion stubbed).
   first thing that would have to be shown.
 - SM120 summary at H=128 B64 64K: v11c 2.82-2.89 ms (FP8) / 2.65-2.74 ms (FP4 QK) against XQA 2.30-2.33 ms. The
   conversion explains 12% of v11c's time, the two per-tile barriers 5%, and the rest is the MMA-issue structure.
+
+## Part 3: B200 (in progress)
+
+### Measurements first
+
+FlashInfer 0.7.4rc1, CUDA 13.4.2, GPU kernel time in ms (page 64, q_len 1):
+
+| shape | this kernel (BF16 mode) | FP8 mode | Cake (NVFP4) | trtllm-gen FP8 | trtllm-gen BF16 | fa2 | cuTile (BF16) |
+|---|---|---|---|---|---|---|---|
+| H=16 B64 64K | 0.766 | 1.284 | 0.320 | 0.387 | 0.839 | 2.47 | 29.4 |
+| H=128 B16 64K | 1.514 | 2.235 | 0.303 | 0.149 | 0.256 | 1.52 | 1.90 |
+| H=128 B64 64K | 5.880 | 8.793 | 0.549 | 0.584 | 1.061 | 4.94 | 7.33 |
+
+- Peaks: DRAM 7.3 TB/s; cuBLAS BF16 1.5 PFLOPS and FP8 3.1 PFLOPS (tcgen05); `mma.sync` BF16 555 and E4M3 2079 TFLOPS.
+- The `mma.sync` kernel is 2.4-10.7x slower than Cake; its FP8 mode is slower than its BF16 mode here.
+- Cake leaves room: 63% of DRAM bandwidth at H=16 B64 64K (the NVFP4 floor is 0.202 ms), 2x slower than
+  trtllm-gen FP8 at H=128 B16, and its query is FP4.
+- Cake under ncu (B200, `kernel_cake_mla_nvfp4_paged_decode_*`, itself a CuTe DSL kernel):
+
+  | | H=16 B64 64K | H=128 B16 64K |
+  |---|---|---|
+  | grid x block, smem | 128 x 640 threads, 203 KB | 128 x 512 threads, 208 KB |
+  | waves (148 SMs, 1 CTA/SM) | 0.86 | 0.86 |
+  | DRAM throughput | 55% | 28% |
+  | tensor pipe active | 9% | 41% |
+  | shared memory (LSU / tensor-core wavefronts, % of peak) | 56% / 35% | 44% / 25% |
+  | top stall | long scoreboard 55% (mbarrier waits) | long scoreboard 38% |
+
+  - Its MMA op counts equal 2 x B x H x tokens x dims with H = 16 or 128 exactly, so Cake also puts heads on N (no
+    padding). They split as: QK over the 512 latent channels in block-scaled FP4 x FP4 (`kind::mxf4nvf4`, no K
+    conversion, hence the FP4 query); RoPE QK and PV in `kind::f8f6f4`, so V is converted to E4M3 (QMUL4 + F2FP,
+    12% of instructions), a rounding step on top of the FP4 query; 1.16M `tcgen05.st` (converted operands into TMEM).
+  - Both shapes launch 128 CTAs on 148 SMs, so 14% of the SMs idle for the whole kernel. At H=16 the DRAM sits at 55%
+    with warps mostly waiting on barriers: the pipeline does not keep enough bytes in flight per SM.
+- The B200 kernel is written in CuTe DSL (nvidia-cutlass-dsl 4.8.1), with FlashInfer's CuTe DSL MLA decode (2-CTA
+  M=128 tiles, 12 warps in roles, O in TMEM, P through shared memory, BF16 or FP8 KV only) as the reference design.
+
+### v0 scope: a plain tcgen05 kernel
+
+First plan: CTAs of 64 heads as the MMA M (a 1-CTA M=64 tile packs a 64 x 512 fp32 O into 256 of the 512 TMEM
+columns), H=16 padded to 64 rows, BF16 operands. Two findings changed it before any code was written:
+
+- CUTLASS 4.8.1 ships a mixed-input decode example (`mixed_input_fmha_decode.py`: int4/int8 KV, a converter
+  warpgroup, tcgen05). It swaps A and B: tokens are the M (128 per tile) and heads the N (8-32). For MLA this removes
+  the padding (H=16 would waste 75% of an M=64 tile), and with M=128 a TMEM lane is a token, so a softmax thread owns
+  one token row and only reduces over heads across lanes. This is also the structure later versions grow into.
+- FP16 instead of BF16 operands. e2m1 x e4m3 has at most 6 significant bits and lies in [2^-10, 2688], so it is exact
+  and normal in FP16; a BF16 query converts exactly; P keeps 3 more mantissa bits. The error can only go down
+  against the BF16 mode, and the conversion is `cvt.rn.f16x2.e2m1x2` + `mul.rn.f16x2`, one instruction per element.
+
+v0 as written (`nvfp4_mla/sm100.py`):
+
+- CTA = 1 request x 16 or 32 heads x 1 KV split, 4 warps, `cta_group::1`, no cluster. H=128 takes 4 CTAs per request,
+  each reading the whole KV (the 3 extra reads should mostly hit L2).
+- Per 128-token tile, in order: every thread converts one token (page lookup, 352 B of loads) into a 128 x 576 FP16
+  tile in shared memory (144 KB); one warp issues QK (S^T = K Q^T, 36 MMAs of K=16) into TMEM; all threads load S^T
+  (a thread = a token), reduce the column (head) max with warp reductions and shared-memory atomics, write P^T to
+  shared memory and rescale O^T in TMEM; one warp issues PV (O^T += V^T P^T, 4 channel tiles x 8 MMAs); all wait.
+- The FP16 tile is the K operand of QK (K-major) and the V^T operand of PV (MN-major) at the same bytes: token groups
+  of 8 rows are innermost and 64-channel blocks outermost in both views.
+- TMEM: S^T N columns + O^T 4N columns. Shared memory at N=32: 144 KB tile + 36 KB Q + 8 KB P, one CTA per SM.
+- Split-KV partials go to the existing combine kernel, now also exposed as `combine` in the extension.
+
+Predictions, written before the first run:
+
+- Error at or below the SM120 BF16 mode against the dequantized reference.
+- Much slower than Cake: no step overlaps another, and one CTA per SM. Beyond that, a bound that overlap alone cannot
+  remove: per token the tile is written once (1152 B) and read by both MMAs (1152 + 1024 B), about 3.3 KB of
+  shared-memory traffic per 352 B of HBM traffic (9.4x), while shared memory (128 B/clk/SM, assumed to also bound
+  tcgen05 operand reads) is only ~5x faster than HBM per SM (7.3 TB/s / 148 SMs / 1.93 GHz = 25 B/clk). So even a
+  perfectly pipelined v0 design would sit near 2x the HBM floor at H=16. If ncu shows shared memory near its peak,
+  the next step is to keep the converted operand out of shared memory (TMEM, as the CUTLASS example does).
+
+### v0 result
+
+Correct on the first B200 run. Error against the dequantized reference (5 cases including
+masked tails, page 16/32/64, explicit and automatic splits):
+
+| | v0 (FP16 operands) | SM120 path (BF16 mode) |
+|---|---|---|
+| rel. L2 vs dequantized cache | 0.0016-0.0017 | 0.0018-0.0022 |
+
+GPU kernel time in ms (B200, page 64, % of 7.3 TB/s in parentheses):
+
+| shape | v0 | SM120 path (`mma.sync`) | Cake | trtllm-gen FP8 |
+|---|---|---|---|---|
+| H=16 B64 64K | 1.348 (15%) | 0.765 | 0.319 | 0.386 |
+| H=128 B16 64K | 1.581 | 1.511 | 0.302 | 0.149 |
+| H=128 B64 64K | 6.140 | 5.874 | 0.545 | 0.574 |
+
+ncu:
+
+| | H=16 B64 64K | H=128 B16 64K |
+|---|---|---|
+| grid, warps per SM | 128 CTAs (0.86 waves), 4 | 128 CTAs (0.86 waves), 4 |
+| registers, local memory | 248 | 255, 2.2M local loads (spills) |
+| DRAM throughput, bytes read | 13.5%, 1.48 GB | 3.0%, 0.37 GB (L2 absorbs the 4 head-group reads) |
+| tensor pipe active | 5.7% | 9.7% |
+| issue slots busy | 14% | 15% |
+| shared memory: LSU / tensor-core wavefronts | 13.8% / 22.0% | 12.4% / 20.9% |
+| stalls | long scoreboard 57%: 24% in the two mbarrier wait loops (MMA done), ~32% on the first use of the tile's global loads | 55%: 23% and ~27% |
+
+- Predictions: the error held (below the BF16 mode). "Much slower than Cake" held: 4.2x at H=16, 5-11x at H=128.
+  Not predicted: v0 is also slower than the `mma.sync` path, which keeps several CTAs per SM and a cp.async pipeline.
+- Shared memory is not what limits v0 now (14% + 22%). One 128-token tile takes 5.2 us (H=16; 256 tiles per CTA)
+  and 6.1 us (H=128): loads, conversion, QK, softmax and PV run one after another with 4 warps per SM, and the
+  stalls split between waiting for the tile's bytes and waiting for the MMAs.
+- The shared-memory prediction holds as a ceiling. The traffic per token is fixed by the data path, so at the H=16
+  HBM floor (0.202 ms, 6.6x shorter) the tensor-core reads alone would need 146% of their peak. The lowest time this
+  data path allows at H=16 is 1.34 x 0.22 = 0.30 ms if those reads have their own port, 1.34 x 0.36 = 0.48 ms if they
+  share it with the LSU, i.e. Cake's time at best, however well the steps overlap.
+- The 144 KB FP16 tile also cannot be double-buffered (228 KB of shared memory per SM), so a pipeline on this data
+  path could only overlap the raw loads, not the conversion of the next tile with the MMAs of this one.
+
+### v1 options
+
+Measurement first (`benchmarks/precision.py`, CPU, random data): the query split into residual terms, each term
+quantized like Cake's query (per-row FP32 scale, per-16 E4M3 scales, E2M1), so QK can run on the raw FP4 cache with
+block-scaled FP4 x FP4 MMAs and the terms accumulate into the same S. Error against attention over the dequantized
+cache (the kernel's own error; against the unquantized cache all rows below except the 1-term one are within 1% of
+BF16, because the cache format's own error dominates there):
+
+| query | H=16 S=4K | H=128 S=4K | H=16 S=16K |
+|---|---|---|---|
+| BF16 (SM120 BF16 mode) | 0.0025 | 0.0023 | 0.0020 |
+| FP8 (SM120 FP8 mode) | 0.0351 | 0.0348 | 0.0350 |
+| 1 FP4 term (Cake) | 0.1291 | 0.1231 | 0.1062 |
+| 2 FP4 terms, 2 E4M3 RoPE terms | 0.0118 | 0.0109 | 0.0094 |
+| 3 FP4 terms, 2 E4M3 RoPE terms | 0.0014 | 0.0013 | 0.0010 |
+
+Three FP4 terms (the query's own error 0.08%, BF16 0.17%) put QK below the BF16 mode. On tcgen05 `kind::mxf4nvf4` runs
+at 4x the FP16 rate, so three terms cost 0.75x of v0's FP16 QK, and the K side is never converted.
+
+- A. Warp-specialize v0 as it is (load warp, converter warps, MMA warp, softmax warps; one FP16 tile in shared
+  memory). Smallest step, but the ceiling above (0.30-0.48 ms at H=16) means it cannot pass Cake.
+- B. Change the data path: QK over the 512 latent channels as `kind::mxf4nvf4` on the raw cache bytes with the
+  3-term query, RoPE QK as 2 E4M3 terms (`kind::f8f6f4`) on the raw kpe; only V is converted, to FP16 (still exact),
+  and written to TMEM as the A operand of PV (lanes = channels, the CUTLASS example's and Cake's placement). Shared
+  memory per token falls from ~3.3 KB to ~1 KB (raw bytes in, QK reads, V-converter reads), which puts its ceiling
+  below the HBM floor. Then warp specialization on top. Costs: block-scale factors through TMEM (`tcgen05.cp`), a
+  transposing V conversion, and a TMEM budget of V 256 + O^T 4N + S^T N columns (416 at N=32, so V can only be
+  double-buffered in 64-token halves).
+- C. B with Cake's 1-term query: fastest QK, but 50x the error. At most a later speed option, like `precision=2` on
+  SM120.
+
+### Choice for v1: option B, in two steps
+
+- **v1a (this step): QK on the raw cache.** The latent part runs as `kind::mxf4nvf4` on the cache bytes as stored,
+  with the cache's block scales as the A scale factors. A small CUDA kernel before the decode writes the query as
+  NVFP4 terms that share one FP32 scale per head, so all terms accumulate into one S. The RoPE part converts kpe to
+  FP16 (exact) and runs as `kind::f16` into a second accumulator, combined with the latent one in the softmax. V stays
+  as in v0 (FP16 in shared memory), and so does the rest of the structure, so this step measures the data path alone.
+- **v1b: V into TMEM.** V converted to FP16 straight into TMEM as the A operand of PV (lanes = channels); the
+  transpose comes from a transposing 8-bit `ldmatrix` on the raw bytes plus one `PRMT` per output word.
+- **v2: warp specialization** (loads, conversion, MMA, softmax in separate warps) and a multi-stage load pipeline.
+
+How many query terms. The table above used FP32 queries, so its error includes the query's own BF16 rounding. The
+kernels receive BF16 queries, and the reference uses the same BF16 query, so the question is what the terms add on
+top of that (CPU, against attention over the dequantized cache, FP16 P; "outliers" multiplies each channel by
+`exp(N(0, 1.5))`, as activations with outlier channels have):
+
+| query | H=16 S=4K | H=16 S=4K outliers | H=128 S=4K | H=128 S=4K outliers | H=16 S=16K | H=16 S=16K outliers |
+|---|---|---|---|---|---|---|
+| FP16 (v0) | 0.0001 | 0.0000 | 0.0001 | 0.0000 | 0.0001 | 0.0001 |
+| 3 FP4 terms, one shared scale | 0.0010 | 0.0038 | 0.0011 | 0.0022 | 0.0009 | 0.0032 |
+| 4 FP4 terms, one shared scale | 0.0001 | 0.0001 | 0.0001 | 0.0002 | 0.0001 | 0.0002 |
+
+The kernels' measured error floor is their BF16 output (about 0.0016), so 3 terms with outlier channels would more
+than double the error, and 4 terms add nothing measurable. Four terms are 32 `mxf4nvf4` MMAs per tile at 4x the FP16
+rate, the same tensor time as v0's 32 FP16 MMAs over the latent channels.
+
+v1a predictions:
+
+- Error against the dequantized cache within 10% of v0's (0.0016-0.0017 on the five check cases).
+- Tensor-core shared-memory reads per token: QK 1152 -> 384 B (256 B FP4 + 128 B FP16 RoPE), with PV's 1024 B
+  unchanged: 2176 -> 1408 B (-35%).
+- Time within 15% of v0 (1.348 ms at H=16 B64 64K, 1.581 ms at H=128 B16 64K). v0 is bound by its serial chain, this
+  step changes only the QK part of it, and the query kernel adds one launch.
+
+### v1a result: correct, 18% slower, and the K operand read once per term
+
+The first run was wrong (error 0.85). Dumping the first tile's scores showed the RoPE part exact and the latent part
+off. Controlled inputs narrowed it down: with all scales 1 the FP4 data, the term indexing and the cache scales
+(SFA) were exact, and only random query scales (SFB) broke it. A least-squares fit of the scale each (head, block)
+actually received (128 tokens, 32 unknowns per head) showed head h correct and blocks 0-7 repeated: the per-term
+SFB offset in TMEM was added to a pointer already recast to 8-bit elements, so it moved a quarter of a column per
+column and the four terms overwrote each other. With the offset added on the 32-bit pointer:
+
+| | v0 | v1a |
+|---|---|---|
+| error vs dequantized cache (5 cases) | 0.0016-0.0017 | 0.0017 |
+
+Same process on B200, ms (v0 with 16 heads per CTA as well, since v1a fits only 16):
+
+| shape | v0, 32 heads/CTA | v0, 16 heads/CTA | v1a, 16 heads/CTA | Cake |
+|---|---|---|---|---|
+| H=16 B64 64K | 1.344 | 1.344 | 1.589 (+18%) | 0.319 |
+| H=128 B16 64K | 1.585 | 2.585 | 3.060 (+18%) | 0.311 |
+| H=128 B64 64K | 6.170 | 10.160 | 11.988 (+18%) | 0.542 |
+| H=16 B64 4K | 0.112 | 0.112 | 0.134 (+20%) | 0.034 |
+| H=128 B64 4K | 0.480 | 0.683 | 0.802 (+17%) | 0.049 |
+
+ncu at H=16 B64 64K:
+
+| | v0 | v1a |
+|---|---|---|
+| tensor-core shared wavefronts | 80.2M | 81.3M |
+| LSU shared wavefronts | 50.4M | 71.4M (+41%) |
+| instructions | 174M | 226M (+30%): shifts, `LOP3`, `VIADD` for the extra stores |
+| time in the two MMA wait loops | 0.32 ms | 0.32 ms |
+| registers | 248 | 202 |
+
+- The error held. The time missed (+18% against "within 15%"), and the tensor-core reads did not fall at all
+  (predicted -35%). The prediction counted the FP4 tile once, but each of the 4 terms is its own MMA and reads the
+  whole K block again: 4 x 256 B + 128 B RoPE = 1152 B per token, exactly v0's. The query terms should sit along N
+  instead (N = 4 x 16 = 64, one MMA per K block, the 4 term columns of a head summed in the softmax), which reads K
+  once.
+- The MMAs did not get slower; the extra time is the conversion phase. Each thread now stores the raw tile, its
+  scale words, the RoPE tile and the V tile separately (25% more stores, +41% LSU wavefronts), with index arithmetic
+  for each. In this serial structure that lands directly on the chain.
+- 16 vs 32 heads per CTA matters more than the data path at H=128: v0 with 16 heads is 1.6x slower (twice the head
+  groups, each converting the same tiles).
+
+### v1a' hypothesis: the query terms along N
+
+- Change: the B operand is the 4 terms stacked (N = 4 x 16 = 64 rows: term t, head h at row 16t + h, each row with its
+  own block scales), one `mxf4nvf4` MMA per K block (8 per tile instead of 32), a 64-column latent accumulator, and the
+  4 columns of a head summed after the TMEM load.
+- Predictions (H=16 B64 64K): tensor-core shared wavefronts 81.3M -> about 53M (QK 1152 -> 384 B per token, PV 1024
+  B unchanged); time -2% to -5%, since the MMA waits are 20% of the time and the conversion phase does not change;
+  error unchanged (the same products, summed in another order).
+
+### v1a' result: K read once
+
+| H=16 B64 64K | v1a | v1a' | predicted |
+|---|---|---|---|
+| tensor-core shared wavefronts | 81.3M | 56.1M | about 53M |
+| time (ncu) | 1.585 ms | 1.422 ms (-10%) | -2% to -5% |
+| error vs dequantized cache | 0.0017 | 0.0017 | unchanged |
+
+Same process, ms: H=16 B64 64K 1.426 (v0 with 16 heads/CTA 1.346), H=128 B16 64K 2.707 (2.593), H=128 B64 64K 10.534
+(10.173), H=16 B64 4K 0.119 (0.112), H=128 B64 4K 0.708 (0.684). The wavefronts fell as predicted and the time fell
+more: the two MMA wait loops went from 0.32 to 0.24 ms, and warp 0 now issues 8 MMAs instead of 32 (each with its own
+scale-factor setup) before the others can go on. v1a' is still 3-6% behind v0: the extra stores of the conversion phase remain. They go away with the next step, which writes V
+straight into TMEM instead of a 128 KB FP16 tile, and which also frees the shared memory for 32 heads per CTA.
+
+One more DSL limit found on the way: a 32x32b TMEM load with 64 columns (`Ld32x32bOp(Repetition(64))`) crashes the
+CuTe DSL 4.8.1 compiler with a segfault and no message; a staged compile-only probe isolated it, and the 64-column
+accumulator is read as four 16-column loads.
+
+### v1b hypothesis: V straight into TMEM
+
+- Change: the V tile no longer goes through shared memory as FP16. After the QK MMAs are issued, every warp reads the
+  raw FP4 tile with a transposing 8-bit `ldmatrix` (16 tokens x 16 bytes: a thread gets 4 tokens of one byte, i.e. of
+  two channels), converts with `cvt.e2m1x2`, pairs tokens with one `PRMT` per word, multiplies by the two tokens'
+  block scales as one f16x2, and writes the result with `tcgen05.st.16x256b` as the A operand of PV (lanes =
+  channels, 2 tokens per column, 256 columns for 512 channels). Lane order within 16 lanes is even channels then odd
+  ones; the epilogue maps it back. Block scales get a second, block-major copy in shared memory so 4 tokens' scales
+  are one 32-bit load.
+- Predictions (H=16 B64 64K, 16 heads per CTA): tensor-core shared wavefronts 56M -> about 15M (PV no longer reads
+  shared memory); LSU wavefronts down by the 64 16-byte V stores per thread per tile, partly paid back by 32
+  `ldmatrix` and 64 scale loads; the V conversion overlaps the QK MMAs, which it could not before. Time -10% to
+  -20% against v1a'. TMEM: 464 columns at 16 heads (one CTA per SM, as now); 32 heads per CTA would need 608 and does
+  not fit without reusing columns.
+
+### v1b result: faster than v0 for the first time
+
+Partial tiles first came out wrong (output 0 below 112 valid tokens in the last tile, 0.15-0.85 error above). Three
+store-side fixes (warp reconvergence before the `.sync.aligned` instructions, scale stores outside the valid-token
+branch, no branch at all) left the error identical to four digits, so the bug was deterministic and elsewhere. A dump of
+the epilogue showed the softmax sum as NaN and the column maximum as -inf: the V conversion loop named its ldmatrix row
+`row`, which in a CuTe DSL kernel (plain Python scope) overwrote the thread's own token row used by the mask below it.
+After the loop every thread had row 112 + lane % 16, so short tiles were masked entirely. Renamed; the branch-free token
+load stayed (rows past the end read the last valid token and are masked to zero), as it removes a divergent branch.
+
+| | v1a' | v1b | predicted |
+|---|---|---|---|
+| error vs dequantized cache (5 cases, and L = 1-300) | 0.0016-0.0017 | 0.0016-0.0017 | |
+| tensor-core shared wavefronts (H=16 B64 64K) | 56.1M | 22.5M | about 15M |
+| LSU shared wavefronts | 70.7M | 58.3M | down |
+| instructions | 222M | 244M | |
+| registers | 211 | 250 | |
+
+Same process, ms (16 heads per CTA for v1a' and v1b):
+
+| shape | v0, 32 heads/CTA | v0, 16 heads/CTA | v1a' | v1b | Cake |
+|---|---|---|---|---|---|
+| H=16 B64 64K | 1.345 | 1.346 | 1.444 | 1.275 (-12%) | 0.319 |
+| H=128 B16 64K | 1.586 | 2.586 | 2.769 | 2.427 (-12%) | 0.309 |
+| H=128 B64 64K | 6.169 | 10.175 | 10.763 | 9.473 (-12%) | 0.544 |
+| H=16 B64 4K | 0.112 | 0.112 | 0.122 | 0.111 (-9%) | 0.034 |
+| H=128 B64 4K | 0.480 | 0.683 | 0.726 | 0.642 (-12%) | 0.049 |
+
+- The time fell as predicted (-9% to -12% against -10% to -20%); v1b is the first version faster than v0 at the same
+  heads per CTA (-5% to -7%). The tensor-core reads fell less than predicted: the estimate left out P^T and the
+  query, which PV and QK still read from shared memory every tile.
+- The data path is now the one the plan aimed at: K read once as FP4 by the MMA, V converted once into TMEM, about
+  1 KB of shared-memory traffic per token. What limits v1b is still the serial structure: one warpgroup, issue slots
+  21%, tensor pipe 6%, and 47% of the stall samples on long scoreboards (the first use of each global load and the
+  MMA waits).
+- At H=128 the 16 heads per CTA cost more than the data path saves (v0 with 32 heads: 1.586 ms, v1b: 2.427 ms at
+  B16 64K): every tile is loaded and converted by 8 CTAs per request instead of 4. 32 heads need 608 TMEM columns
+  (512 exist), so the next version has to reuse columns or share the converted V between head groups.
