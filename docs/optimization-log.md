@@ -620,7 +620,7 @@ them.
 
 These are the last steps for SM120; the work then moves to B200.
 
-### v11 results and the end of the SM120 work
+### v11 results
 
 **1. Transposing 8-bit `ldmatrix` (v11a).** A probe of `ldmatrix.m16n16.x2.trans.b8` showed that lane (g, t) gets
 channel g and g + 8 of tokens 4t..4t+3 (first 16 rows) and 16+4t..16+4t+3 (second 16 rows): exactly the PV B
@@ -652,18 +652,169 @@ had twice the integer work, gained 5%. Registers 245 -> 253 (FP8 mode), no spill
 FP4 QK mode against FP8 mode in the same build: H=128 B64 64K -3.0%, other large H=128 shapes -2% to -3%, small
 shapes up to +8%. That is exactly the 3% the rule asked for, at 25-55% more error; it stays an opt-in mode.
 
-**3. Conversion floor: confirmed.** After 1 and 2, H=128 B64 64K takes 2.79-2.86 ms in the FP8 mode and 2.71 ms
-in the FP4 QK mode (predicted 2.6-2.7 ms), against 2.30 ms for XQA. The conversion is now 46% of the FP8 mode's
-instructions. On SM120 this kernel does not overtake XQA's FP8 cache at H=128.
+**3. The prediction held; the "floor" explanation did not.** After 1 and 2, H=128 B64 64K takes 2.79-2.86 ms in
+the FP8 mode and 2.71 ms in the FP4 QK mode (predicted 2.6-2.7 ms), against 2.30 ms for XQA, so this kernel does not
+overtake XQA there. The first version of this section called the conversion a floor; a review of the v11b ncu report
+(FP8 mode, H=128 B64 64K) showed that it is not one:
+
+| | v11b |
+|---|---|
+| issue slots busy | 38.6% (no instruction issued in 61% of cycles) |
+| warps per scheduler: active / eligible | 1.96 / 0.48 |
+| busiest pipes (instructions, % of peak) | tensor 49%, LSU 33%, ALU 19%, FMA 10% |
+| stalls | wait 23%, short scoreboard 18%, math pipe throttle 11%, barrier 6% |
+
+A throughput floor would show one pipe near its peak and stalls on that pipe. Here no pipe passes 49% and most
+stalls wait for the result of the previous instruction, so the kernel is bound by latency. The pipe counts alone
+would allow 2.72 ms x 49% = 1.33 ms (tensor), well below XQA. The gap has two parts:
+
+- The format: XQA reads FP8 and converts nothing.
+- This kernel's structure: 247 registers allow 2 CTAs (2 warps per scheduler), and each warp runs conversion -> QK
+  -> barrier -> softmax -> P to shared memory -> PV in series, so the conversion sits in the middle of a chain
+  whose latency nothing hides. v6b (more CTAs per SM) and v8 (converting one tile ahead in the same warps) tried to
+  hide it and did not pay off; separate converter warps were not tried.
+
+Short contexts add fixed costs on top (query quantization, pipeline fill, the combine kernel): at batch 64 the best
+mode is 1.69x slower than XQA at 1K, 1.30x at 4K, 1.17x at 16K and 1.20x at 64K.
 
 SM120 summary at H=128 B64 64K: v5 (BF16) 4.81 ms -> v6 (FP8 MMA) 3.51 -> v9 (QK by token) 3.01 -> v11 2.79-2.86
 (FP8) / 2.71 (FP4 QK). At H=16 the BF16 path stays at 85% of DRAM bandwidth and is the fastest MLA decode measured on
 SM120.
 
-### Later: B200
+### v12 hypothesis: converter warps (warp specialization)
 
-FlashInfer Cake (`tcgen05`, NVFP4 query, FlashInfer 0.7.4rc1) on B200:
-- Cake runs H=16 B64 64K in 0.32 ms against v5's 0.74 ms, but at only 63% of DRAM bandwidth.
-- Its FP4 query raises the error against the BF16 reference from 0.08–0.12 (this kernel) to 0.13–0.17.
-- Hypothesis: a tcgen05 kernel that keeps BF16 Q stays memory-bound at H=16 and can be both faster and more accurate.
-  At H=128, BF16 Q puts its compute floor (spec BF16 tensor peak) near Cake's time, so that shape would need a low-precision query too.
+The review above leaves one structural option untried. v7 shared the conversion between two head groups but put
+them in one CTA with CTA-wide barriers, and v8 moved the conversion within the same warps; both kept the conversion
+inside the warps that run QK, softmax and PV. Here it moves to other warps.
+
+Hypothesis: the latency of the MMA warps' chain limits v11. If separate converter warps produce the E4M3 tile and
+hand it over through mbarriers (no CTA-wide barrier), the MMA warps' chain loses the conversion, its shared-memory
+reads and the copy address math, and the schedulers can issue conversion work while the MMA warps wait. At H=128
+two head groups can then share one conversion, which v7 showed halves the conversion instructions.
+
+Where a v11b warp spends one tile (stall samples by instruction class, FP8 mode, H=128 B64 64K, about 2240 cycles
+per warp per tile):
+
+| class | instructions | stall samples | in v12's MMA warps |
+|---|---|---|---|
+| conversion (`F2FP`, `HMUL2`) | 46% | 20% | gone |
+| MMA | 8% | 20% | stays (the tensor pipe alone needs about 530 cycles per tile) |
+| integer, `MOV`, `PRMT` | 20% | 22% | about half stays (`LDSM` -> `MOV` -> MMA, address math) |
+| softmax and row max (FP32, `SHFL`) | 14% | 14% | stays |
+| shared loads and stores, `cp.async` | 7% | 16% | raw reads and V stores leave |
+| `LDSM`, barriers, other | 5% | 8% | stays |
+
+A second review turned this into a timing model. The MMA warps' chain shrinks from about 2240 to about 1500 cycles
+per tile (530 MMA + 970 other). If both head groups take each tile from the same full barrier, they run in lock step
+and queue on the tensor pipe: 2 x 530 + 970 = about 2030 cycles per pair of tiles, about 2.45 ms, level with XQA
+(2.30 ms is about 950 cycles per head-group tile). If group B issues its MMAs while group A is in softmax (FA3's
+ping-pong: two named barriers around the QK issue), a pair takes max(2 x 530, 530 + 970) = 1500 cycles, about
+1.8 ms. v11's two independent CTAs per SM get this offset for free from their random phase; one shared ring loses
+it, so the ping-pong belongs in v12 from the start.
+
+**Experiment E1, before building v12.** v11's FP8 path with the conversion stubbed out (raw words go into QK as if
+they were E4M3 and into the V tile unchanged: wrong numbers, same control flow). This approximates v12's MMA-warp
+chain, with the random phase of 2 CTAs per SM standing in for the ping-pong.
+- 2.0 ms or less: build v12 with the ping-pong.
+- 2.4 ms or more: the chain after the conversion (barrier, row max, P exchange) is the limit, and v12 cannot pass
+  XQA; that chain comes first.
+- Its ptxas register count is the first answer to the 216-register budget below.
+
+**Free fixes, measured in the same run (v11c, output bitwise equal):**
+- The FP8 path's raw-stage swizzle `c ^ ((c >> 2) & 2) ^ (r & 1)` is conflict-free for the reads, but each
+  `cp.async` warp instruction (8 rows x 4 chunks) hits only 4 of the 8 16-byte slots, so it takes 2x the wavefronts
+  (8 `LDGSTS` x 8.4M excess wavefronts, 72% of all excess). `c ^ (r & 7)`, the FP4 QK path's swizzle, is
+  conflict-free for both.
+- P has a 32-byte row stride, so its `ldmatrix` and `STS.U16` are 2-way (2 x 8.4M and 4 x 2.1M excess); a 48-byte
+  stride removes both.
+- Prediction: small, since the LSU (33%) is not the limit: 0-3% at H=128, none at H=16.
+
+Design (FP8 mode; H=16 stays on v11, which is memory bound at 85%):
+
+- CTA = 2 head groups (32 heads) = 8 MMA warps (4 per group, the v11 split: QK by token, PV by channel) + 4
+  converter warps; one CTA per SM, 3 warps per scheduler instead of 2. The two groups ping-pong.
+- Converter warps: `cp.async` raw stages (with the conflict-free swizzle), then E2M1 x scale -> E4M3 into a ring of
+  4 converted tiles in the existing V layout (16 KB + 2 KB RoPE each; 3 is the minimum). Full and empty mbarriers
+  per slot; the empty barrier counts the 8 MMA warps. Shared memory about 95 KB.
+- MMA warps: QK reads K with non-transposing `ldmatrix` from the converted tile (the V layout's swizzle is
+  conflict-free for 8 rows of one chunk). The 8 V fragments of PV (32 registers) are loaded right after QK, before
+  the row-max barrier, so their latency hides behind the softmax; v11 runs `LDSM` -> 3 `MOV` -> MMA in series
+  there. The cross-warp row max uses one named barrier per head group (`bar.sync id, 128`).
+- Registers with `setmaxnreg`. The CTA is launched with 384 x 168 = 64512 registers, and `inc` can only take what
+  `dec` gave back, so the split is 2 x 128 x 216 + 128 x 72 = 64512 (or 208 / 88). Checked with
+  a small probe on the RTX PRO 6000: with 216 / 72 and 208 / 88 a path that keeps 200 floats live after
+  `inc` runs with correct results and no spills; 216 / 80 (65536, this section's first budget) blocks in `inc`
+  forever.
+- One CTA per SM halves the wave (376 -> 188 CTAs), and no other CTA hides the prologue (query quantization,
+  pipeline fill), so v12 is a long-context mode, dispatched by length; 1K-4K stay on v11. The 1.69x gap at 1K B64
+  is a separate problem (each split CTA quantizes the query again, the combine kernel) for a separate ncu run.
+
+Predictions:
+
+- MMA warps fit 216 registers with the V fragments loaded early, and converter warps fit 72, both without spills
+  (ptxas -v, checked before any run).
+- Issue slots 39% -> 50-60%, tensor pipe 49% -> 60-75%.
+- H=128 B64 64K, FP8 mode: 2.86 -> 1.8-2.2 ms. Without the ping-pong the model gives 2.4-2.5 ms.
+- Decision rule: keep if H=128 B64 64K improves by 10% or more in a same-run A/B and no H=128 shape from 16K up is
+  more than 3% slower.
+
+### v11c and E1 results: v12 is not built
+
+**Free fixes (v11c).** The swizzle the review proposed for the FP8 path, `c ^ (r & 7)`, made the FP8 reads 2-way
+and left the `cp.async` writes at 2x. Both reviews and this log had counted conflicts over 32 lanes; 16-byte
+accesses are served 8 lanes at a time. With that model (a short script that matches ncu for the reads and
+`ldmatrix`), the FP8 path got `c ^ ((c >> 2) & 2) ^ ((r & 1) * 5)` and the FP4 QK path `c ^ (r & 7) ^ ((r & 1) << 2)`.
+
+| H=128 B64 64K | v11b | v11c |
+|---|---|---|
+| excess shared wavefronts | 92.8M | 67.4M (P stores and `ldmatrix`: 25M -> 0) |
+| `cp.async` writes | 2x | still 2x |
+| FP8 mode, same-run A/B | 2.819 ms | 2.819 ms (H=16 and H=128 shapes within 0.5%) |
+| FP4 QK mode, same-run A/B | 2.697 ms | 2.648 ms (-1.3%) |
+
+Output is bitwise equal and all tests pass. The `cp.async` writes stay at 2x with three different swizzles, so that
+2x is not a bank conflict of the layout; the likely cause is that each warp instruction touches 8 global lines (8
+tokens x 64 B) and the shared-memory writes follow the lines. The prediction (0-3%, the LSU is not the limit) held.
+
+**E1: the conversion stubbed out.** The first stub put one raw word into both halves of each MMA operand pair; the
+compiler then needed 572M extra `MOV` to build the pairs (2.69 ms, not a valid measurement). The second stub writes
+two different words (two `LOP3` per word):
+
+| H=128 B64 64K, FP8 mode | v11c | E1 |
+|---|---|---|
+| instructions executed | 1798M | 1077M (-40%) |
+| conversion (`F2FP`, `HMUL2`) | 833M | 11M |
+| registers | 245 | 254 |
+| issue slots busy | 38% | 26% |
+| eligible warps per scheduler | 0.48 | 0.31 |
+| tensor pipe | 48.5% | 55.7% |
+| stall samples at MMA (math throttle) | 20% (12%) | 31% (14%) |
+| kernel time, ncu | 2.96 ms | 2.56 ms (-13%) |
+| same-run A/B (CUPTI) | 2.806 ms | 2.484 ms (-11.5%) |
+
+Other H=128 shapes: -3% (B16 4K) to -10% (B16 64K). With XQA in the same process (H=128 batch 64, median of 3
+alternating rounds; `docs/img/sm120-gap`):
+
+| tokens | v11c FP8 | v11c FP4 QK | E1 | XQA FP8 | E1 / XQA |
+|---|---|---|---|---|---|
+| 1K | 0.137 ms | 0.134 | 0.133 | 0.081 | 1.64 |
+| 4K | 0.282 | 0.270 | 0.261 | 0.215 | 1.21 |
+| 16K | 0.854 | 0.816 | 0.769 | 0.673 | 1.14 |
+| 64K | 2.889 | 2.738 | 2.548 | 2.328 | 1.09 |
+
+At 1K the conversion costs 3% and the gap stays at 1.64x, so the short-context loss is a fixed cost per CTA.
+
+- Removing all of the conversion, 40% of the instructions, saves 11-13%. Its 20% of the stall samples was not 20%
+  of the time: without it the warps wait at the MMAs (bursts of QK and PV, math throttle) and in the integer and
+  softmax chain instead, and fewer warps are ready (0.31 per scheduler).
+- 2.48 ms is above the 2.4 ms line set before the run. Even a free conversion would leave this kernel at XQA's time
+  (2.30 ms in another run; run-to-run variation is up to 8%). v12 can at best remove a little more than E1 (the
+  copy, the raw reads and the V stores leave the MMA warps too), about 2.2-2.3 ms, with the one-CTA-per-SM risks
+  on top. By the decision rule, v12 is not built.
+- The review's model counted the conversion's stall share (about 450 of 2244 cycles) as time that would be freed;
+  E1 frees about 290. Stall shares say where warps wait, not how much time disappears when the work does.
+- What remains at 2.48 ms is the rest of the chain. The tensor pipe at 56% puts its own floor at 1.43 ms; the gap to
+  it is the MMA bursts, the `LDSM` -> `MOV` -> MMA dependencies, the cross-warp row max and the softmax. Changing
+  that is a different kernel design, not a step from v11.
+
+SM120 ends at v11c: the FP8 mode at 2.82 ms and the FP4 QK mode at 2.65 ms on H=128 B64 64K, against 2.30 ms for XQA.

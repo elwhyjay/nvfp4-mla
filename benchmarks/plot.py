@@ -1,4 +1,4 @@
-"""README figures from benchmarks/results/*.csv: latency per kernel version, library comparison, roofline.
+"""README figures from benchmarks/results/*.csv: latency per kernel version, library comparison, roofline, the SM120 gap.
 
   uv run --with matplotlib python benchmarks/plot.py      # writes docs/img/<name>-{light,dark}.svg
 """
@@ -21,9 +21,11 @@ FLOP_PER_TOKEN_HEAD = 2 * 576 + 2 * 512  # QK over 512 + 64 channels, PV over 51
 KV_BYTES = {"nvfp4": 352, "nvfp4-fp8": 352, "nvfp4-fp4q": 352, "cake": 352, "nvfp4+fa2": 352, "fp8": 576,
             "bf16": 1152}
 # BF16 path v1-v5 on both GPUs; the FP8 path (opt-in, for compute-bound shapes) v6-v11 on RTX PRO 6000
-VERSIONS = {"RTX PRO 6000": ["v1", "v2", "v3", "v4", "v5", "v6", "v9", "v11"], "B200": ["v1", "v2", "v3", "v4", "v5"]}
+VERSIONS = {"RTX PRO 6000": ["v1", "v2", "v3", "v4", "v5", "v6", "v9", "v11", "v11c"],
+            "B200": ["v1", "v2", "v3", "v4", "v5"]}
 TICKS = {"v1": "v1\nCUDA\ncores", "v2": "v2\nmma.sync", "v3": "v3\ncp.async", "v4": "v4\nsplit-KV",
-         "v5": "v5\nfewer\ninstrs", "v6": "v6\nFP8\nMMA", "v9": "v9\nQK by\ntoken", "v11": "v11\n8-bit\nldmatrix"}
+         "v5": "v5\nfewer\ninstrs", "v6": "v6\nFP8\nMMA", "v9": "v9\nQK by\ntoken", "v11": "v11\n8-bit\nldmatrix",
+         "v11c": "v11c\nswizzle"}
 OURS = ("nvfp4", "nvfp4-fp8")
 TABLE_ONLY = ("nvfp4+fa2", "nvfp4-fp4q")  # in the README tables, not in the bar charts
 CONFIGS = [(16, 64, 65536), (16, 1, 65536), (128, 64, 65536), (128, 1, 65536)]
@@ -109,10 +111,10 @@ def versions(t):
     axes[0].set_ylabel("latency (ms, log scale)", color=t["ink2"])
     h, l = axes[0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper center", ncol=3, frameon=False, labelcolor=t["ink2"], fontsize=9)
-    fig.text(0.01, 0.01, "Lower is better. v1-v5: BF16 path; v6-v11: the FP8 path (opt-in), shown for H=128. v1-v3 timed "
-             "with CUDA events, later versions with CUPTI; L2 flushed. Labels: last latency (speedup over v1).",
+    fig.text(0.01, 0.01, "Lower is better. v1-v5: BF16 path; v6-v11c: the FP8 path (opt-in), shown for H=128. v1-v3 timed "
+             "with CUDA events, later versions with CUPTI; L2 flushed.\nLabels: last latency (speedup over v1).",
              color=t["muted"], fontsize=8)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.92))
+    fig.tight_layout(rect=(0, 0.07, 1, 0.92))
     return fig
 
 
@@ -210,15 +212,63 @@ def roofline(t):
     return fig
 
 
+def gap(t):
+    """SM120, H=128 batch 64: what is left of the gap to XQA once the FP4 -> FP8 conversion costs nothing (E1)."""
+    rows = load(RES / "sm120_gap.csv")
+    ms = {(r["provider"], r["s_kv"]): r["ms"] for r in rows}
+    ss = sorted({r["s_kv"] for r in rows})
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4.2), gridspec_kw={"width_ratios": [5, 6]})
+    style(a1, t)
+    a1.axhline(1, color=t["muted"], lw=1.2, zorder=2)
+    a1.text(0, 1.01, "XQA (FP8) = 1", va="bottom", color=t["ink2"], fontsize=8.5)
+    for p, color, ls in (("v11c FP8", t["series"][2], "-"), ("E1 (no conversion)", t["ink2"], "--")):
+        ys = [ms[p, s] / ms["XQA FP8", s] for s in ss]
+        a1.plot(range(len(ss)), ys, color=color, ls=ls, lw=2, marker="o", ms=6, mec=t["surface"], mew=1.5, label=p,
+                zorder=3)
+        a1.annotate(f"{p}\n{ys[-1]:.2f}×", (len(ss) - 1, ys[-1]), xytext=(8, 0), textcoords="offset points",
+                    va="center", color=t["ink2"], fontsize=8.5)
+    a1.set_xticks(range(len(ss)), [f"{s // 1024}K" for s in ss])
+    a1.set_xlabel("KV tokens per request", color=t["ink2"])
+    a1.set_xlim(-0.3, len(ss) + 0.6)
+    a1.set_ylim(0.9, None)
+    a1.set_ylabel("time / XQA time", color=t["ink2"])
+    title(a1, t, "H=128, batch 64: relative to XQA")
+    a1.legend(loc="upper right", frameon=False, labelcolor=t["ink2"], fontsize=8.5)
+
+    style(a2, t, grid_axis=None)
+    S = ss[-1]
+    bars = [("v11c FP8", t["series"][2], None), ("v11c FP4 QK", t["series"][2], None),
+            ("E1 (no conversion)", t["gray"], "///"), ("XQA FP8", t["gray"], None)][::-1]
+    ys = range(len(bars))
+    vals = [ms[p, S] for p, _, _ in bars]
+    for patch, (_, _, h) in zip(a2.barh(ys, vals, height=0.62, color=[c for _, c, _ in bars], edgecolor=t["surface"],
+                                        lw=0), bars):
+        patch.set_hatch(h)  # E1 is not a real kernel: textured, so it does not read as a library bar
+    a2.set_yticks(ys, [p for p, _, _ in bars], fontsize=8.5)
+    for y, v, (p, _, _) in zip(ys, vals, bars):
+        a2.text(v + max(vals) * 0.015, y, fmt_ms(v), va="center", color=t["ink" if p.startswith("v11c") else "ink2"],
+                fontsize=8.5, fontweight="bold" if p.startswith("v11c") else "normal")
+    a2.set_xlim(0, max(vals) * 1.2)
+    a2.set_xticks([])
+    a2.spines["bottom"].set_visible(False)
+    title(a2, t, f"H=128, batch 64, {S // 1024}K tokens")
+    fig.text(0.01, 0.01, "RTX PRO 6000, one process, median of 3 alternating rounds (CUPTI). E1 is a test build of the "
+             "FP8 mode with the FP4 -> FP8 conversion replaced\nby two logic ops per word: wrong results, same control "
+             "flow. Removing 40% of the instructions saves 12% at 64K; the rest of the gap is the kernel's serial chain.",
+             color=t["muted"], fontsize=8)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    return fig
+
+
 def main():
-    plt.rcParams.update({"font.family": "sans-serif", "svg.fonttype": "none", "font.size": 9,
+    plt.rcParams.update({"font.family": "sans-serif", "svg.fonttype": "none", "font.size": 9, "svg.hashsalt": "nvfp4-mla",
                          "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]})
     IMG.mkdir(parents=True, exist_ok=True)
     for mode, t in THEMES.items():
-        figs = {"versions": versions(t), "roofline": roofline(t),
+        figs = {"versions": versions(t), "roofline": roofline(t), "sm120-gap": gap(t),
                 **{"compare-" + g.lower().replace(" ", "-"): comparison(t, g) for g in GPUS}}
         for key, fig in figs.items():
-            fig.savefig(IMG / f"{key}-{mode}.svg", facecolor=t["surface"])
+            fig.savefig(IMG / f"{key}-{mode}.svg", facecolor=t["surface"], metadata={"Date": None})  # stable diffs
             plt.close(fig)
     print("wrote", sorted(p.name for p in IMG.glob("*.svg")))
 

@@ -620,10 +620,13 @@ struct Stage {  // 16 B chunk c of row r at ckv_chunk / sf_chunk / kpe_chunk (c,
 };
 
 // Stage swizzles (16 B chunk c of tile row r). BF16 path: conflict-free for its reads (thread (w, t4) reads ckv chunk
-// 4w + t4 of rows g, sf/kpe chunks by warp). FP8 path: thread t of warp w reads ckv chunks 4t..4t+3 of row 8w + g.
-// P = 0: BF16 path, 1: FP8 path, 2: FP8 path with FP4 QK (ldmatrix reads 8 rows of one ckv chunk).
+// 4w + t4 of rows g, sf/kpe chunks by warp). 16 B accesses are served 8 lanes at a time. FP8 path: an 8-lane phase
+// of its reads covers rows 2m, 2m + 1 x chunks {i, 4+i, 8+i, 12+i} (thread t of warp w: chunks 4t..4t+3 of row
+// 8w + g). FP4 QK path: ldmatrix reads 8 rows of one chunk. Both read conflict-free. The cp.async writes take 2x the
+// ideal wavefronts with every swizzle tried, so that cost is not the layout's.
+// P = 0: BF16 path, 1: FP8 path, 2: FP8 path with FP4 QK.
 template <int P> __device__ __forceinline__ int ckv_chunk(int c, int r) {
-  return P == 2 ? c ^ (r & 7) : P == 1 ? c ^ ((c >> 2) & 2) ^ (r & 1) : c ^ ((r & 1) << 2);
+  return P == 2 ? c ^ (r & 7) ^ ((r & 1) << 2) : P == 1 ? c ^ ((c >> 2) & 2) ^ ((r & 1) * 5) : c ^ ((r & 1) << 2);
 }
 template <int P> __device__ __forceinline__ int sf_chunk(int c, int r) { return P ? c : c ^ ((r >> 2) & 1); }
 template <int P> __device__ __forceinline__ int kpe_chunk(int c, int r) { return P ? c : c ^ ((r >> 1) & 3); }
@@ -634,7 +637,7 @@ struct Fp8Smem {
   // V tile in e4m3: chunk c of token row r (channels 16c .. 16c + 15) at chunk c ^ (r & 7) ^ ((c >> 2) & 6), which
   // is conflict-free for the converting threads' stores and for the transposing ldmatrix over 8 or 16 tokens.
   uint4 v[TILE][CKV / 16];
-  uint8_t p[16][TILE];  // P in e4m3, column = token
+  uint8_t p[16][TILE + 16];  // P in e4m3, column = token; 48-byte rows keep its stores and ldmatrix conflict-free
   float mx[16][4];      // per row: max over each warp's tokens; after the loop, each warp's row sum
 };
 template <int P>

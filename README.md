@@ -162,12 +162,14 @@ How to read these numbers:
   tokens): 1.6-3.3x faster than Triton FP8 and 1.5-6.1x faster than fa2. At 64 x 64K it reads 1.32 TB/s, 85% of the
   achievable 1.56 TB/s (`benchmarks/roofline.py`). Triton FP8 reaches the same fraction there, so the 1.65x gain is
   the byte ratio 576 / 352. The FP8 mode changes little here (0.8-1.03x).
-- **SM120, 128 heads** (compute bound from batch 16): the FP8 mode is 1.3-1.7x faster than the default from batch 4.
+- **SM120, 128 heads** (not memory bound from batch 16): the FP8 mode is 1.3-1.7x faster than the default from batch 4.
   It is the fastest at batch 1-4 (XQA has no KV split and is slow with long contexts) and at batch 16 with 16K tokens
   or more, and faster than Triton FP8 (1.2-2.9x) and fa2 (1.1-4.1x) in all shapes. XQA's FP8 cache still wins at
-  batch 64 (1.23x at 64 x 64K): this kernel has to convert every K/V element from FP4 to FP8 first, 46% of its
-  instructions, and SM120 has no instruction that folds the block scale into that conversion
-  ([optimization log](docs/optimization-log.md#v11-results-and-the-end-of-the-sm120-work)).
+  batch 64 (1.23x at 64 x 64K). This is not a hardware floor: ncu shows the kernel bound by latency (38.6% of issue
+  slots, tensor pipe 49%). The FP4 -> FP8 conversion is 46% of the instructions, but removing it entirely (a test
+  build with wrong numbers) saves only 11-13% and leaves the kernel at about XQA's time; the rest of each warp's
+  serial chain (MMA bursts, the cross-warp row max, softmax) with 2 warps per scheduler is what separates them
+  ([optimization log](docs/optimization-log.md#v11c-and-e1-results-v12-is-not-built)).
 - **B200, 16 heads**: FlashInfer Cake (`tcgen05` MMA) is the fastest in most shapes, up to 2.3x faster than this
   kernel; this kernel is faster only at batch 1-4 with up to 4K tokens. It is faster than trtllm-gen BF16 in all
   16 shapes (1.03-1.47x), than fa2 (1.6-3.3x) and than Triton FP8 (2.5-5.1x). This kernel uses `mma.sync` on both
@@ -182,23 +184,35 @@ How to read these numbers:
 
 Latency of each kernel version on the same shapes. v1 runs on CUDA cores; v2 moves to tensor cores with
 dequantization in registers; v3 adds the `cp.async` pipeline; v4 splits the KV range across CTAs; v5 cuts
-instructions per token. v6-v11 are the FP8 mode for compute-bound shapes: FP8 MMA (v6), QK split by token so the
-scores need no cross-warp sum (v9), V loaded with a transposing 8-bit `ldmatrix` (v11). Each step, the hypothesis and
-the profile behind it, and the steps that were measured and dropped (v7, v8, a split-policy change) are in
-[docs/optimization-log.md](docs/optimization-log.md).
+instructions per token. v6-v11c are the FP8 mode for compute-bound shapes: FP8 MMA (v6), QK split by token so the
+scores need no cross-warp sum (v9), V loaded with a transposing 8-bit `ldmatrix` (v11), conflict-free shared-memory
+layouts (v11c). Each step, the hypothesis and the profile behind it, and the steps that were measured and dropped
+(v7, v8, a split-policy change, v12) are in [docs/optimization-log.md](docs/optimization-log.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/versions-dark.svg">
-  <img alt="Latency per kernel version, v1 to v5 on both GPUs and v6 to v11 (FP8 mode) at 128 heads on RTX PRO 6000" src="docs/img/versions-light.svg">
+  <img alt="Latency per kernel version, v1 to v5 on both GPUs and v6 to v11c (FP8 mode) at 128 heads on RTX PRO 6000" src="docs/img/versions-light.svg">
 </picture>
 
 The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof. At 128
-heads the FP8 mode reaches 45% of the E4M3 `mma.sync` roof on RTX PRO 6000; there the per-element conversion, not the
-tensor pipe, sets the time. B200 is still at the BF16 `mma.sync` stage.
+heads the FP8 mode reaches 45% of the E4M3 `mma.sync` roof on RTX PRO 6000; there no unit is saturated (issue slots
+39%, tensor pipe 49%): the kernel is bound by the latency of each warp's serial chain. B200 is shown at the
+`mma.sync` stage; its `tcgen05` kernel is in progress.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/roofline-dark.svg">
   <img alt="Roofline of RTX PRO 6000 and B200 with kernel versions v1 to v5 and the fastest other library" src="docs/img/roofline-light.svg">
+</picture>
+
+Where the remaining gap to XQA at 128 heads comes from. The FP4 -> FP8 conversion is 46% of the FP8 mode's
+instructions, so a test build replaced it with two logic ops per word (wrong results, same control flow). It removes
+40% of the instructions but only 12% of the time at 64K tokens, and the build is still 1.09x slower than XQA: the
+conversion is not the floor, the rest of each warp's chain is. At 1K tokens both builds are about 1.65x slower, a fixed
+cost per CTA that the conversion does not explain either.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/sm120-gap-dark.svg">
+  <img alt="RTX PRO 6000, 128 heads, batch 64: time of the FP8 mode and of a build without the conversion, relative to XQA, for 1K to 64K tokens" src="docs/img/sm120-gap-light.svg">
 </picture>
 
 ## Reproduce
