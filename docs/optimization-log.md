@@ -1615,3 +1615,11 @@ tokens per page included). B200, page size 64, ms:
 
 H=128 still reads the cache once per 16 heads (8 CTAs per sequence), which is the next structural item after the
 convert role.
+
+After v2.4, on the full grid (H 16/128, batch 1-64, 1K-64K tokens, one process with the other libraries;
+`benchmarks/results/b200.csv`, and every buildable version in `versions.csv`): the SM100 kernel is faster than the
+CUDA kernel from about 16 x 16K tokens, but below that it is slower, and slower than v0. A call costs at least about
+40 us with a cold L2. With warm caches at H=16, batch 1, 1K tokens: 17.6 us for the kernel (one tile through its
+start, pipeline and end), 2.3 us query terms, 1.7 us RoPE terms, 2.7 us split merge. v0 has no query split kernels
+and a shorter start (no TMA warp, no role setup), 23 us cold. The fixed cost is a separate item from the tile
+period and not addressed yet.
