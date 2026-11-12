@@ -2354,3 +2354,71 @@ factors can go into tensor memory directly (the layout above works), but not fro
 the next attempt at 16 heads should take work off the scale warps without putting it on the conversion's path (for
 example their 32 single-byte stores per token, which a transpose of 4 x 4 bytes across lanes would turn into 8 word
 stores).
+
+### V3.4 hypothesis: word stores for the conversion's scales
+
+The scale warps write the conversion's block-major scales one byte at a time: per token 32 single-byte stores, each
+after a shift and a mask. A token's 4 words hold 4 blocks each; the 4 lanes of a token group (4 consecutive tokens,
+the 4 bytes of one word of the block-major layout) can transpose their 4 x 4 bytes with 2 shuffles and 2 byte
+permutes per word, after which lane j holds block 4a + j of all 4 tokens and stores it as one word: per token 16
+shuffles, 16 permutes and 8 word stores instead of 32 byte stores and 32 shifts and masks. The 4 lanes of a group
+would then store into the same bank (rows 32 words apart), so the layout's column is swizzled to g ^ 8 (row % 4),
+which the convert warps undo with one XOR on their load address.
+
+Predictions (one process against V3.2): H=16 B64 64K 0.305-0.32 ms (0.328), the scale warps under 85% busy; H=128
+within 2% of V3.2.
+
+V3.4 result (after one wrong permute selector, caught by the tests): correct, the scale warps fall from 85-92% to 69%
+busy, and the whole is slower: H=16 B64 64K 0.348 ms against V3.2's 0.327, H=16 B16 64K 0.101 (0.098), H=128 1-3%
+slower. The prediction fails. With their work cut, the scale warps now wait 26% of their samples for the conversion
+to release tile j - 2, and the MMA warp waits 40% for their published tiles: with 2 derived buffers (nd = 2) the
+scale layouts of tile j cannot start before the conversion of tile j - 2 is done, so they sit in the loop
+conversion(j - 2) -> scale layouts(j) -> QK(j) -> softmax(j) -> PV(j) -> conversion(j + 1). In V3.2 they were slow
+enough that this did not show. (The softmax's "long scoreboard" stalls are its mbarrier waits for S, not spills; it
+spills about 5 values per tile.)
+
+### V3.4b hypothesis: three derived buffers
+
+With nd = 3 the scale layouts of tile j wait for tile j - 3, one tile more of slack, which should take the scale
+warps out of that loop. The 2^k buffer then needs more than 4 slots (tile j's slot was last read for tile j - 4,
+whose P is no longer implied by the release of tile j - 3): 8. Shared memory grows by about 10 KB. One process: V3.2
+and V3.4, each with nd = 2 and 3.
+
+Prediction: V3.4 with nd = 3 at or below 0.32 ms at H=16 B64 64K; V3.2 with nd = 3 unchanged (its scale warps were
+the limit, not the loop).
+
+V3.4b result, one process, ms (the H=128 shapes did not finish, see below):
+
+| shape | V3.2 | V3.2 nd 3 | V3.4 | V3.4 nd 3 |
+|---|---|---|---|---|
+| H=16 B64 64K | 0.326 | 0.315 | 0.348 | **0.307** |
+| H=16 B16 64K | 0.098 | 0.097 | 0.101 | 0.097 |
+| H=16 B64 16K | 0.107 | 0.105 | 0.112 | 0.105 |
+
+The error is the same for all four. V3.4 with nd = 3 is at 0.307 ms, as predicted at or below 0.32; V3.2 with nd = 3
+gains too (-3.6%), not predicted. With 32 heads (3 raw stages) nd = 3 deadlocks: the scale warps may then publish tile
+it + 3 into the stage of tile it as soon as tile it is released, before the softmax has waited on that stage's full
+barrier for tile it, whose parity has then flipped twice. With 4 stages (16 heads) publishing tile it + 4 needs P(it)
+first, so it cannot happen. nd = 3 is therefore for 16 heads only. The 2^k buffer holds k as a byte (8 slots, 1 KB),
+which keeps the 16-head kernel within shared memory (232,256 of 232,448 bytes).
+
+### V3.4 as kept: word stores and 3 derived buffers at 16 heads only
+
+With 32 heads the word stores cost 2-3% and, once the stores were bytes again there, so did the conversion's XOR on
+each scale load (4%: the conversion is in the loop at 32 heads). So both the swizzled word layout and nd = 3 are for 16
+heads; the 32-head path is V3.2's except that k is stored as a byte. One process, ms:
+
+| shape | V3.2 | V3.4 | Cake |
+|---|---|---|---|
+| H=16 B64 64K | 0.327 | **0.308** | 0.319 |
+| H=16 B16 64K | 0.098 | 0.097 | 0.087 |
+| H=16 B64 16K | 0.108 | 0.106 | 0.092 |
+| H=16 B1 / B4 64K | 0.029 / 0.042 | 0.028 / 0.043 | 0.021 / 0.034 |
+| H=128 B16 64K | 0.380 | 0.380 | 0.300 |
+| H=128 B64 64K | 1.386 | 1.387 | 0.545 |
+
+At 16 heads, batch 64 and 64K tokens v3 is now 3% faster than Cake (and its error 1.01x the BF16 mode's against
+Cake's 1.4-1.7x); with smaller batches Cake still leads by 1.1-1.4x, and at 128 heads as analysed above. Of the 16-head
+changes, the third derived buffer alone gains 3.6%; the word stores alone lose 6% (the faster scale warps only expose
+the loop through the conversion) and add 2% once that loop has the slack of the third buffer. Moving scale work onto
+the convert warps (V3.3, V3.3b) lost in every form.

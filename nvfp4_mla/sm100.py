@@ -188,6 +188,17 @@ def bar_red_or(pred: Int32, bar_id: int, nthreads: int, *, loc=None, ip=None) ->
 
 
 @dsl_user_op
+def bytes4x4_t(w: Uint32, s1: Uint32, s2: Uint32, *, loc=None, ip=None) -> Uint32:
+    """4 x 4 byte transpose across lanes 4g .. 4g + 3: lane 4g + j returns byte j of the 4 lanes' words, lane 4g's in
+    byte 0. s1, s2: the lane's byte selectors, 0x5410 / 0x3276 for lane bit 1 clear / set, 0x6240 / 0x3715 for bit 0."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(x).ir_value(loc=loc, ip=ip) for x in (w, s1, s2)],
+        "{\n.reg .b32 p, x, q;\nshfl.sync.bfly.b32 p, $1, 2, 0x1f, 0xffffffff;\nprmt.b32 x, $1, p, $2;\n"
+        "shfl.sync.bfly.b32 q, x, 1, 0x1f, 0xffffffff;\nprmt.b32 $0, x, q, $3;\n}", "=r,r,r,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def tmem_st16x128(taddr: Uint32, w0: Uint32, w1: Uint32, *, loc=None, ip=None):
     """tcgen05.st.16x128b.x1: thread (g, t) writes lane g column t (w0) and lane g + 8 column t (w1)."""
     llvm.inline_asm(None, [Uint32(x).ir_value(loc=loc, ip=ip) for x in (taddr, w0, w1)],
@@ -1641,6 +1652,10 @@ class DecodeV3(DecodeV2):
         super().__init__(n, page_size, terms, "lazy,rope8,tma,cvt8,vhalf,v8" + (",st3,h32" if n == 32 else ""), stub)
         if n == 16:  # the scale warps set the period at 16 heads and run short of registers at 80
             self.regs = {0: 128, 1: 128, 2: 152, 3: 104}
+            # 3 derived buffers: the scale layouts of tile j wait for tile j - 3 instead of j - 2, out of the loop through
+            # the conversion. Not with 32 heads: with 3 raw stages the scale warps could publish tile it + 3 into tile
+            # it's stage before the softmax has waited on it (the parity of its full barrier would alias).
+            self.nd = 3
 
     @cute.jit
     def __call__(self, q4: cute.Tensor, qsf: cute.Tensor, qg: cute.Tensor, qpe8: cute.Tensor, qpe_e: cute.Tensor,
@@ -1794,7 +1809,7 @@ class DecodeV3(DecodeV2):
         sSfT8 = cute.make_tensor(cute.recast_ptr(sSfT.iterator, dtype=Uint8),
                                  cute.make_layout((CKV // 16, TILE, nd), stride=(TILE, 1, 4096)))
         sSfR = smem.allocate_tensor(Uint32, cute.make_layout((nst, TILE, 8), stride=(TILE * 8, 8, 1)), 16)
-        sKf = smem.allocate_tensor(Float32, cute.make_layout((4, TILE), stride=(TILE, 1)), 16)  # 2^k per token
+        sKf = smem.allocate_tensor(Uint8, cute.make_layout((8, TILE), stride=(TILE, 1)), 16)  # k per token
         sMx = smem.allocate_tensor(Float32, cute.make_layout((2, 4, n), stride=(4 * n, n, 1)), 16)
         sL = smem.allocate_tensor(Float32, cute.make_layout((4, n), stride=(n, 1)), 16)
         sG = smem.allocate_tensor(Float32, cute.make_layout(n), 16)
@@ -1892,7 +1907,10 @@ class DecodeV3(DecodeV2):
                             off = (c // 8) * 16384 + (vrow // 8) * 1024 + (vrow % 8) * 128 + ((c % 8) ^ (vrow % 8)) * 16
                             r = ldsm_t16(k4_base + Uint32(sx * (TILE * CKV // 2) + off))
                             for G in cutlass.range_constexpr(2):
-                                w = v_words_q(r[G], sSfT[8 * dm + 2 * lw + G, 4 * blk + t4, dx])
+                                rr, cw = 8 * dm + 2 * lw + G, 4 * blk + t4
+                                if cutlass.const_expr(self.n == 16):  # swizzled by the scale warps' word stores
+                                    cw = cw ^ (8 * (rr % 4))
+                                w = v_words_q(r[G], sSfT[rr, cw, dx])
                                 tmem_st16x128(tmem_v + Uint32(((32 * lw + 16 * G) << 16) + dm * 32 + blk * 4), w[0], w[1])
                     cute.arch.fence_view_async_tmem_store()
                     hv.commit()
@@ -1913,8 +1931,13 @@ class DecodeV3(DecodeV2):
         if warp >= 14:
             # ---- scale layouts (two tokens per thread) once a tile has landed. Before writing those of tile j, tile
             # j - nd is released (the last reader of the derived buffers). That comes after QK(j - nd), so after the
-            # softmax published P(j - nd - 2) and read 2^k from the slot tile j reuses (4 slots).
+            # softmax published P(j - nd - 2) and read k from the slot tile j reuses (8 slots).
             tl = tidx - 448
+            s1, s2 = Uint32(0x5410), Uint32(0x6240)  # byte selectors of bytes4x4_t
+            if (lane & 2) != 0:
+                s1 = Uint32(0x3276)
+            if (lane & 1) != 0:
+                s2 = Uint32(0x3715)
             st_done = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, nst)
             for j in cutlass.range(n_tiles):
                 sx = st_done.index
@@ -1925,8 +1948,8 @@ class DecodeV3(DecodeV2):
                     cute.arch.mbarrier_wait(stg.kvc.data_ptr() + nst + sp, ph)
                 for q in cutlass.range_constexpr(2):
                     tk = tl + 64 * q
-                    self.scale_layouts(sSfR, sfa_w, sSfT8, sKf[j % 4, None], sx, j % nd, tk, t_beg + j * TILE + tk,
-                                       t_end)
+                    self.scale_layouts(sSfR, sfa_w, sSfT, sSfT8, sKf[j % 8, None], sx, j % nd, tk,
+                                       t_beg + j * TILE + tk, t_end, s1, s2)
                 cute.arch.fence_view_async_shared()
                 kvm.producer_commit(st_done)
                 kvc.producer_commit(st_done)
@@ -2056,7 +2079,7 @@ class DecodeV3(DecodeV2):
                     self.rescale(ld_s, st_o, tStO, tOtO, corr, frag)
                 # the scale warps' arrival on the stage's full barrier orders their 2^k store before this load
                 cute.arch.mbarrier_wait(stg.kvc.data_ptr() + it % nst, (it // nst) % 2)
-                kf = sKf[it % 4, row]
+                kf = Float32(Uint32(1) << Uint32(sKf[it % 8, row]))
                 for i in cutlass.range_constexpr(n):
                     pf[i] = pf[i] * kf
                 p8 = cute.make_rmem_tensor(frag, Float8E4M3FN)
@@ -2120,9 +2143,12 @@ class DecodeV3(DecodeV2):
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
-    def scale_layouts(self, sSfR, sfa_w, sSfT8, kf, sx, dx, tk, tok, t_end):
-        """Scales of token tk of the tile in stage sx -> buffer dx: SFA words as stored (QK), block-major bytes x 2^-k
-        (V) and 2^k (P, into kf). Rows past the end get scales 0, so V is exactly 0 there."""
+    def scale_layouts(self, sSfR, sfa_w, sSfT, sSfT8, kf, sx, dx, tk, tok, t_end, s1, s2):
+        """Scales of token tk of the tile in stage sx -> buffer dx: SFA words as stored (QK), block-major words x 2^-k
+        (V) and k (P is scaled by 2^k; into kf). Rows past the end get scales 0, so V is exactly 0 there. The
+        16 heads: the 4 lanes of a token group transpose their bytes and store words; the word of block b and tokens
+        4g .. 4g + 3 sits in column g ^ 8 (b % 4), so that the 4 lanes store into 4 different banks. 32 heads: bytes
+        one by one, unswizzled; there the conversion's extra XOR per load and the shuffles measured slower."""
         msk = Uint32(~((t_end - 1 - tok) >> 31))
         base = Uint32(sSfR.iterator.toint()) + Uint32((sx * TILE + tk) * 32)
         w = lds_v4(base) + lds_v4(base + Uint32(16))
@@ -2142,9 +2168,13 @@ class DecodeV3(DecodeV2):
         for a in range(CKV // 64):
             sfa_w[tk % 32, tk // 32, a, dx] = w[a]
             ws = e4m3x4_mul(w[a], f2)
-            for i in range(4):
-                sSfT8[4 * a + i, tk, dx] = ((ws >> (8 * i)) & Uint32(0xFF)).to(Uint8)
-        kf[tk] = Float32(Uint32(1) << k)
+            if cutlass.const_expr(self.n == 16):
+                col = bytes4x4_t(ws, s1, s2)  # block 4a + tk % 4 of the group's 4 tokens
+                sSfT[4 * a + tk % 4, (tk // 4) ^ (8 * (tk % 4)), dx] = col
+            else:
+                for i in range(4):
+                    sSfT8[4 * a + i, tk, dx] = ((ws >> (8 * i)) & Uint32(0xFF)).to(Uint8)
+        kf[tk] = k.to(Uint8)
 
 
 @functools.lru_cache(maxsize=None)

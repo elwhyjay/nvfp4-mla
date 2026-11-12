@@ -1057,51 +1057,68 @@ z
 " style="stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
     </defs>
     <g clip-path="url(#p4dbf188ddd)">
-     <use xlink:href="#m8c69a1e747" x="501.390343" y="82.809807" style="fill: #d95926; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
+     <use xlink:href="#m8c69a1e747" x="501.390343" y="82.935184" style="fill: #d95926; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_31">
     <g id="patch_10">
-     <path d="M 411.114172 92.507307 
-L 494.140343 92.507307 
-L 494.140343 73.112307 
-L 411.114172 73.112307 
+     <path d="M 411.114172 92.632684 
+L 494.140343 92.632684 
+L 494.140343 73.237684 
+L 411.114172 73.237684 
 z
 " style="fill: #1a1a19"/>
     </g>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(411.864172 81.107307)">FlashInfer Cake (NVFP4)</text>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(475.136047 90.054807)">H=16</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(411.864172 81.232684)">FlashInfer Cake (NVFP4)</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(475.136047 90.180184)">H=16</text>
    </g>
    <g id="line2d_129">
     <g clip-path="url(#p4dbf188ddd)">
-     <use xlink:href="#m8c69a1e747" x="603.150622" y="35.938018" style="fill: #d95926; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
+     <use xlink:href="#m8c69a1e747" x="603.150622" y="35.345609" style="fill: #d95926; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_32">
     <g id="patch_11">
-     <path d="M 609.400622 45.635518 
-L 692.426794 45.635518 
-L 692.426794 26.240518 
-L 609.400622 26.240518 
+     <path d="M 609.400622 45.043109 
+L 692.426794 45.043109 
+L 692.426794 25.648109 
+L 609.400622 25.648109 
 z
 " style="fill: #1a1a19"/>
     </g>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(610.150622 34.235518)">FlashInfer Cake (NVFP4)</text>
-    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(610.150622 43.183018)">H=128</text>
-   </g>
-   <g id="text_33">
-    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(508.390343 93.295539)">tcgen05 v3</text>
-    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(508.390343 102.839539)">H=16, 62% of</text>
-    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(508.390343 112.383539)">DRAM roof</text>
-   </g>
-   <g id="text_34">
-    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(610.150622 73.904009)">tcgen05 v3</text>
-    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(610.150622 83.448009)">H=128</text>
-   </g>
-   <g id="text_35">
-    <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="389.247018" y="19.47" transform="rotate(-0 389.247018 19.47)">B200</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(610.150622 33.643109)">FlashInfer Cake (NVFP4)</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(610.150622 42.590609)">H=128</text>
    </g>
    <g id="line2d_130">
+    <g clip-path="url(#p4dbf188ddd)">
+     <use xlink:href="#mb589e91ddf" x="579.050621" y="34.619819" style="fill: #52514e; stroke: #1a1a19; stroke-width: 1.5; stroke-linejoin: miter"/>
+    </g>
+   </g>
+   <g id="text_33">
+    <g id="patch_12">
+     <path d="M 519.624449 44.317319 
+L 572.800621 44.317319 
+L 572.800621 24.922319 
+L 519.624449 24.922319 
+z
+" style="fill: #1a1a19"/>
+    </g>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(520.374449 32.917319)">trtllm-gen (FP8)</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #c3c2b7" transform="translate(549.626793 41.864819)">H=128</text>
+   </g>
+   <g id="text_34">
+    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(508.390343 91.624925)">tcgen05 v3</text>
+    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(508.390343 101.168925)">H=16, 65% of</text>
+    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(508.390343 110.712925)">DRAM roof</text>
+   </g>
+   <g id="text_35">
+    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(610.150622 74.050563)">tcgen05 v3</text>
+    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #f0efec" transform="translate(610.150622 83.594563)">H=128</text>
+   </g>
+   <g id="text_36">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #f0efec" x="389.247018" y="19.47" transform="rotate(-0 389.247018 19.47)">B200</text>
+   </g>
+   <g id="line2d_131">
     <path d="M 501.390343 226.420108 
 L 501.390343 183.647344 
 L 501.390343 157.448738 
@@ -1116,7 +1133,7 @@ L 501.390343 109.805699
      <use xlink:href="#mf79007d55c" x="501.390343" y="109.805699" style="fill: #3987e5; stroke: #1a1a19; stroke-width: 1.5"/>
     </g>
    </g>
-   <g id="line2d_131">
+   <g id="line2d_132">
     <path d="M 603.150622 217.832412 
 L 603.150622 141.344214 
 L 603.150622 121.18488 
@@ -1131,7 +1148,7 @@ L 603.150622 108.676554
      <use xlink:href="#mf79007d55c" x="603.150622" y="108.676554" style="fill: #3987e5; stroke: #1a1a19; stroke-width: 1.5"/>
     </g>
    </g>
-   <g id="line2d_132">
+   <g id="line2d_133">
     <defs>
      <path id="mfd8bd0aebe" d="M 0 3 
 C 0.795609 3 1.55874 2.683901 2.12132 2.12132 
@@ -1146,16 +1163,16 @@ z
 " style="stroke: #1a1a19; stroke-width: 1.5"/>
     </defs>
     <g clip-path="url(#p4dbf188ddd)">
-     <use xlink:href="#mfd8bd0aebe" x="501.390343" y="83.567539" style="fill: #c98500; stroke: #1a1a19; stroke-width: 1.5"/>
+     <use xlink:href="#mfd8bd0aebe" x="501.390343" y="81.896925" style="fill: #c98500; stroke: #1a1a19; stroke-width: 1.5"/>
     </g>
    </g>
-   <g id="line2d_133">
+   <g id="line2d_134">
     <g clip-path="url(#p4dbf188ddd)">
-     <use xlink:href="#mfd8bd0aebe" x="603.150622" y="64.176009" style="fill: #c98500; stroke: #1a1a19; stroke-width: 1.5"/>
+     <use xlink:href="#mfd8bd0aebe" x="603.150622" y="64.322563" style="fill: #c98500; stroke: #1a1a19; stroke-width: 1.5"/>
     </g>
    </g>
   </g>
-  <g id="text_36">
+  <g id="text_37">
    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #898781" transform="translate(7.2 318.344)">Batch 64, 64K tokens, q_len 1. Compute roofs are this kernel's mma.sync: BF16 for v1-v5, E4M3 for the FP8 path (v6-v11).</text>
    <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #898781" transform="translate(7.2 327.888)">tcgen05 kernels (trtllm-gen, Cake, this kernel's SM100 path) have higher roofs, not drawn.</text>
   </g>

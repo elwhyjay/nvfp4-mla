@@ -194,6 +194,7 @@ def comparison(t, gpu):
 LABEL_AT = {("RTX PRO 6000", "triton:fp8", 16): (-9, -2, "right", "top"),
             ("RTX PRO 6000", "trtllm:fp8", 128): (6, 4, "left", "bottom"),
             ("B200", "cake", 16): (-8, 0, "right", "center"),
+            ("B200", "trtllm:fp8", 128): (-7, 0, "right", "center"),
             ("B200", "nvfp4", 16): (-8, 0, "right", "center"),
             ("B200", "nvfp4-tc", 16): (7, -2, "left", "top"),
             ("B200", "nvfp4-tc", 128): (7, -2, "left", "top"),
