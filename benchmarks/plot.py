@@ -30,9 +30,10 @@ TICKS = {"v1": "v1\nCUDA\ncores", "v2": "v2\nmma.sync", "v3": "v3\ncp.async", "v
 OURS = ("nvfp4", "nvfp4-fp8", "nvfp4-tc")
 COLOR = {"nvfp4": 0, "cake": 1, "nvfp4-fp8": 2, "nvfp4-tc": 3}  # categorical slot per provider, the same in every chart
 # SM100 tcgen05 (CuTe DSL) versions the current code still builds; v2-v2.2 are in the optimization log only
-TC_VERSIONS = ["tc-v0", "tc-v1a", "tc-v1b", "tc-v2.3", "tc-v2.4"]
+TC_VERSIONS = ["tc-v0", "tc-v1a", "tc-v1b", "tc-v2.3", "tc-v2.4", "tc-v3.1", "tc-v3.2"]
 TC_TICKS = {"tc-v0": "v0\nFP16 tile\nin smem", "tc-v1a": "v1a'\nFP4 QK\n(mxf4nvf4)", "tc-v1b": "v1b\nV into\nTMEM",
-            "tc-v2.3": "v2.3\nwarp\nroles", "tc-v2.4": "v2.4\nTMA, 8\nconvert warps"}
+            "tc-v2.3": "v2.3\nwarp\nroles", "tc-v2.4": "v2.4\nTMA, 8\nconvert warps",
+            "tc-v3.1": "v3.1\nQMUL4 V,\nmax by vote", "tc-v3.2": "v3.2\n32 heads\nper CTA"}
 TABLE_ONLY = ("nvfp4+fa2", "nvfp4-fp4q")  # in the README tables, not in the bar charts
 CONFIGS = [(16, 64, 65536), (16, 1, 65536), (128, 64, 65536), (128, 1, 65536)]
 
@@ -130,7 +131,7 @@ def sm100(t):
     """B200, the tcgen05 kernel version by version, with Cake on the same shapes."""
     rows = load(RES / "versions.csv")
     cake = {(r["heads"], r["batch"], r["s_kv"]): r["ms"] for r in load(RES / "b200.csv") if r["provider"] == "cake"}
-    fig, ax = plt.subplots(figsize=(8.2, 4.6))
+    fig, ax = plt.subplots(figsize=(9.6, 4.6))
     style(ax, t)
     n = len(TC_VERSIONS)
     for i, (h, b, s) in enumerate(CONFIGS[:3]):
@@ -193,7 +194,7 @@ LABEL_AT = {("RTX PRO 6000", "triton:fp8", 16): (-9, -2, "right", "top"),
             ("B200", "cake", 16): (-8, 0, "right", "center"),
             ("B200", "nvfp4", 16): (-8, 0, "right", "center"),
             ("B200", "nvfp4-tc", 16): (7, -2, "left", "top"),
-            ("B200", "nvfp4-tc", 128): (7, 2, "left", "bottom"),
+            ("B200", "nvfp4-tc", 128): (7, -2, "left", "top"),
             ("RTX PRO 6000", "nvfp4", 128): (8, -6, "left", "top")}
 
 
@@ -252,7 +253,7 @@ def roofline(t):
                     zorder=4)
             dram = f", {100 * y / (g['bw'] * x / 1e3):.0f}% of\nDRAM roof" if r["heads"] == 16 else ""
             dx, dy, ha, va = LABEL_AT.get((gpu, "nvfp4-tc", r["heads"]), (7, 0, "left", "center"))
-            ax.annotate(f"tcgen05 v2.4\nH={r['heads']}{dram}", (x, y), xytext=(dx, dy), textcoords="offset points",
+            ax.annotate(f"tcgen05 v3\nH={r['heads']}{dram}", (x, y), xytext=(dx, dy), textcoords="offset points",
                         ha=ha, va=va, color=t["ink"], fontsize=8)
         ax.set_xlim(10, xs[-1])
         ax.set_ylim(1, 3000)

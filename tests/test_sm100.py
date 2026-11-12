@@ -25,26 +25,48 @@ CASES = [  # (kv_lens, page_size, heads, num_splits)
 ]
 
 
+def check(c, out, page_size, unquantized=True):
+    """The default path is v3 from page size 16 on: V and P in E4M3, so against the dequantized cache only to that
+    rounding, and against the unquantized KV within 3% of the CUDA kernel's BF16 mode. v2.4 below that: exact V."""
+    err = rel_l2(out, c.reference())
+    assert not out.isnan().any()
+    if page_size < 16:
+        assert err < 3e-3
+        return err
+    assert err < 0.04
+    if unquantized:
+        ref16 = c.reference_bf16()
+        assert rel_l2(out, ref16) <= 1.03 * rel_l2(nvfp4_mla.decode(*c.args()), ref16)
+    return err
+
+
 @pytest.mark.parametrize("kv_lens,page_size,heads,splits", CASES)
 @pytest.mark.parametrize("scales", [(0.5, 2.0), CALIBRATED])
 def test_decode(kv_lens, page_size, heads, splits, scales):
     c = RandomCache(kv_lens, page_size, heads, *scales)
-    out = sm100.decode(*c.args(), num_splits=splits)
-    err = rel_l2(out, c.reference())
+    err = check(c, sm100.decode(*c.args(), num_splits=splits), page_size)
     print(f"{kv_lens} ps={page_size} H={heads}: rel-L2 vs dequantized {err:.2e}")
+
+
+@pytest.mark.parametrize("kv_lens,page_size,heads,splits", [c for c in CASES if c[1] >= 16])
+@pytest.mark.parametrize("scales", [(0.5, 2.0), CALIBRATED])
+def test_v2(kv_lens, page_size, heads, splits, scales):
+    """v2.4 (DecodeV2) where v3 is the default: exact V, so close to the dequantized cache."""
+    c = RandomCache(kv_lens, page_size, heads, *scales)
+    out = sm100.decode(*c.args(), num_splits=splits, version=3)
     assert not out.isnan().any()
-    assert err < 3e-3
+    assert rel_l2(out, c.reference()) < 3e-3
 
 
 @pytest.mark.parametrize("page_size", [1, 16, 64, 128])
 def test_lengths(page_size):
-    """Every length around the 128-token tile and the 4-stage ring, two requests per call."""
+    """Every length around the 128-token tile and the stage ring, two requests per call (the tiling, so against
+    the dequantized cache only)."""
     worst = 0.0
     for L in (1, 2, 63, 64, 65, 127, 128, 129, 255, 300, 513):
         c = RandomCache([L, 3 * L + 5], page_size, 16, seed=L)
-        worst = max(worst, rel_l2(sm100.decode(*c.args()), c.reference()))
+        worst = max(worst, check(c, sm100.decode(*c.args()), page_size, unquantized=False))
     print(f"ps={page_size}: worst rel-L2 vs dequantized {worst:.2e}")
-    assert worst < 3e-3
 
 
 @pytest.mark.parametrize("scales", [(1.0, 1.0), CALIBRATED])
@@ -58,22 +80,3 @@ def test_against_unquantized(heads, scales):
     e_cuda = rel_l2(nvfp4_mla.decode(*c.args()), ref)
     print(f"H={heads} scales={scales}: vs unquantized sm100 {e_tc:.4f}, CUDA bf16 mode {e_cuda:.4f}")
     assert e_tc <= 1.03 * e_cuda
-
-
-V3_CASES = [c for c in CASES if c[1] >= 16] + [([1, 2, 63, 64, 65, 127, 128, 129, 255, 300, 513], 16, 16, 1)]
-
-
-@pytest.mark.parametrize("kv_lens,page_size,heads,splits", V3_CASES)
-@pytest.mark.parametrize("scales", [(0.5, 2.0), CALIBRATED])
-def test_v3(kv_lens, page_size, heads, splits, scales):
-    """DecodeV3 rounds V and P to E4M3: against the dequantized cache only to that rounding, against the unquantized
-    KV within 3% of the CUDA kernel's BF16 mode."""
-    c = RandomCache(kv_lens, page_size, heads, *scales)
-    out = sm100.decode(*c.args(), num_splits=splits, version=4)
-    ref16 = c.reference_bf16()
-    e, e16 = rel_l2(out, c.reference()), rel_l2(out, ref16)
-    e_cuda = rel_l2(nvfp4_mla.decode(*c.args()), ref16)
-    print(f"{str(kv_lens)[:20]} ps={page_size} H={heads}: vs dequantized {e:.4f}, vs unquantized x{e16 / e_cuda:.3f}")
-    assert not out.isnan().any()
-    assert e < 0.04
-    assert e16 <= 1.03 * e_cuda

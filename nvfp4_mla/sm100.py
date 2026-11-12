@@ -8,7 +8,12 @@ v1a: the same structure, but QK reads the cache as stored: the latent part is bl
 (kind::mxf4nvf4, the cache's block scales as SFA) against the query written as 4 NVFP4 terms with one shared scale per
 head (query_terms in the extension), stacked along N so K is read once; the RoPE part FP16 (kpe converted exactly)
 into a second accumulator.
-v1b (default): as v1a, but V is converted from the raw tile straight into TMEM as the A operand of PV.
+v1b: as v1a, but V is converted from the raw tile straight into TMEM as the A operand of PV.
+v2 (DecodeV2): v1b's data path with each step in its own warps, so consecutive tiles overlap; the default for page
+sizes under 16.
+v3 (DecodeV3, the default for page sizes of 16 and more): v2.4's roles with V converted by QMUL4 to E4M3, RoPE
+accumulated into the latent score, the tile maxima exchanged only when a score grows, and 32 heads per CTA when the
+head count allows.
 """
 import functools
 import math
@@ -1625,12 +1630,17 @@ class DecodeV3(DecodeV2):
 
     v3.1b: the softmax exchanges the tile maxima only when a score passes its head's running maximum by 2^5, which
     one barrier with an OR reduction tells all four warps; on the other tiles P uses the running maximum as it is.
+
+    v3.2: 32 heads per CTA (n = 32) when the head count allows, so the cache is read and converted once per 32 heads.
     """
 
     def __init__(self, n: int, page_size: int, terms: int, stub: str = ""):
-        if n != 16 or page_size < 16:
-            raise ValueError("v3 runs 16 heads per CTA and needs page size >= 16 (TMA)")
-        super().__init__(n, page_size, terms, "lazy,rope8,tma,cvt8,vhalf,v8", stub)
+        if n not in (16, 32) or page_size < 16:
+            raise ValueError("v3 runs 16 or 32 heads per CTA and needs page size >= 16 (TMA)")
+        # 32 heads (v3.2): 3 raw stages for shared memory, DecodeV2's h32 registers
+        super().__init__(n, page_size, terms, "lazy,rope8,tma,cvt8,vhalf,v8" + (",st3,h32" if n == 32 else ""), stub)
+        if n == 16:  # the scale warps set the period at 16 heads and run short of registers at 80
+            self.regs = {0: 128, 1: 128, 2: 152, 3: 104}
 
     @cute.jit
     def __call__(self, q4: cute.Tensor, qsf: cute.Tensor, qg: cute.Tensor, qpe8: cute.Tensor, qpe_e: cute.Tensor,
@@ -1784,7 +1794,7 @@ class DecodeV3(DecodeV2):
         sSfT8 = cute.make_tensor(cute.recast_ptr(sSfT.iterator, dtype=Uint8),
                                  cute.make_layout((CKV // 16, TILE, nd), stride=(TILE, 1, 4096)))
         sSfR = smem.allocate_tensor(Uint32, cute.make_layout((nst, TILE, 8), stride=(TILE * 8, 8, 1)), 16)
-        sKf = smem.allocate_tensor(Float32, cute.make_layout((nst, TILE), stride=(TILE, 1)), 16)  # 2^k per token
+        sKf = smem.allocate_tensor(Float32, cute.make_layout((4, TILE), stride=(TILE, 1)), 16)  # 2^k per token
         sMx = smem.allocate_tensor(Float32, cute.make_layout((2, 4, n), stride=(4 * n, n, 1)), 16)
         sL = smem.allocate_tensor(Float32, cute.make_layout((4, n), stride=(n, 1)), 16)
         sG = smem.allocate_tensor(Float32, cute.make_layout(n), 16)
@@ -1862,6 +1872,8 @@ class DecodeV3(DecodeV2):
               sSFB, sSFApe, sSFBpe, sG, wt)
 
         if role <= 1:
+            if cutlass.const_expr(self.regs[1] < 128):
+                cute.arch.setmaxregister_decrease(self.regs[1])
             # ---- convert: V^T of the tile into TMEM; warpgroup r converts chunks dm = 2 r, 2 r + 1 (quadrant lw)
             tmem_v = Uint32(tmem_ptr.toint()) + Uint32(self.vbase)
             k4_base = Uint32(sK4.iterator.toint())
@@ -1901,7 +1913,7 @@ class DecodeV3(DecodeV2):
         if warp >= 14:
             # ---- scale layouts (two tokens per thread) once a tile has landed. Before writing those of tile j, tile
             # j - nd is released (the last reader of the derived buffers). That comes after QK(j - nd), so after the
-            # softmax published P(j - nd - 2) and read 2^k from the slot tile j reuses (one slot per stage).
+            # softmax published P(j - nd - 2) and read 2^k from the slot tile j reuses (4 slots).
             tl = tidx - 448
             st_done = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, nst)
             for j in cutlass.range(n_tiles):
@@ -1913,7 +1925,8 @@ class DecodeV3(DecodeV2):
                     cute.arch.mbarrier_wait(stg.kvc.data_ptr() + nst + sp, ph)
                 for q in cutlass.range_constexpr(2):
                     tk = tl + 64 * q
-                    self.scale_layouts(sSfR, sfa_w, sSfT8, sKf, sx, j % nd, tk, t_beg + j * TILE + tk, t_end)
+                    self.scale_layouts(sSfR, sfa_w, sSfT8, sKf[j % 4, None], sx, j % nd, tk, t_beg + j * TILE + tk,
+                                       t_end)
                 cute.arch.fence_view_async_shared()
                 kvm.producer_commit(st_done)
                 kvc.producer_commit(st_done)
@@ -1973,7 +1986,8 @@ class DecodeV3(DecodeV2):
             ld_s, st_o, tStSn, tSsP, tStO, tOtO = v["ld_s"], v["st_o"], v["tStSn"], v["tSsP"], v["tStO"], v["tOtO"]
             tScS, frag = v["tScS"], v["frag"]
             g_head = cute.make_rmem_tensor(frag, Float32)
-            cute.autovec_copy(v["tSsG"], g_head)
+            if cutlass.const_expr(not self.h32):  # with 32 heads they are read from shared memory each tile
+                cute.autovec_copy(v["tSsG"], g_head)
             m_prev = cute.make_rmem_tensor(frag, Float32)
             m_prev.fill(-Float32.inf)
             l_acc = cute.make_rmem_tensor(frag, Float32)
@@ -1991,7 +2005,10 @@ class DecodeV3(DecodeV2):
                 cute.arch.fence_view_async_tmem_load()
                 hs.release()
                 for i in cutlass.range_constexpr(n):
-                    sS[i] = sS[i] * g_head[i]
+                    if cutlass.const_expr(self.h32):
+                        sS[i] = sS[i] * sG[tScS[i][1]]
+                    else:
+                        sS[i] = sS[i] * g_head[i]
                 if t_beg + it * TILE + row >= t_end:
                     sS.fill(-Float32.inf)
                 # A head's maximum moves only when a score passes it by 2^5 (log2). Each thread tests its own scores
@@ -2039,7 +2056,7 @@ class DecodeV3(DecodeV2):
                     self.rescale(ld_s, st_o, tStO, tOtO, corr, frag)
                 # the scale warps' arrival on the stage's full barrier orders their 2^k store before this load
                 cute.arch.mbarrier_wait(stg.kvc.data_ptr() + it % nst, (it // nst) % 2)
-                kf = sKf[it % nst, row]
+                kf = sKf[it % 4, row]
                 for i in cutlass.range_constexpr(n):
                     pf[i] = pf[i] * kf
                 p8 = cute.make_rmem_tensor(frag, Float8E4M3FN)
@@ -2062,22 +2079,36 @@ class DecodeV3(DecodeV2):
             if lane < n:
                 sL[lw, lane] = l_lane
             softmax_bar.arrive_and_wait()
-            for dm in cutlass.range_constexpr(4):
-                o = cute.make_rmem_tensor(frag, Float32)
-                if n_tiles > 0:
-                    cute.copy(ld_s, tStO[None, None, None, None, dm], o)
-                for i in cutlass.range_constexpr(n):
-                    head = tScS[i][1]
-                    l = sL[0, head] + sL[1, head] + sL[2, head] + sL[3, head]
-                    val = Float32(0.0)
-                    if l > 0.0:
-                        val = o[i] * (out_scale / l)
-                    lrow = tScS[i][0]
-                    ch = dm * TILE + ((lrow & 0x70) | ((lrow & 7) << 1) | ((lrow >> 3) & 1))
-                    if splits == 1:
-                        mOut[b, h0 + head, ch] = val.to(BFloat16)
-                    else:
-                        mOpart[z, b, h0 + head, ch] = val
+            # The output scale per head once, and the n heads' rows as one static (n, 512) view: per element only
+            # a multiply and a store (indexing the full tensors per element cost about 50 instructions each).
+            inv = cute.make_rmem_tensor(frag, Float32)
+            for i in cutlass.range_constexpr(n):
+                hd = tScS[i][1]
+                l = sL[0, hd] + sL[1, hd] + sL[2, hd] + sL[3, hd]
+                inv[i] = Float32(0.0)
+                if l > 0.0:
+                    inv[i] = out_scale / l
+            lrow = tScS[0][0]
+            ch = (lrow & 0x70) | ((lrow & 7) << 1) | ((lrow >> 3) & 1)  # TMEM lane -> channel (see the conversion)
+            rows = cute.make_layout((n, CKV), stride=(CKV, 1))
+            nh = mOut.shape[1]
+            o = cute.make_rmem_tensor(frag, Float32)
+            if splits == 1:
+                gO = cute.make_tensor(mOut.iterator + Int64(b * nh + h0) * CKV, rows)
+                for dm in cutlass.range_constexpr(4):
+                    o.fill(0.0)
+                    if n_tiles > 0:
+                        cute.copy(ld_s, tStO[None, None, None, None, dm], o)
+                    for i in cutlass.range_constexpr(n):
+                        gO[tScS[i][1], dm * TILE + ch] = (o[i] * inv[i]).to(BFloat16)
+            else:
+                gO = cute.make_tensor(mOpart.iterator + Int64((z * mOpart.shape[1] + b) * nh + h0) * CKV, rows)
+                for dm in cutlass.range_constexpr(4):
+                    o.fill(0.0)
+                    if n_tiles > 0:
+                        cute.copy(ld_s, tStO[None, None, None, None, dm], o)
+                    for i in cutlass.range_constexpr(n):
+                        gO[tScS[i][1], dm * TILE + ch] = o[i] * inv[i]
             if splits > 1 and lw == 0 and lane < n:
                 l = sL[0, lane] + sL[1, lane] + sL[2, lane] + sL[3, lane]
                 lse = -Float32.inf
@@ -2089,9 +2120,9 @@ class DecodeV3(DecodeV2):
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
-    def scale_layouts(self, sSfR, sfa_w, sSfT8, sKf, sx, dx, tk, tok, t_end):
+    def scale_layouts(self, sSfR, sfa_w, sSfT8, kf, sx, dx, tk, tok, t_end):
         """Scales of token tk of the tile in stage sx -> buffer dx: SFA words as stored (QK), block-major bytes x 2^-k
-        (V) and 2^k (P). Rows past the end get scales 0, so V is exactly 0 there."""
+        (V) and 2^k (P, into kf). Rows past the end get scales 0, so V is exactly 0 there."""
         msk = Uint32(~((t_end - 1 - tok) >> 31))
         base = Uint32(sSfR.iterator.toint()) + Uint32((sx * TILE + tk) * 32)
         w = lds_v4(base) + lds_v4(base + Uint32(16))
@@ -2113,7 +2144,7 @@ class DecodeV3(DecodeV2):
             ws = e4m3x4_mul(w[a], f2)
             for i in range(4):
                 sSfT8[4 * a + i, tk, dx] = ((ws >> (8 * i)) & Uint32(0xFF)).to(Uint8)
-        sKf[sx, tk] = Float32(Uint32(1) << k)
+        kf[tk] = Float32(Uint32(1) << k)
 
 
 @functools.lru_cache(maxsize=None)
@@ -2194,15 +2225,19 @@ def default_feat(page_size: int) -> str:
 
 
 def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale, ckv_scale=1.0,
-           kpe_scale=1.0, max_kv_len=None, num_splits=0, version=3, heads_per_cta=None, terms=None,
+           kpe_scale=1.0, max_kv_len=None, num_splits=0, version=None, heads_per_cta=None, terms=None,
            feat=None):
-    """Same contract as nvfp4_mla.decode (BF16-or-better accuracy); SM100 only.
+    """Same contract as nvfp4_mla.decode; SM100 only. v3 rounds V and P to E4M3, which adds 1-3% to the error against
+    the unquantized KV (the CUDA kernel's BF16 mode: 0-1%).
 
-    version: 0 (v0), 1 (v1a'), 2 (v1b), 3 (v2, warp-specialized), 4 (v3, page size >= 16).
+    version: 0 (v0), 1 (v1a'), 2 (v1b), 3 (v2), 4 (v3, page size >= 16). Default: 4, or 3 for page sizes under 16 or
+    when feat (DecodeV2 options) is given.
     terms: NVFP4 terms of the query, 3 for v3 and 4 before it by default."""
     from . import _load
 
     B, H = q_nope.shape[:2]
+    if version is None:
+        version = 4 if ckv_cache.shape[1] >= 16 and feat is None else 3
     terms = terms or (3 if version == 4 else 4)
     if H % 16:
         raise ValueError(f"heads must be a multiple of 16, got {H}")
@@ -2212,9 +2247,12 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
     if h32 and H % 32:
         raise ValueError(f"h32 needs a multiple of 32 heads, got {H}")
     # v1a keeps v0's FP16 V tile in shared memory and v1b keeps V in TMEM: both leave room for 16 heads per CTA only;
-    # v2 with E4M3 V (v8) has room for 32 (h32)
-    n = heads_per_cta or (32 if (version == 0 and H % 32 == 0) or h32 else 16)
+    # v2 with E4M3 V (v8) has room for 32 (h32), which v3 uses whenever the head count allows
     max_len = max(int(kv_lens.max()) if max_kv_len is None else int(max_kv_len), 1)
+    # ponytail: v3 measured on B200 (H=128): 32 heads per CTA win from about 32K tokens in the batch, below that the
+    # 16-head kernel's lower fixed cost and twice the CTAs win
+    v3_32 = version == 4 and H % 32 == 0 and B * max_len >= 32768
+    n = heads_per_cta or (32 if (version == 0 and H % 32 == 0) or h32 or v3_32 else 16)
     tiles = -(-max_len // TILE)
     if num_splits <= 0:  # ponytail: one wave of one CTA per SM; v0 has no tuned split policy
         sms = torch.cuda.get_device_properties(q_nope.device).multi_processor_count

@@ -14,8 +14,8 @@ There are two kernels, both written from scratch: a CUDA kernel (`mma.sync`, `cp
 Status: dense decode, one query token per request (see [Roadmap](#roadmap)). How both kernels were built, step by
 step with the hypothesis, the profile and the result of each change (including the ones that did not work): the CUDA
 kernel from a CUDA-core version to 85% of DRAM bandwidth and an FP8 mode for compute-bound shapes, and the SM100
-kernel from a serial `tcgen05` version to TMA and warp specialization:
-[docs/optimization-log.md](docs/optimization-log.md).
+kernel from a serial `tcgen05` version through warp specialization to V converted by `QMUL4`, within 3% of FlashInfer
+Cake at 16 heads, batch 64 and 64K tokens: [docs/optimization-log.md](docs/optimization-log.md).
 
 ## Why
 
@@ -29,9 +29,10 @@ FlashInfer can write an MLA KV cache in NVFP4 (#4676). Who can read it back for 
   BF16 before attention. TensorRT-LLM's `fp4_mla` (FP4 query, KV and P, its own cache layout) is validated on SM100
   and SM107 only.
 - **SM100:** FlashInfer v0.7.3 added `cake_mla_nvfp4_paged_decode` (experimental, needs CUDA 13.4), which reads
-  this cache with `tcgen05` MMA and an NVFP4 query. It is still faster than this repository's SM100 kernel on B200
-  (1.4x at 16 heads, batch 64 and 64K tokens; more with 128 heads; see [Performance](#performance)). An open vLLM
-  PR ([#63203](https://github.com/vllm-project/vllm/pull/63203)) uses it for `--kv-cache-dtype nvfp4` on dense MLA
+  this cache with `tcgen05` MMA and an NVFP4 query. On B200 it is 1.03x faster than this repository's SM100 kernel at
+  16 heads, batch 64 and 64K tokens, 1.2-1.9x at smaller shapes and up to 2.9x with 128 heads (see
+  [Performance](#performance)), with 1.4-1.7x the error against the unquantized KV (see [Accuracy](#accuracy)). An
+  open vLLM PR ([#63203](https://github.com/vllm-project/vllm/pull/63203)) uses it for `--kv-cache-dtype nvfp4` on dense MLA
   models.
 - FlashInfer's generic MLA decode (`trtllm_batch_decode_with_kv_cache_mla`) still raises for this cache.
 
@@ -104,9 +105,11 @@ out = sm100.decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table,
                    sm_scale, ckv_scale, kpe_scale, max_kv_len=max_context_len)
 ```
 
-On B200 it is faster than `nvfp4_mla.decode` from about 16 requests x 16K tokens (up to 1.6x with 16 heads and
-1.8x with 128 heads). Below that, its fixed cost of about 40 µs per call makes it slower (see
-[Performance](#performance)). The first call for each page size compiles it with CuTe DSL.
+On B200 it is faster than `nvfp4_mla.decode` in the larger shapes (7 of 16 at 16 heads, up to 2.3x; 12 of 16 at 128
+heads, up to 4.2x); with small batches and short contexts the CUDA kernel's lower fixed cost wins (see
+[Performance](#performance)). It rounds V and P to E4M3, which adds 1-2% to the error against the unquantized KV
+(see [Accuracy](#accuracy)); `version=3` selects the previous version (v2.4, exact V), which page sizes under 16 use
+anyway. The first call for each page size and head grouping compiles it with CuTe DSL.
 
 `page_table` is the same block table as `block_tables` in FlashInfer's `MLAPlanMetadata.dense`.
 `nvfp4_mla.dequantize(ckv_cache, ckv_sf_cache, kpe_cache, ckv_scale, kpe_scale)` returns the cache in BF16 or FP32,
@@ -127,19 +130,22 @@ scales reach the E4M3 maximum); `benchmarks/accuracy.py` on RTX PRO 6000 and B20
 | CUDA kernel, `precision="bf16"` (default) | 0.078-0.126 | 1.00 |
 | CUDA kernel, `precision="fp8"` (E4M3 Q, K, V, P) | 0.085-0.136 | 1.07-1.11 |
 | CUDA kernel, `precision="fp4-qk"` (NVFP4 query, SM120) | 0.13-0.17 | 1.36-1.70 |
-| SM100 kernel (`nvfp4_mla.sm100`) | 0.078-0.123 | 1.00 |
+| SM100 kernel (`nvfp4_mla.sm100`, default) | 0.079-0.125 | 1.01-1.02 |
+| SM100 kernel, `version=3` (v2.4) | 0.078-0.123 | 1.00 |
 | FlashInfer Cake (NVFP4 query, SM100) | 0.13-0.17 | 1.38-1.71 |
 
 - Most of it is the format: NVFP4 KV alone costs 0.08-0.12 (cosine about 0.995); FP8 KV with an FP8 query (Triton
   FP8, XQA) has cosine 0.998 against BF16.
 - The SM100 kernel's QK runs on the cache's FP4 bytes with block-scaled FP4 MMA, but the BF16 query is not rounded
-  to one NVFP4 value: it is a sum of 4 NVFP4 terms with one shared scale per head (rest 5.5e-5), and the RoPE part 3
-  E4M3 terms (rest 1.2e-5). Cake rounds the query to one NVFP4 value, hence its 1.4-1.7x.
+  to one NVFP4 value: it is a sum of 3 NVFP4 terms with one shared scale per head (4 in v2.4), and the RoPE part 3
+  E4M3 terms. Its V and P are rounded to E4M3, with a power of two per token that keeps every value in range: that is
+  its 1-2%. Cake rounds the query to one NVFP4 value, hence its 1.4-1.7x.
 - Until 2026-11-11 the `fp8` and `fp4-qk` modes saturated with a calibrated global scale: they round
   e2m1 x block scale (up to 2688) to E4M3 (up to 448), and their error was 0.62-0.69. They now round the value / 8 and
   undo the 8 in the score scale and the output; the tests run both scales.
 - Kernel correctness, against attention over the dequantized cache: relative L2 at most 1.9e-3 (the CUDA kernel's
-  BF16 mode; rounding of the output and P to BF16) and 1.7e-3 (the SM100 kernel). The in-kernel dequantization is
+  BF16 mode; rounding of the output and P to BF16) and 1.7e-3 (the SM100 kernel's v2.4; its default, with V and P in
+  E4M3, 0.014-0.03). The in-kernel dequantization is
   bitwise equal to the PyTorch reference, also with `--use_fast_math`.
   [`benchmarks/precision.py`](benchmarks/precision.py) simulates the precision options on the CPU.
 
@@ -182,13 +188,13 @@ knob, the KV split count, set to the fastest of its candidates for each shape); 
 
 | heads | batch x kv_len | nvfp4 CUDA | nvfp4 tcgen05 | Cake NVFP4 | trtllm-gen FP8 | trtllm-gen BF16 | fa2 BF16 | Triton FP8 |
 |---|---|---|---|---|---|---|---|---|
-| 16 | 1 x 4K | **0.012** | 0.037 | 0.013 | **0.012** | 0.016 | 0.025 | 0.049 |
-| 16 | 1 x 64K | 0.030 | 0.049 | **0.021** | 0.031 | 0.044 | 0.079 | 0.111 |
-| 16 | 16 x 64K | 0.202 | 0.130 | **0.087** | 0.116 | 0.238 | 0.560 | 0.532 |
-| 16 | 64 x 64K | 0.748 | 0.456 | **0.320** | 0.385 | 0.844 | 2.487 | 1.907 |
-| 128 | 1 x 64K | 0.105 | 0.082 | **0.034** | 0.037 | 0.045 | 0.097 | 0.295 |
-| 128 | 16 x 64K | 1.512 | 0.851 | 0.301 | **0.149** | 0.253 | 1.515 | 3.515 |
-| 128 | 64 x 64K | 5.875 | 3.383 | **0.541** | 0.566 | 1.002 | 5.058 | 14.53 |
+| 16 | 1 x 4K | **0.012** | 0.020 | **0.012** | 0.013 | 0.016 | 0.025 | 0.049 |
+| 16 | 1 x 64K | 0.030 | 0.028 | **0.022** | 0.031 | 0.044 | 0.079 | 0.111 |
+| 16 | 16 x 64K | 0.202 | 0.101 | **0.088** | 0.112 | 0.239 | 0.560 | 0.523 |
+| 16 | 64 x 64K | 0.765 | 0.327 | **0.319** | 0.386 | 0.840 | 2.490 | 1.906 |
+| 128 | 1 x 64K | 0.104 | 0.046 | **0.032** | 0.036 | 0.046 | 0.097 | 0.293 |
+| 128 | 16 x 64K | 1.511 | 0.382 | 0.305 | **0.149** | 0.256 | 1.510 | 3.513 |
+| 128 | 64 x 64K | 5.875 | 1.384 | **0.549** | 0.578 | 1.001 | 5.010 | 14.52 |
 
 How to read these numbers:
 
@@ -207,16 +213,19 @@ How to read these numbers:
   ([optimization log](docs/optimization-log.md#e3-and-e4-results-sm120-stops-at-v11c)).
 - **FlashInfer b12x** (SM12x dense MLA, FP8 KV): correct (cosine 0.9986-0.9988 against fa2), but in this setup
   slower than this kernel at 16 heads (1.2-2.5x) and, at 128 heads, up to 7.9x slower than XQA.
-- **B200, 16 heads**: FlashInfer Cake is the fastest in 11 of the 16 shapes. The SM100 kernel is 1.4x slower than
-  Cake at 64 x 64K (it reads 3.2 TB/s, 44% of the achievable 7.3 TB/s; Cake 63%) and 1.5x slower at 16 x 64K. It is
-  faster than the CUDA kernel from 16 x 16K tokens (up to 1.6x) and than trtllm-gen BF16 in the same shapes (up to
-  1.85x). Below that it is the slower of the two kernels: a call costs at least about 40 µs with a cold L2 (24 µs
-  warm: 18 µs for one tile through the kernel's start, pipeline and end, 7 µs for three small kernels that split the
-  query and merge the KV splits). The CUDA kernel is the fastest of all at batch 1-4 with 1K tokens and at batch 1
-  with 4K.
-- **B200, 128 heads**: Cake is 1.5-6.3x and trtllm-gen FP8 2.1-7.3x faster than the SM100 kernel. One CTA of it
-  handles 16 heads, so the cache is read 8 times per request; this is the next structural change (see
-  [Roadmap](#roadmap)). It is faster than the CUDA kernel in 9 of the 16 shapes (up to 1.8x).
+- **B200, 16 heads**: FlashInfer Cake is the fastest in 11 of the 16 shapes. The SM100 kernel is within 3% of it at
+  64 x 64K (it reads 4.5 TB/s, 62% of the achievable 7.3 TB/s; Cake 63%), 1.16x slower at 16 x 64K and 1.2-1.3x at
+  16K-64K tokens with smaller batches. With short contexts it is 1.5-1.9x slower: a call costs 18-23 µs with a cold
+  L2, about 8 µs of it in three small kernels that split the query and merge the KV splits (Cake's query quantization
+  runs once outside its timed call, this kernel's query split inside). There the CUDA kernel is
+  the fastest of all (batch 1-4 with 1K tokens, batch 1 with 4K). The SM100 kernel is faster than trtllm-gen FP8 at
+  64K tokens and from 16 x 16K (up to 1.18x) and than the CUDA kernel in the 7 largest shapes (up to 2.3x).
+- **B200, 128 heads**: trtllm-gen FP8 is the fastest in 14 of the 16 shapes, 1.2-3.1x faster than the SM100 kernel.
+  Against Cake the SM100 kernel is faster or equal at batch 1 with 1K-4K tokens and at 16 x 1K, 1.1-1.5x slower up to
+  batch 16 and 2.5-2.9x slower at batch 64: Cake's kernel for more than 48 heads runs all 128 heads of a request in
+  one cluster of two CTAs and reads the cache once per request, this kernel once per 32 heads (see
+  [SM100 kernel and FlashInfer Cake](#sm100-kernel-and-flashinfer-cake)). It is faster than the CUDA kernel in 12 of
+  the 16 shapes (up to 4.2x).
 - Cake's query is NVFP4, so its error against the BF16 cache is 1.4-1.7x higher (see [Accuracy](#accuracy)).
 - The CUDA kernel's FP8 mode does not help on B200 (1.5-1.7x slower than its default at 64 x 64K in an earlier run).
 
@@ -237,7 +246,7 @@ layouts (v11c). Each step, the hypothesis and the profile behind it, and the ste
 The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof. At 128
 heads the FP8 mode reaches 45% of the E4M3 `mma.sync` roof on RTX PRO 6000; there no unit is saturated (issue slots
 39%, tensor pipe 49%): the kernel is bound by the latency of each warp's serial chain. On B200 the SM100 kernel
-(v2.4) sits above the CUDA kernel's `mma.sync` stages: 44% of the DRAM roof at 16 heads.
+(v3) sits above the CUDA kernel's `mma.sync` stages: 62% of the DRAM roof at 16 heads, next to Cake's 63%.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/roofline-dark.svg">
@@ -263,13 +272,19 @@ published every tile one release too late, so its own latency was in every tile'
 TMA and converts V in 8 warps instead of 4. v2.5 (V and P in E4M3, so that 32 heads fit in tensor memory) is
 correct but gains only 1-2% at 128 heads, because the softmax then sets the period; v2.6 (the query terms
 summed by the MMA, so the softmax loads one score block instead of four) moves the cost to the single MMA warp and
-is slower. Both stay as options. With 128 heads, v1a' and v1b are slower than v0 because they handle 16
-heads per CTA instead of 32 (tensor memory), so they read the cache twice as often. The first warp-specialized
-builds (v2-v2.2, 1.04-1.13 ms at 16 heads x 64 x 64K) are in the log only; the current code no longer builds them.
+is slower. Both stay as options. v3 is a new class: V converted by `QMUL4` (FP4 times a per-lane E4M3 scale to
+E4M3, 4 values per instruction) straight into tensor memory, with a power of two per token that keeps the values in
+range; v3.1 adds RoPE into the latent score and exchanges the softmax's tile maxima only on tiles where a score
+grows (one barrier with an OR reduction), which removed the shared-memory loads that had queued behind the
+conversion; v3.2 runs 32 heads per CTA when the batch holds enough work. A shorter epilogue (one scale per head, one
+static view of the output rows) also halved the fixed cost per call. With 128 heads, v1a' and v1b are slower than v0
+because they handle 16 heads per CTA instead of 32 (tensor memory), so they read the cache twice as often. The first
+warp-specialized builds (v2-v2.2, 1.04-1.13 ms at 16 heads x 64 x 64K) and v3.0 are in the log only; the current code
+no longer builds them.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/sm100-versions-dark.svg">
-  <img alt="B200: latency of the SM100 tcgen05 kernel from v0 to v2.4 for three shapes, with FlashInfer Cake on the same shapes" src="docs/img/sm100-versions-light.svg">
+  <img alt="B200: latency of the SM100 tcgen05 kernel from v0 to v3.2 for three shapes, with FlashInfer Cake on the same shapes" src="docs/img/sm100-versions-light.svg">
 </picture>
 
 ## Reproduce
@@ -324,22 +339,45 @@ FP8 mode (`precision="fp8"`):
 - `fp4-qk` feeds QK with the cache bytes as stored, through block-scaled FP4 `mma.sync` (`kind::mxf4nvf4`), whose
   per-16 E4M3 scales match the cache's.
 
-SM100 kernel (`nvfp4_mla.sm100`, CuTe DSL):
+SM100 kernel (`nvfp4_mla.sm100`, CuTe DSL; v3):
 
-- `tcgen05` MMA with the operands swapped: tokens are M (128 per tile) and the CTA's 16 heads are N, so a 16-head
-  query still fills the MMA. Scores, the output accumulator and V live in tensor memory.
+- `tcgen05` MMA with the operands swapped: tokens are M (128 per tile) and the CTA's 16 or 32 heads are N, so a
+  16-head query still fills the MMA. Scores, the output accumulator and V live in tensor memory.
 - QK reads the cache's FP4 bytes as stored, with block-scaled FP4 MMA (`kind::mxf4nvf4`) and the cache's E4M3
-  scales. The BF16 query is written as 4 NVFP4 terms with one shared scale per head, stacked along N, so K is read
-  once for all terms. The RoPE part is E4M3 x E4M3 (`kind::f8f6f4`) on the raw RoPE bytes, with the query as 3 E4M3
-  terms.
-- V is converted from the raw FP4 tile straight into tensor memory (8-bit transposing `ldmatrix`, E2M1 to FP16,
-  times the block scale) and is the A operand of the PV MMA; P comes from shared memory.
-- 512 threads in roles: one warp issues TMA (one box per page) into a 4-stage ring of raw tiles, two warps lay out
-  the block scales for the QK MMA and for the V conversion, 8 warps convert V, one warp issues the MMAs and 4 warps
-  run the softmax. The roles hand tiles over through mbarriers; `setmaxnreg` moves registers from the MMA/TMA
-  warpgroup to the softmax warps.
-- Online softmax with lazy rescaling (as in the CUDA kernel) and two P buffers; V in two 64-token halves, so the
-  conversion of the next tile overlaps PV.
+  scales. The BF16 query is written as 3 NVFP4 terms with one shared scale per head, stacked along N, so K is read
+  once for all terms. The RoPE part is E4M3 x E4M3 on the raw RoPE bytes (`kind::mxf8f6f4`), the query as 3 E4M3
+  terms with a power of two per head as the MMA's scale factor, so that it adds into the first term's scores.
+- V is converted from the raw FP4 tile straight into tensor memory with `QMUL4` (`mul.rn.e4m3x4.e2m1x4.e4m3x4`, PTX
+  ISA 9.4): a transposing 8-bit `ldmatrix` gives each thread 4 tokens of two channels, and after a nibble shuffle one
+  `QMUL4` per channel makes an E4M3 word of 4 tokens, each with its own block scale. Each token's scales are divided
+  by a power of two (0-3) that keeps 6 x scale within E4M3; P is multiplied by it before PV.
+- 512 threads in roles: one warp issues TMA (one box per page) into a ring of raw tiles (4 stages, 3 with 32 heads),
+  two warps lay out the block scales for the QK MMA and for the conversion, 8 warps convert V, one warp issues the
+  MMAs and 4 warps run the softmax. The roles hand tiles over through mbarriers; `setmaxnreg` gives each role its
+  registers.
+- Online softmax with lazy rescaling: a head's maximum moves only when a score passes it by 2^5. Each thread tests
+  its own scores, one barrier with an OR reduction (`bar.red.or`) tells the 4 warps, and only then are the tile maxima
+  exchanged. V in two 64-token halves, so the conversion of the next tile overlaps PV.
+- Pages under 16 tokens use v2.4 (`cp.async` instead of TMA, V in FP16, 4 query terms).
+
+### SM100 kernel and FlashInfer Cake
+
+Both read the same cache with `tcgen05` MMAs, swapped operands, V converted on chip by `QMUL4` and a power of two per
+token to keep V in range. Where they differ (Cake from FlashInfer 0.7.4rc1's sources):
+
+| | this kernel (v3) | Cake |
+|---|---|---|
+| query | 3 NVFP4 terms; RoPE 3 E4M3 terms | 1 NVFP4 term; RoPE 1 E4M3 term |
+| error vs unquantized KV, relative to the BF16 mode | 1.01-1.02 | 1.38-1.71 |
+| V after conversion | tensor memory (thread = channel, PV's A operand from TMEM) | shared memory, token-major (thread = token, A operand from shared memory) |
+| MMA issue | one warp for QK and PV | a QK warp and a PV warp |
+| softmax | one warpgroup | two warpgroups on alternate tiles, each with its own output accumulator |
+| 128 heads | one CTA per 32 heads: the cache is read 4 times per request | all heads in one cluster of two CTAs (`cta_group::2`): read once |
+
+The last row is most of the remaining gap at 128 heads (2.5-2.9x at batch 64). At 16 heads the two are within 3% at
+64 x 64K; with short contexts this kernel's fixed cost per call is higher. The details, and what each difference
+cost or gained when tried here, are in the
+[optimization log](docs/optimization-log.md#this-kernel-and-cake-where-the-structures-differ).
 
 ## Cache layout (flashinfer#4676)
 
@@ -353,10 +391,10 @@ Dequantization: `ckv = e2m1 * scale * ckv_scale`, `kpe = fp8 * kpe_scale`.
 
 ## Roadmap
 
-- SM100 kernel: the remaining gap to FlashInfer Cake. With 128 heads the cache is read once per 16 heads (32 heads
-  per CTA work, but the softmax then sets the period, and summing the query terms in the MMA needs a second MMA
-  warp first), the V conversion is the busiest role at 16 heads, and each call has a fixed cost of about 40 µs. The next steps are in the
-  [optimization log](docs/optimization-log.md#where-the-sm100-kernel-stops-for-now).
+- SM100 kernel: the remaining gap to FlashInfer Cake. With 128 heads the cache is read once per 32 heads (Cake: once
+  per request, two CTAs in a cluster); at 16 heads the scale-layout warps set the period; each call runs three small
+  kernels around the decode (about 8 µs). See
+  [SM100 kernel and FlashInfer Cake](#sm100-kernel-and-flashinfer-cake).
 - Accuracy on real model KV: layer-wise attention output of DeepSeek-V2-Lite against BF16, this kernel and Cake.
 - Attention throughput at a fixed KV memory budget, where NVFP4 holds 1.64x the tokens of FP8.
 - MTP / speculative decode (2-4 query tokens per request).

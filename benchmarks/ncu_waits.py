@@ -76,8 +76,8 @@ else:  # the cp.async load block is still compiled but no warp runs it; convert 
     dead, wg3 = dealloc[0], dealloc[-1]
     kv_full = lambda k: wait_off.get(k) is not None and 8 * a.stages <= wait_off[k] < 12 * a.stages
     cvt0 = first(kv_full, dead)
-    if len(dealloc) == 1:  # DecodeV3: no cp.async block; convert follows the prologue's last block-wide barrier
-        dead, cvt0 = None, max(k for k in range(wg3) if "BAR.SYNC" in src[k]) + 1
+    if not any("LDGSTS" in x for x in src):  # DecodeV3: no cp.async block; convert follows the prologue's last barrier
+        dead, cvt0 = None, max(k for k in range(dealloc[0]) if "BAR.SYNC" in src[k]) + 1
     bounds = [(0, "prologue"), (dead, "cp.async load (not run)"), (cvt0, "convert"), (wg3, "TMA warp"),
               (first(lambda k: wait_off.get(k, -1) >= TMA0, wg3), "scale warps"),
               (first(lambda k: wait_off.get(k, -1) == 0 or "UTCQMMA" in src[k], wg3), "MMA"), (smx, "softmax")]

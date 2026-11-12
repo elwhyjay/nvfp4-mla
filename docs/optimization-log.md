@@ -2100,3 +2100,142 @@ it: the softmax is now 43-59% busy and waits for S most of the remaining time, a
 scale warps 92% busy, more of it in dependency stalls), so v3 uses 3 terms.
 
 At H=128 the gap to Cake stays 1.9x: 8 CTAs per request each read the whole cache for 16 heads. That is V3.2.
+
+### V3.2 hypothesis: 32 heads per CTA
+
+At H=128 each request has 8 CTAs of 16 heads, and each of them loads, converts and scales the whole cache, so the
+cache is read 8 times per request. With 32 heads per CTA it is read 4 times, and the conversion and scale-layout work
+per head halves. v2.5 tried this (`h32`) and gained 1-2% because its softmax was then 99% busy. V3.1b's softmax is
+43-59% busy at 16 heads; at 32 heads its work about doubles per tile while every other role's stays the same.
+
+Changes, as v2.5's `h32`: 3 raw stages instead of 4 (shared memory), the per-role registers 104 / 104 / 232 / 72, the
+softmax reads g from shared memory. The 2^k buffer keeps 4 slots (tile j % 4): with 3 stages, a slot per stage would
+be rewritten before the softmax has read it. H=16 keeps 16 heads per CTA.
+
+Predictions: H=128 B16 64K 0.33-0.40 ms (0.574 with 16 heads; Cake 0.304), the period set by the softmax (85% or
+more busy) at about 1.3-1.5 us per tile; H=128 B64 64K about 4x that of B16 less the better wave fill; H=16 unchanged.
+Accuracy unchanged.
+
+### V3.2 result: -27% at H=128, still 1.4x behind Cake there
+
+Accuracy unchanged (worst x1.024; with 32 heads the same or slightly lower ratios). Time, one process, ms:
+
+| shape | v2.4 | v3 16 heads | v3 32 heads | Cake |
+|---|---|---|---|---|
+| H=128 B16 64K | 0.858 | 0.580 | **0.423** | 0.302 |
+| H=128 B64 64K | 3.387 | 2.284 | **1.481** | 0.555 |
+| H=128 B64 8K | 0.497 | 0.360 | **0.305** | 0.083 |
+| H=16 B64 64K | 0.456 | 0.323 | 0.324 (16 heads) | 0.321 |
+
+-27% at H=128 B16 and -35% at B64, short of the predicted 0.33-0.40 ms. At H=128 B16 a tile takes 1.65 us and no
+role is saturated: the softmax is 78% busy (18% waiting for S), the convert warps 64% (31% waiting for PV to release
+V), the MMA warp 52%. The period is the latency of the loop P(j) -> PV(j) -> V buffer free -> convert(j + 1) ->
+stage free -> scale layouts -> QK -> S, not one role's work. At 32 heads the softmax's work per tile (about 1.3 us)
+is most of that loop.
+
+The remaining gap at H=128 is structural. Cake's kernel for more than 48 heads is a different program: a cluster of
+two CTAs with `cta_group::2` MMAs takes all 128 heads of a request, so the cache is read and its V converted once per
+request; this kernel does that 4 times (one CTA per 32 heads). At B64 8K that is 3.7x.
+
+### The epilogue: most of the fixed cost
+
+V3.2 with 32 heads was 2x slower than with 16 at one request and short contexts (H=128 B1 1K: 0.075 against 0.036
+ms). With one tile per CTA the kernel is mostly its prologue and epilogue, and the epilogue was long: per output
+element it indexed the full output tensor (its dynamic strides reloaded, about 50 instructions), branched on the split
+count and on l > 0, and loaded and summed the four warps' row sums again; 3,600 SASS lines with 16 heads, 7,000 with
+32. Now the output scale per head is computed once, the CTA's rows are one static (heads, 512) view, and the split
+branch is outside the loops. One tile, warm L2: 18.2 -> 10.4 us with 16 heads, 33.1 -> 14.9 us with 32. A whole call
+at H=16 B1 1K: 0.040 -> 0.017 ms, so most of the "40 us fixed cost per call" of earlier sections was this epilogue.
+
+With it, 32 heads per CTA lose only where the batch holds little work (H=128: B1 up to 16K tokens, B16 1K), where
+16 heads give twice the CTAs and no KV split: v3 now uses 32 heads from 32K tokens in the batch.
+
+One process against the build before, ms: H=128 B16 64K 0.418 -> 0.379, H=128 B64 16K 0.483 -> 0.381, H=16 B16 64K
+0.105 -> 0.099, but H=16 B64 64K 0.320 -> 0.339. The epilogue runs once per CTA, so that is not its cost: in the
+profile the scale warps, which set the period at H=16, went from 85% to 94% busy, their dependency stalls from 19% to
+31% of their samples. Their code did not change; the compiler scheduled it differently. A role at the edge of the
+period shows every such change.
+
+### Hypothesis: the 2^-k shift as integer arithmetic
+
+The scale warps shift every block scale by 2^-k through f16 (two conversions to f16, a multiply, two conversions back
+per word: 4 of the 7 instructions on the narrow conversion pipe, "math" 10-12% of their stalls). On the E4M3 bytes
+it is the exponent field minus k: with bit 7 set first the subtraction cannot borrow across bytes, and bit 7 of
+(byte - 8k - 8) tells which bytes stay normal; the others (blocks more than 2^11 below the token's largest, which the
+f16 path rounded to 1-3 bit subnormals) become 0. About 5 integer instructions per word, all on the full-rate pipe.
+
+Predictions: H=16 B64 64K at or below 0.320 ms (the old build) and the scale warps under 85% busy; the error within
+0.001 of now; H=128 unchanged within 2%.
+
+Result: no. With the integer shift H=16 B64 64K takes 0.347 ms (0.338 with the f16 shift, 0.320 before the epilogue
+change), H=16 B16 64K 0.100 (0.099), H=128 within 1%; the error is unchanged. Fewer instructions, more time: the
+prediction fails and the f16 shift stays.
+
+What does help is registers. The scale warps share a warpgroup with the MMA and TMA warps at 80 registers, and the
+softmax, at 16 heads only 44-50% busy now, holds 176. Moving 24 per thread from the softmax to that warpgroup (one
+process, ms; 176/80 is the build above):
+
+| softmax / MMA-TMA-scale registers | 176 / 80 | 152 / 104 | 144 / 112 | 136 / 120 |
+|---|---|---|---|---|
+| H=16 B64 64K | 0.339 | **0.326** | 0.325 | 0.328 |
+| H=16 B16 64K | 0.099 | **0.097** | 0.098 | 0.099 |
+| H=16 B64 16K | 0.110 | **0.107** | 0.108 | 0.108 |
+| H=16 B4 64K | 0.044 | **0.043** | 0.044 | 0.045 |
+
+v3 with 16 heads now runs 152 / 104 (the softmax can only grow from the launch's 128, and that warpgroup only shrink).
+H=16 B64 64K ends 2% above the build before the epilogue change; every other shape is faster.
+
+### Where v3 stands (full B200 sweep, one process)
+
+v3 is now `sm100.decode`'s default for page sizes of 16 and more (v2.4 below that, or with `version=3`). The version
+history on three shapes, ms:
+
+| shape | v2.4 | v3.1 (16 heads) | v3.2 | Cake |
+|---|---|---|---|---|
+| H=16 B64 64K | 0.455 | 0.327 | 0.327 | 0.319 |
+| H=16 B1 64K | 0.049 | 0.031 | 0.032 | 0.022 |
+| H=128 B16 64K | 0.857 | 0.608 | 0.378 | 0.305 |
+| H=128 B64 64K | 3.387 | 2.387 | 1.383 | 0.549 |
+
+Against Cake over the 32-shape grid: at 16 heads 1.03x at 64 x 64K, 1.16-1.31x at 16K-64K tokens, 1.4-1.9x with
+short contexts (the three small kernels around the decode, about 8 us warm, are inside this kernel's timed call;
+Cake's query quantization is not); at 128 heads 0.89-0.96x (faster) at batch 1 with 1K-4K tokens and at 16 x 1K,
+1.1-1.5x up to batch 16, 2.5-2.9x at batch 64. trtllm-gen FP8 is 1.2-3.1x faster than v3 at 128 heads. Error against
+the unquantized KV: 1.01-1.02x the BF16 mode (Cake 1.38-1.71x).
+
+### This kernel and Cake: where the structures differ
+
+FlashInfer Cake (0.7.4rc1, `flashinfer/experimental/cake_mla_nvfp4_paged_decode`) reads the same cache. Its source
+has two attention programs; side by side with v3:
+
+| | v3 (this kernel) | Cake, up to 48 heads (`d2829e4e`) | Cake, more heads (`32a47bbf`) |
+|---|---|---|---|
+| query | BF16 query as 3 NVFP4 terms, one scale per head; RoPE as 3 E4M3 terms times 2^e per head | 1 NVFP4 term; RoPE as 1 E4M3 term in the latent unit | same as left |
+| QK | `mxf4nvf4`, the terms along N; RoPE `mxf8f6f4` (UE8M0 2^e) into the first term's columns | `mxf4nvf4` and RoPE `f8f6f4` into one score block | `cta_group::2`, the query as the TMEM A operand |
+| heads per CTA | 16, or 32 from 32K tokens in the batch | 16 / 32 / 48 rows | 128 rows per cluster of 2 CTAs |
+| cache reads per request at 128 heads | 4 (8 at 16 heads per CTA) | | 1 |
+| V conversion | 8 warps, thread = channel: transposing `ldmatrix`, QMUL4, `tcgen05.st` into TMEM; V^T is PV's A operand in TMEM | 8 warps, thread = token: `ld.shared.v4`, QMUL4, `st.shared.v4` token-major; V is PV's A operand in shared memory | shared by the 2 CTAs |
+| V range | per-token 2^-k in the block scales, undone on P | the same | the same |
+| QK scale factors of the cache | 2 warps lay them out in shared memory, `tcgen05.cp` | the conversion warps write them into TMEM (`tcgen05.st`, lane = token) | |
+| MMA issue | one warp for QK and PV | a QK warp and a PV warp | |
+| softmax | one warpgroup; lazy rescale at 2^5, maxima exchanged only when a score grows | two warpgroups on alternate tiles, each with its own O | |
+| raw stages | 4 (3 with 32 heads), TMA | 2, TMA | |
+| warps | 16 | 20 | 16 |
+| error vs unquantized KV, x BF16 mode | 1.01-1.02 | 1.38-1.71 | 1.38-1.71 |
+
+What the differences are worth, on B200:
+
+- **Query terms** (3 against 1): the accuracy column above. The time is small here: QK is not on the critical path,
+  and 3 terms ran as fast as 4 (X1).
+- **V in tensor memory** (this kernel) against V in shared memory (Cake): it spares the shared-memory round trip (Cake's
+  shared memory was 91% busy at 16 heads in its profile, this kernel's 68% in v2.4) at the price of a transposing load
+  and a nibble shuffle. The conversion is no longer the limit (48-64% busy).
+- **One MMA warp** against two: 40-54% busy in v3, so not a limit now (v2.6 showed when it becomes one).
+- **One softmax warpgroup** against two: with the vote it is 44-59% busy at 16 heads. At 32 heads (78% busy) the
+  period is the latency of the loop softmax -> PV -> conversion -> scale layouts -> QK; two warpgroups on alternate
+  tiles, as Cake, would overlap that loop. Not tried yet.
+- **The cache's QK scale factors**: here two warps lay them out in shared memory for `tcgen05.cp`, and they set the
+  period at 16 heads (85-94% busy; the register split above bought 4%). Cake's conversion warps write them into tensor
+  memory directly (`tcgen05.st`, lane = token), which would remove that role's shared-memory round trip.
+- **128 heads**: the cluster of two CTAs reads the cache once per request, this kernel once per 32 heads, 4x the
+  conversion and scale work per request. This is 2.5-2.9x at batch 64, the largest remaining gap.
