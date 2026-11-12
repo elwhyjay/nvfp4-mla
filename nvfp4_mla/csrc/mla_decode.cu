@@ -1195,7 +1195,7 @@ __global__ void __launch_bounds__(128) query_terms_kernel(const __nv_bfloat16* _
 std::vector<torch::Tensor> query_terms(torch::Tensor q_nope, int64_t terms) {
   TORCH_CHECK(q_nope.dim() == 3 && q_nope.size(2) == CKV && q_nope.scalar_type() == at::kBFloat16 &&
                   q_nope.is_contiguous(), "q_nope must be contiguous bfloat16 [batch, heads, 512]");
-  TORCH_CHECK(terms == 3 || terms == 4, "terms must be 3 or 4");
+  TORCH_CHECK(terms >= 2 && terms <= 4, "terms must be 2, 3 or 4");
   const at::cuda::OptionalCUDAGuard guard(q_nope.device());
   const int B = q_nope.size(0), H = q_nope.size(1), rows = B * H;
   auto u8 = q_nope.options().dtype(at::kByte);
@@ -1206,24 +1206,41 @@ std::vector<torch::Tensor> query_terms(torch::Tensor q_nope, int64_t terms) {
         reinterpret_cast<const __nv_bfloat16*>(q_nope.data_ptr()), rows, q4.data_ptr<uint8_t>(),
         qsf.data_ptr<uint8_t>(), g.data_ptr<float>());
   };
-  terms == 3 ? launch(query_terms_kernel<3>) : launch(query_terms_kernel<4>);
+  terms == 2   ? launch(query_terms_kernel<2>)
+  : terms == 3 ? launch(query_terms_kernel<3>)
+               : launch(query_terms_kernel<4>);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {q4, qsf, g};
 }
 
 // q_pe as T E4M3 terms with one FP32 scale per row, s = amax / 448: q_pe ~ s * sum_t e4m3_t (the SM100 kernel's RoPE
-// MMA is E4M3 x E4M3 on the cache's kpe bytes). One warp per row; lane j owns channels 2j, 2j + 1.
+// MMA is E4M3 x E4M3 on the cache's kpe bytes). With a unit u per row (g, the row's latent scale, / ratio), s is
+// u * 2^e, the smallest such scale that fits, and the row's e is written as a UE8M0 byte instead: the kernel can then
+// accumulate RoPE into the latent score with 2^e as the MMA's scale factor. One warp per row; lane j owns channels
+// 2j, 2j + 1.
 template <int T>
 __global__ void __launch_bounds__(128) rope_terms_kernel(const __nv_bfloat16* __restrict__ q, int rows,
-                                                         uint8_t* __restrict__ q8, float* __restrict__ s_out) {
+                                                         uint8_t* __restrict__ q8, float* __restrict__ s_out,
+                                                         const float* __restrict__ g, float ratio,
+                                                         uint8_t* __restrict__ e_out) {
   const int row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
   if (row >= rows) return;
   float2 r = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(q + size_t(row) * KPE + 2 * lane));
   float amax = fmaxf(fabsf(r.x), fabsf(r.y));
 #pragma unroll
   for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, o));
-  const float sc = amax > 0.f ? amax / 448.f : 1.f, inv = 1.f / sc;
-  if (lane == 0) s_out[row] = sc;
+  float sc = amax > 0.f ? amax / 448.f : 1.f;
+  if (g) {
+    const float u = g[row] / ratio;
+    int e = amax > 0.f ? int(ceilf(log2f(amax / (448.f * u)))) : 0;
+    if (amax > 448.f * ldexpf(u, e)) ++e;  // log2f is not exact
+    e = max(-127, min(127, e));
+    sc = ldexpf(u, e);
+    if (lane == 0) e_out[row] = uint8_t(e + 127);
+  } else if (lane == 0) {
+    s_out[row] = sc;
+  }
+  const float inv = 1.f / sc;
 #pragma unroll
   for (int t = 0; t < T; ++t) {
     const uint32_t w = pack_e4m3x4(r.x * inv, r.y * inv, 0.f, 0.f) & 0xffff;
@@ -1234,19 +1251,30 @@ __global__ void __launch_bounds__(128) rope_terms_kernel(const __nv_bfloat16* __
   }
 }
 
-// q_pe [B, H, 64] bf16 -> q8 [B, H, T, 64] (E4M3), s [B, H] (FP32): q_pe ~ s * sum_t q8_t.
-std::vector<torch::Tensor> rope_terms(torch::Tensor q_pe, int64_t terms) {
+// q_pe [B, H, 64] bf16 -> q8 [B, H, T, 64] (E4M3) and s [B, H] (FP32): q_pe ~ s * sum_t q8_t. With g [B, H] (FP32),
+// the second output is e [B, H] (UE8M0 bytes) instead: q_pe ~ g / ratio * 2^e * sum_t q8_t.
+std::vector<torch::Tensor> rope_terms(torch::Tensor q_pe, int64_t terms, c10::optional<torch::Tensor> g,
+                                      double ratio) {
   TORCH_CHECK(q_pe.dim() == 3 && q_pe.size(2) == KPE && q_pe.scalar_type() == at::kBFloat16 && q_pe.is_contiguous(),
               "q_pe must be contiguous bfloat16 [batch, heads, 64]");
   TORCH_CHECK(terms == 3, "terms must be 3");
   const at::cuda::OptionalCUDAGuard guard(q_pe.device());
   const int B = q_pe.size(0), H = q_pe.size(1), rows = B * H;
   auto q8 = torch::empty({B, H, terms, KPE}, q_pe.options().dtype(at::kByte));
-  auto sc = torch::empty({B, H}, q_pe.options().dtype(at::kFloat));
+  torch::Tensor second;
+  const float* gp = nullptr;
+  if (g) {
+    TORCH_CHECK(g->scalar_type() == at::kFloat && g->is_contiguous() && g->numel() == rows, "g must be float32 [B, H]");
+    gp = g->data_ptr<float>();
+    second = torch::empty({B, H}, q_pe.options().dtype(at::kByte));
+  } else {
+    second = torch::empty({B, H}, q_pe.options().dtype(at::kFloat));
+  }
   rope_terms_kernel<3><<<(rows + 3) / 4, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __nv_bfloat16*>(q_pe.data_ptr()), rows, q8.data_ptr<uint8_t>(), sc.data_ptr<float>());
+      reinterpret_cast<const __nv_bfloat16*>(q_pe.data_ptr()), rows, q8.data_ptr<uint8_t>(),
+      g ? nullptr : second.data_ptr<float>(), gp, float(ratio), g ? second.data_ptr<uint8_t>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {q8, sc};
+  return {q8, second};
 }
 
 // Merge split-KV partials o_part [splits, B, H, 512] / lse_part [splits, B, H] (as decode writes them) into out.
@@ -1270,5 +1298,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode", &decode);
   m.def("dequantize", &dequantize);
   m.def("query_terms", &query_terms);
-  m.def("rope_terms", &rope_terms);
+  m.def("rope_terms", &rope_terms, py::arg("q_pe"), py::arg("terms"), py::arg("g") = py::none(),
+        py::arg("ratio") = 1.0);
 }

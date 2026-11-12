@@ -173,6 +173,16 @@ def lds_v4(addr: Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def bar_red_or(pred: Int32, bar_id: int, nthreads: int, *, loc=None, ip=None) -> Int32:
+    """Named barrier that also returns whether pred is non-zero in any of the nthreads threads."""
+    return Int32(llvm.inline_asm(
+        T.i32(), [Int32(pred).ir_value(loc=loc, ip=ip)],
+        f"{{\n.reg .pred p, q;\nsetp.ne.s32 p, $1, 0;\nbar.red.or.pred q, {bar_id}, {nthreads}, p;\n"
+        f"selp.s32 $0, 1, 0, q;\n}}", "=r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def tmem_st16x128(taddr: Uint32, w0: Uint32, w1: Uint32, *, loc=None, ip=None):
     """tcgen05.st.16x128b.x1: thread (g, t) writes lane g column t (w0) and lane g + 8 column t (w1)."""
     llvm.inline_asm(None, [Uint32(x).ir_value(loc=loc, ip=ip) for x in (taddr, w0, w1)],
@@ -1608,6 +1618,13 @@ class DecodeV3(DecodeV2):
     scales. Per token a power of two 2^-k (k = 0-3, from the token's largest block scale) keeps 6 x scale inside
     E4M3: the scale warps apply it to the scales the conversion reads (QK's scale factors stay as stored) and the
     softmax undoes it on P, so the lazy rescale moves the maximum at 2^5 (P x 2^3 <= 256).
+
+    v3.1: RoPE accumulates into the first query term's score columns, so the softmax loads terms x 16 columns. The
+    RoPE query comes as 3 E4M3 terms in units of g / kpe_ratio times 2^e per head (rope_terms with g), and the RoPE
+    MMA is kind::mxf8f6f4 with 2^e as the query's UE8M0 scale factor (1 for the cache).
+
+    v3.1b: the softmax exchanges the tile maxima only when a score passes its head's running maximum by 2^5, which
+    one barrier with an OR reduction tells all four warps; on the other tiles P uses the running maximum as it is.
     """
 
     def __init__(self, n: int, page_size: int, terms: int, stub: str = ""):
@@ -1615,15 +1632,122 @@ class DecodeV3(DecodeV2):
             raise ValueError("v3 runs 16 heads per CTA and needs page size >= 16 (TMA)")
         super().__init__(n, page_size, terms, "lazy,rope8,tma,cvt8,vhalf,v8", stub)
 
+    @cute.jit
+    def __call__(self, q4: cute.Tensor, qsf: cute.Tensor, qg: cute.Tensor, qpe8: cute.Tensor, qpe_e: cute.Tensor,
+                 ckv: cute.Tensor, sf: cute.Tensor, kpe: cute.Tensor, page_table: cute.Tensor, kv_lens: cute.Tensor,
+                 out: cute.Tensor, o_part: cute.Tensor, lse_part: cute.Tensor, chunk: Int32, splits: Int32,
+                 scale_log2: Float32, out_scale: Float32, stream):
+        n, st = self.n, self.stages
+        nq = self.terms * n
+        mma_qk = cute.make_tiled_mma(tcgen05.MmaMXF4NVF4Op(Float8E4M3FN, (TILE, nq, 64), tcgen05.CtaGroup.ONE,
+                                                           tcgen05.OperandSource.SMEM))
+        mma_pe = cute.make_tiled_mma(tcgen05.MmaMXF8F6F4Op(Float8E4M3FN, Float8E4M3FN, (TILE, n, 32),
+                                                           tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+                                                           OperandMajorMode.K, OperandMajorMode.K))
+        mma_vp = sm100_utils.make_trivial_tiled_mma(Float8E4M3FN, Float8E4M3FN, OperandMajorMode.K, OperandMajorMode.MN,
+                                                    Float32, tcgen05.CtaGroup.ONE, (TILE, n), tcgen05.OperandSource.TMEM)
+        mma_sn = sm100_utils.make_trivial_tiled_mma(Float16, OperandMajorMode.K, OperandMajorMode.K, Float32,
+                                                    tcgen05.CtaGroup.ONE, (TILE, nq))
+        atom4 = tcgen05.make_smem_layout_atom(tcgen05.mma.SmemLayoutAtomKind.K_SW128, Float4E2M1FN)
+        atom_pe = tcgen05.make_smem_layout_atom(tcgen05.mma.SmemLayoutAtomKind.K_SW64, Float8E4M3FN)
+        rows, bx, op = ckv.shape[0] * self.ps, self.box, cpasync.CopyBulkTensorTileG2SOp()
+        flat = lambda t, w: cute.make_tensor(t.iterator, cute.make_layout((rows, w), stride=(w, 1)))
+        rowl = lambda w: cute.make_layout((bx, w), stride=(w, 1))
+        tma_k, mTK = cpasync.make_tiled_tma_atom(
+            op, flat(ckv, CKV // 2), cute.make_composed_layout(cute.make_swizzle(3, 4, 3), 0, rowl(128)), (bx, 128))
+        tma_sf, mTSf = cpasync.make_tiled_tma_atom(op, flat(sf, CKV // 16), rowl(CKV // 16), (bx, CKV // 16))
+        tma_pe, mTPe = cpasync.make_tiled_tma_atom(
+            op, flat(kpe, KPE), cute.make_composed_layout(cute.make_swizzle(2, 4, 3), 0, rowl(KPE)), (bx, KPE))
+        # the RoPE scale factors as one 128-channel chunk (4 per row; K-steps 0, 1 used): a 64-channel tiler does not
+        # divide the scale-factor atom
+        tiler_pe = (TILE, n, 4 * 32)
+        self.kernel(q4, qsf, qg, qpe8, qpe_e, page_table, kv_lens, out, o_part, lse_part, chunk, scale_log2, out_scale,
+                    tma_k, mTK, tma_sf, mTSf, tma_pe, mTPe, mma_qk, mma_pe, mma_vp, mma_sn,
+                    cute.tile_to_shape(atom4, (TILE, CKV, st), order=(0, 1, 2)),
+                    cute.tile_to_shape(atom4, (nq, CKV), order=(0, 1)),
+                    cute.tile_to_shape(atom_pe, (TILE, KPE, st), order=(0, 1, 2)),
+                    cute.tile_to_shape(atom_pe, (n, KPE, 3), order=(0, 1, 2)),
+                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), Float8E4M3FN, self.np),
+                    sm100_utils.make_smem_layout_b(mma_vp, (TILE, n, TILE), Float8E4M3FN, 1),
+                    bsl.make_smem_layout_sfa(mma_qk, (TILE, nq, CKV), SF_VEC, self.nd),
+                    bsl.make_smem_layout_sfb(mma_qk, (TILE, nq, CKV), SF_VEC, 1),
+                    bsl.make_smem_layout_sfa(mma_pe, tiler_pe, 32, 1),
+                    bsl.make_smem_layout_sfb(mma_pe, tiler_pe, 32, 1)).launch(
+            grid=[qg.shape[1] // n, qg.shape[0], splits], block=[512, 1, 1], min_blocks_per_mp=1, stream=stream)
+
+    def views(self, mma_qk, mma_pe, mma_vp, mma_sn, lsfa, lsfb, lsfa_pe, lsfb_pe, lp1, tmem_ptr, sK4, sQ4, sKpe, sQpe,
+              sP, sSFA, sSFB, sSFApe, sSFBpe, sG, wt):
+        """As DecodeV2.views, for v3's operands. TMEM: S (terms x n columns, RoPE added to the first n), O^T (4 x n),
+        the scale factors (latent, then RoPE); V^T in columns 384-511."""
+        n, nq = self.n, self.terms * self.n
+        thr_qk, thr_pe, thr_vp = mma_qk.get_slice(0), mma_pe.get_slice(0), mma_vp.get_slice(0)
+        tCrK4 = mma_qk.make_fragment_A(thr_qk.partition_A(sK4))  # (MMA, 1, 8, stages)
+        tCrQ4 = mma_qk.make_fragment_B(thr_qk.partition_B(sQ4))  # (MMA, 1, 8)
+        tCrKpe = mma_pe.make_fragment_A(thr_pe.partition_A(sKpe))  # (MMA, 1, 2, stages)
+        tCrQpe = mma_pe.make_fragment_B(thr_pe.partition_B(sQpe))  # (MMA, 1, 2, query RoPE terms)
+        tCrP = mma_vp.make_fragment_B(sP)  # (MMA, 1, 4, P buffers)
+
+        s_shape = mma_vp.partition_shape_C((TILE, n, 1))
+        s_layout = mma_vp.make_fragment_C(s_shape).layout
+        tCtSn = cute.make_tensor(tmem_ptr, mma_sn.make_fragment_C(mma_sn.partition_shape_C((TILE, nq, 1))).layout)
+        tCtSp = cute.make_tensor(tmem_ptr, s_layout)  # the first n columns of S
+        col_n = tcgen05.find_tmem_tensor_col_offset(tCtSn)
+        col = tcgen05.find_tmem_tensor_col_offset(tCtSp)
+        tCtO = cute.make_tensor(tmem_ptr + col_n, mma_vp.make_fragment_C(mma_vp.partition_shape_C((TILE, n, 4))).layout)
+        col_sf = col_n + tcgen05.find_tmem_tensor_col_offset(tCtO)
+
+        def sf_tmem(c, mma, lay, tiler, vec, dt, a):
+            make = bsl.make_tmem_layout_sfa if a else bsl.make_tmem_layout_sfb
+            t = cute.make_tensor(cute.recast_ptr(tmem_ptr + c, dtype=dt),
+                                 make(mma, tiler, vec, cute.slice_(lay, (None, None, None, 0))))
+            return t, c + tcgen05.find_tmem_tensor_col_offset(t)
+
+        e8m0 = cutlass.Float8E8M0FNU
+        tCtSFA, c = sf_tmem(col_sf, mma_qk, lsfa, (TILE, n, CKV), SF_VEC, Float8E4M3FN, True)
+        tCtSFB, c = sf_tmem(c, mma_qk, lsfb, (TILE, n, CKV), SF_VEC, Float8E4M3FN, False)
+        tCtSFApe, c = sf_tmem(c, mma_pe, lsfa_pe, (TILE, n, 4 * 32), 32, e8m0, True)
+        tCtSFBpe, c = sf_tmem(c, mma_pe, lsfb_pe, (TILE, n, 4 * 32), 32, e8m0, False)
+        tAtV = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.vbase, dtype=Float8E4M3FN),
+                                thr_vp.make_fragment_A(mma_vp.partition_shape_A((TILE, TILE, 4))).layout)
+
+        def s2t(tt, ss, dt):  # shared -> TMEM copy of a scale-factor tile: (copy, source per stage, destination)
+            cp = tcgen05.make_s2t_copy(cute.make_copy_atom(tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE), dt),
+                                       cute.filter_zeros(tt))
+            thr = cp.get_slice(0)
+            return (cp, tcgen05.get_s2t_smem_desc_tensor(cp, thr.partition_S(cute.filter_zeros(ss))),
+                    thr.partition_D(cute.filter_zeros(tt)))
+
+        sfa = s2t(tCtSFA, sSFA, Float8E4M3FN)
+        sfb = s2t(tCtSFB, sSFB, Float8E4M3FN)
+        sfa_pe = s2t(tCtSFApe, sSFApe, e8m0)
+        sfb_pe = s2t(tCtSFBpe, sSFBpe, e8m0)
+
+        tCsP = [cute.composition(cute.make_tensor(cute.recast_ptr(sP.iterator + b * cute.cosize(lp1), lp1.inner,
+                                                                  dtype=Float8E4M3FN), lp1.outer),
+                                 cute.make_ordered_layout(s_shape, order=((2, 0), 3, 1, 4))) for b in range(self.np)]
+        rep = tcgen05.Repetition(n)
+        ld_s = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(rep), Float32), tCtSp[None, None, None, 0])
+        st_o = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.St32x32bOp(rep), Float32), tCtO[None, None, None, 0])
+        thr_ld = ld_s.get_slice(wt)
+        thr_st = st_o.get_slice(wt)
+        tStSn = [thr_ld.partition_S(cute.make_tensor(tmem_ptr + t * col, s_layout)) for t in range(self.terms)]
+        tSsP = [thr_ld.partition_D(x) for x in tCsP]
+        tStO = thr_ld.partition_S(tCtO)
+        tOtO = thr_st.partition_D(tCtO)
+        tSsG = thr_ld.partition_D(thr_vp.partition_C(cute.make_tensor(sG.iterator, cute.make_layout((TILE, n),
+                                                                                                    stride=(0, 1)))))
+        tScS = thr_ld.partition_D(thr_vp.partition_C(cute.make_identity_tensor((TILE, n))))
+        frag = tSsP[0].shape[:-1]
+        return locals()
+
     @cute.kernel
-    def kernel(self, mQ4: cute.Tensor, mQsf: cute.Tensor, mQg: cute.Tensor, mQp: cute.Tensor, mQp8: cute.Tensor,
-               mQps: cute.Tensor, mCkv: cute.Tensor, mSf: cute.Tensor, mKpe: cute.Tensor, mPt: cute.Tensor,
-               mLens: cute.Tensor, mOut: cute.Tensor, mOpart: cute.Tensor, mLse: cute.Tensor, chunk: Int32,
-               scale_log2: Float32, kpe_ratio: Float32, out_scale: Float32, tma_k, mTK, tma_sf, mTSf, tma_pe, mTPe,
-               mma_qk: cute.TiledMma,
-               mma_pe: cute.TiledMma, mma_vp: cute.TiledMma, mma_sn: cute.TiledMma, lk4: cute.ComposedLayout,
-               lq4: cute.ComposedLayout, lkpe: cute.ComposedLayout, lqpe: cute.ComposedLayout,
-               lp: cute.ComposedLayout, lp1: cute.ComposedLayout, lsfa: cute.Layout, lsfb: cute.Layout):
+    def kernel(self, mQ4: cute.Tensor, mQsf: cute.Tensor, mQg: cute.Tensor, mQp8: cute.Tensor, mQe: cute.Tensor,
+               mPt: cute.Tensor, mLens: cute.Tensor, mOut: cute.Tensor, mOpart: cute.Tensor, mLse: cute.Tensor,
+               chunk: Int32, scale_log2: Float32, out_scale: Float32, tma_k, mTK, tma_sf, mTSf, tma_pe, mTPe,
+               mma_qk: cute.TiledMma, mma_pe: cute.TiledMma, mma_vp: cute.TiledMma, mma_sn: cute.TiledMma,
+               lk4: cute.ComposedLayout, lq4: cute.ComposedLayout, lkpe: cute.ComposedLayout,
+               lqpe: cute.ComposedLayout, lp: cute.ComposedLayout, lp1: cute.ComposedLayout, lsfa: cute.Layout,
+               lsfb: cute.Layout, lsfa_pe: cute.Layout, lsfb_pe: cute.Layout):
         n, terms, nst, nd, npb, nv = self.n, self.terms, self.stages, self.nd, self.np, self.nv
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(tidx // 32)
@@ -1654,6 +1778,8 @@ class DecodeV3(DecodeV2):
         sP = smem.allocate_tensor(Float8E4M3FN, lp.outer, 1024, lp.inner)
         sSFA = smem.allocate_tensor(Float8E4M3FN, lsfa, 128)
         sSFB = smem.allocate_tensor(Float8E4M3FN, lsfb, 128)
+        sSFApe = smem.allocate_tensor(cutlass.Float8E8M0FNU, lsfa_pe, 128)
+        sSFBpe = smem.allocate_tensor(cutlass.Float8E8M0FNU, lsfb_pe, 128)
         sSfT = smem.allocate_tensor(Uint32, cute.make_layout((CKV // 16, TILE // 4, nd), stride=(TILE // 4, 1, 1024)), 16)
         sSfT8 = cute.make_tensor(cute.recast_ptr(sSfT.iterator, dtype=Uint8),
                                  cute.make_layout((CKV // 16, TILE, nd), stride=(TILE, 1, 4096)))
@@ -1662,7 +1788,6 @@ class DecodeV3(DecodeV2):
         sMx = smem.allocate_tensor(Float32, cute.make_layout((2, 4, n), stride=(4 * n, n, 1)), 16)
         sL = smem.allocate_tensor(Float32, cute.make_layout((4, n), stride=(n, 1)), 16)
         sG = smem.allocate_tensor(Float32, cute.make_layout(n), 16)
-        sC = smem.allocate_tensor(Float32, cute.make_layout(n), 16)
         sfa_w = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=Uint32),
                                  cute.make_layout((32, 4, CKV // 64, nd), stride=(4, 1, 128, 1024)))
         sfb_w = cute.make_tensor(cute.recast_ptr(sSFB.iterator, dtype=Uint32),
@@ -1714,8 +1839,18 @@ class DecodeV3(DecodeV2):
             r, t, c = i // (3 * (KPE // 16)), (i // (KPE // 16)) % 3, i % (KPE // 16)
             w = ld_v4(addr_of(mQp8) + ((Int64(b * mQp8.shape[1] + h0 + r) * 3 + t) * KPE + 16 * c))
             store8(cute.local_tile(sQpe[None, None, t], (1, 16), (r, c)), w[0], w[1], w[2], w[3])
+        # RoPE scale factors, one 512-byte chunk each: word i holds the 4 of row (i / 4) + 32 (i % 4). The cache's are 1
+        # (UE8M0 0x7F), the query's 2^e of its head.
+        if tidx < 128:
+            hd = tidx // 4 + 32 * (tidx % 4)
+            sfa_pe_w = cute.make_tensor(cute.recast_ptr(sSFApe.iterator, dtype=Uint32), cute.make_layout(128))
+            sfb_pe_w = cute.make_tensor(cute.recast_ptr(sSFBpe.iterator, dtype=Uint32), cute.make_layout(128))
+            sfa_pe_w[tidx] = Uint32(0x7F7F7F7F)
+            e = Uint32(0)
+            if hd < n:
+                e = Uint32(mQe[b, h0 + hd]) * Uint32(0x01010101)
+            sfb_pe_w[tidx] = e
         if tidx < n:
-            sC[tidx] = mQps[b, h0 + tidx] * kpe_ratio
             sG[tidx] = mQg[b, h0 + tidx]
         cute.arch.fence_view_async_shared()
         cute.arch.sync_threads()
@@ -1723,7 +1858,8 @@ class DecodeV3(DecodeV2):
         t_beg = z * chunk
         t_end = cutlass.min(mLens[b], t_beg + chunk)
         n_tiles = cutlass.max(t_end - t_beg + TILE - 1, 0) // TILE
-        VA = (mma_qk, mma_pe, mma_vp, mma_sn, lsfa, lsfb, lp1, tmem_ptr, sK4, sQ4, sKpe, sQpe, sP, sSFA, sSFB, sG, sC, wt)
+        VA = (mma_qk, mma_pe, mma_vp, mma_sn, lsfa, lsfb, lsfa_pe, lsfb_pe, lp1, tmem_ptr, sK4, sQ4, sKpe, sQpe, sP, sSFA,
+              sSFB, sSFApe, sSFBpe, sG, wt)
 
         if role <= 1:
             # ---- convert: V^T of the tile into TMEM; warpgroup r converts chunks dm = 2 r, 2 r + 1 (quadrant lw)
@@ -1785,12 +1921,14 @@ class DecodeV3(DecodeV2):
         if warp == 12:
             # ---- MMA: iteration it issues QK(it), then PV(it - 1)
             v = self.views(*VA)
-            tCrK4, tCrQ4, tCrKpe, tCrQpe, tCrP = v["tCrK4"], v["tCrQ4"][0], v["tCrKpe"], v["tCrQpe"], v["tCrP"]
-            tCtSn, tCtSp, tCtO, tCtSFA, tCtSFB, tAtV = (v["tCtSn"], v["tCtSp"], v["tCtO"], v["tCtSFA"], v["tCtSFB"][0],
+            tCrK4, tCrQ4, tCrKpe, tCrQpe, tCrP = v["tCrK4"], v["tCrQ4"], v["tCrKpe"], v["tCrQpe"], v["tCrP"]
+            tCtSn, tCtSp, tCtO, tCtSFA, tCtSFB, tAtV = (v["tCtSn"], v["tCtSp"], v["tCtO"], v["tCtSFA"], v["tCtSFB"],
                                                         v["tAtV"])
-            cp_sfa, sfa_src, sfa_dst = v["cp_sfa"], v["sfa_src"], v["sfa_dst"]
-            if n_tiles > 0:
-                cute.copy(v["cp_sfb"], v["sfb_src"][None, None, None, None, 0], v["sfb_dst"][0])
+            tCtSFApe, tCtSFBpe = v["tCtSFApe"], v["tCtSFBpe"]
+            cp_sfa, sfa_src, sfa_dst = v["sfa"]
+            if n_tiles > 0:  # the query's scale factors and the RoPE ones, once
+                for x in (v["sfb"], v["sfa_pe"], v["sfb_pe"]):
+                    cute.copy(x[0], x[1][None, None, None, None, 0], x[2])
             for it in cutlass.range(n_tiles + 1):
                 if it < n_tiles:
                     hk = kvm_c.wait_and_advance()
@@ -1803,12 +1941,13 @@ class DecodeV3(DecodeV2):
                         cute.gemm(mma_qk, tCtSn[None, None, None, 0], tCrK4[None, None, k, hk.index],
                                   tCrQ4[None, None, k], tCtSn[None, None, None, 0])
                         mma_qk.set(tcgen05.Field.ACCUMULATE, True)
-                    mma_pe.set(tcgen05.Field.ACCUMULATE, False)
+                    mma_pe.set(tcgen05.Field.ACCUMULATE, True)  # onto the first term's latent score
                     for t in cutlass.range_constexpr(3):
-                        for k in cutlass.range_constexpr(2):
+                        for k in cutlass.range_constexpr(KPE // 32):
+                            mma_pe.set(tcgen05.Field.SFA, tCtSFApe[None, None, k].iterator)
+                            mma_pe.set(tcgen05.Field.SFB, tCtSFBpe[None, None, k].iterator)
                             cute.gemm(mma_pe, tCtSp[None, None, None, 0], tCrKpe[None, None, k, hk.index],
                                       tCrQpe[None, None, k, t], tCtSp[None, None, None, 0])
-                            mma_pe.set(tcgen05.Field.ACCUMULATE, True)
                     hs.commit()
                     hk.release()
                 if it > 0:
@@ -1831,13 +1970,10 @@ class DecodeV3(DecodeV2):
             cute.arch.setmaxregister_increase(self.regs[2])
             # ---- softmax: thread wt = token row wt of S^T (TMEM lane wt)
             v = self.views(*VA)
-            ld_s, st_o, tStSn, tStSp, tSsP, tStO, tOtO = (v["ld_s"], v["st_o"], v["tStSn"], v["tStSp"], v["tSsP"],
-                                                          v["tStO"], v["tOtO"])
+            ld_s, st_o, tStSn, tSsP, tStO, tOtO = v["ld_s"], v["st_o"], v["tStSn"], v["tSsP"], v["tStO"], v["tOtO"]
             tScS, frag = v["tScS"], v["frag"]
             g_head = cute.make_rmem_tensor(frag, Float32)
-            c_head = cute.make_rmem_tensor(frag, Float32)
             cute.autovec_copy(v["tSsG"], g_head)
-            cute.autovec_copy(v["tSsC"], c_head)
             m_prev = cute.make_rmem_tensor(frag, Float32)
             m_prev.fill(-Float32.inf)
             l_acc = cute.make_rmem_tensor(frag, Float32)
@@ -1852,37 +1988,51 @@ class DecodeV3(DecodeV2):
                     cute.copy(ld_s, tStSn[t][None, None, None, None, 0], sR)
                     for i in cutlass.range_constexpr(n):
                         sS[i] = sS[i] + sR[i]
-                cute.copy(ld_s, tStSp[None, None, None, None, 0], sR)
                 cute.arch.fence_view_async_tmem_load()
                 hs.release()
                 for i in cutlass.range_constexpr(n):
-                    sS[i] = sS[i] * g_head[i] + sR[i] * c_head[i]
+                    sS[i] = sS[i] * g_head[i]
                 if t_beg + it * TILE + row >= t_end:
                     sS.fill(-Float32.inf)
-                m_lane = Float32(0.0)
+                # A head's maximum moves only when a score passes it by 2^5 (log2). Each thread tests its own scores
+                # and the barrier's OR tells the warpgroup; only then are the tile maxima exchanged.
+                m_thr = Float32.inf if "load" in self.stub else Float32(5.0)
+                lim = m_thr / scale_log2
+                grow = Int32(0)
+                if it == 0:
+                    grow = Int32(1)
                 for i in cutlass.range_constexpr(n):
-                    mi = cute.arch.warp_redux_sync(sS[i], kind="fmax", nan=True)
-                    if i == lane:
-                        m_lane = mi
-                if lane < n:
-                    sMx[it % 2, lw, lane] = m_lane
-                softmax_bar.arrive_and_wait()
+                    if sS[i] > m_prev[i] + lim:
+                        grow = Int32(1)
                 pf = cute.make_rmem_tensor(frag, Float32)
                 corr = cute.make_rmem_tensor(frag, Float32)
                 need = Int32(0)
-                for i in cutlass.range_constexpr(n):
-                    hd = tScS[i][1]
-                    mt = cutlass.max(cutlass.max(sMx[it % 2, 0, hd], sMx[it % 2, 1, hd]),
-                                     cutlass.max(sMx[it % 2, 2, hd], sMx[it % 2, 3, hd]))
-                    m_new = m_prev[i]
-                    if (mt - m_prev[i]) * scale_log2 > (Float32.inf if "load" in self.stub else 5.0):
-                        m_new = mt
-                        if it > 0:
-                            need = Int32(1)
-                    pf[i] = cute.math.exp2((sS[i] - m_new) * scale_log2, fastmath=True)
-                    corr[i] = cute.math.exp2((m_prev[i] - m_new) * scale_log2, fastmath=True)
-                    l_acc[i] = l_acc[i] * corr[i] + pf[i]
-                    m_prev[i] = m_new
+                if bar_red_or(grow, 2, 128) != 0:
+                    m_lane = Float32(0.0)
+                    for i in cutlass.range_constexpr(n):
+                        mi = cute.arch.warp_redux_sync(sS[i], kind="fmax", nan=True)
+                        if i == lane:
+                            m_lane = mi
+                    if lane < n:
+                        sMx[it % 2, lw, lane] = m_lane
+                    softmax_bar.arrive_and_wait()
+                    for i in cutlass.range_constexpr(n):
+                        hd = tScS[i][1]
+                        mt = cutlass.max(cutlass.max(sMx[it % 2, 0, hd], sMx[it % 2, 1, hd]),
+                                         cutlass.max(sMx[it % 2, 2, hd], sMx[it % 2, 3, hd]))
+                        m_new = m_prev[i]
+                        if (mt - m_prev[i]) * scale_log2 > m_thr:
+                            m_new = mt
+                            if it > 0:
+                                need = Int32(1)
+                        pf[i] = cute.math.exp2((sS[i] - m_new) * scale_log2, fastmath=True)
+                        corr[i] = cute.math.exp2((m_prev[i] - m_new) * scale_log2, fastmath=True)
+                        l_acc[i] = l_acc[i] * corr[i] + pf[i]
+                        m_prev[i] = m_new
+                else:
+                    for i in cutlass.range_constexpr(n):
+                        pf[i] = cute.math.exp2((sS[i] - m_prev[i]) * scale_log2, fastmath=True)
+                        l_acc[i] = l_acc[i] + pf[i]
                 hp = p_p.acquire_and_advance()
                 if need > 0:
                     cute.arch.mbarrier_wait(o_bar, (it - 1) % 2)
@@ -2002,7 +2152,7 @@ def _compiled1(n: int, page_size: int, terms: int, dbg: bool = False, v_tmem: bo
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled2(n: int, page_size: int, terms: int, feat: str = "", stub: str = "", v3: bool = False):
+def _compiled2(n: int, page_size: int, terms: int, feat: str = "", stub: str = ""):
     sym = cute.sym_int
     b, h, p, mp, s = sym(), sym(), sym(), sym(), sym()
 
@@ -2011,13 +2161,30 @@ def _compiled2(n: int, page_size: int, terms: int, feat: str = "", stub: str = "
                                                      assumed_align=align)
 
     return cute.compile(
-        DecodeV3(n, page_size, terms, stub) if v3 else DecodeV2(n, page_size, terms, feat, stub),
-        t(Uint8, (b, h, terms, CKV // 2)),
+        DecodeV2(n, page_size, terms, feat, stub), t(Uint8, (b, h, terms, CKV // 2)),
         t(Uint8, (b, h, terms, CKV // 16), 4), t(Float32, (b, h), 4), t(BFloat16, (b, h, KPE)),
         t(Uint8, (b, h, 3, KPE)), t(Float32, (b, h), 4), t(Uint8, (p, page_size, CKV // 2)),
         t(Uint8, (p, page_size, CKV // 16)), t(Uint8, (p, page_size, KPE)), t(Int32, (b, mp), 4), t(Int32, (b,), 4),
         t(BFloat16, (b, h, CKV)), t(Float32, (s, b, h, CKV)), t(Float32, (s, b, h), 4), Int32(TILE), Int32(1),
         Float32(1.0), Float32(1.0), Float32(1.0), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi")
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled3(n: int, page_size: int, terms: int, stub: str = ""):
+    sym = cute.sym_int
+    b, h, p, mp, s = sym(), sym(), sym(), sym(), sym()
+
+    def t(dtype, shape, align=16):
+        return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape)))[::-1],
+                                                     assumed_align=align)
+
+    return cute.compile(
+        DecodeV3(n, page_size, terms, stub), t(Uint8, (b, h, terms, CKV // 2)), t(Uint8, (b, h, terms, CKV // 16), 4),
+        t(Float32, (b, h), 4), t(Uint8, (b, h, 3, KPE)), t(Uint8, (b, h), 4), t(Uint8, (p, page_size, CKV // 2)),
+        t(Uint8, (p, page_size, CKV // 16)), t(Uint8, (p, page_size, KPE)), t(Int32, (b, mp), 4), t(Int32, (b,), 4),
+        t(BFloat16, (b, h, CKV)), t(Float32, (s, b, h, CKV)), t(Float32, (s, b, h), 4), Int32(TILE), Int32(1),
+        Float32(1.0), Float32(1.0), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi")
 
 
@@ -2027,14 +2194,16 @@ def default_feat(page_size: int) -> str:
 
 
 def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens, sm_scale, ckv_scale=1.0,
-           kpe_scale=1.0, max_kv_len=None, num_splits=0, version=3, heads_per_cta=None, terms=4,
+           kpe_scale=1.0, max_kv_len=None, num_splits=0, version=3, heads_per_cta=None, terms=None,
            feat=None):
     """Same contract as nvfp4_mla.decode (BF16-or-better accuracy); SM100 only.
 
-    version: 0 (v0), 1 (v1a'), 2 (v1b), 3 (v2, warp-specialized), 4 (v3, page size >= 16)."""
+    version: 0 (v0), 1 (v1a'), 2 (v1b), 3 (v2, warp-specialized), 4 (v3, page size >= 16).
+    terms: NVFP4 terms of the query, 3 for v3 and 4 before it by default."""
     from . import _load
 
     B, H = q_nope.shape[:2]
+    terms = terms or (3 if version == 4 else 4)
     if H % 16:
         raise ValueError(f"heads must be a multiple of 16, got {H}")
     if version == 3 and feat is None:
@@ -2069,8 +2238,8 @@ def decode(q_nope, q_pe, ckv_cache, ckv_sf_cache, kpe_cache, page_table, kv_lens
                 qp8, qps = q_pe.new_empty(B, H, 3, KPE, dtype=torch.uint8), g
             _compiled2(n, ckv_cache.shape[1], terms, feat)(q4, qsf, g, q_pe, qp8, qps, *args)
         elif version == 4:
-            qp8, qps = _load().rope_terms(q_pe, 3)
-            _compiled2(n, ckv_cache.shape[1], terms, v3=True)(q4, qsf, g, q_pe, qp8, qps, *args)
+            qp8, qe = _load().rope_terms(q_pe, 3, g, kpe_scale / ckv_scale)
+            _compiled3(n, ckv_cache.shape[1], terms)(q4, qsf, g, qp8, qe, *args[:-2], args[-1])
         else:
             _compiled1(n, ckv_cache.shape[1], terms, False, version == 2)(q4, qsf, g, q_pe, *args)
     if splits > 1:

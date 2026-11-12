@@ -1977,3 +1977,126 @@ of 1.20 us, the period of v2.4 without conversion. The softmax does set the peri
 tile (95% of 1.56), not 1.15: the convert and scale warps share its sub-partitions (14% of its samples ready but not
 selected), and it multiplies P by 2^k. The next step is therefore the softmax's own work (V3.1: 2 query terms and
 RoPE in the latent accumulator, 32 TMEM columns loaded per tile instead of 80), with the scale warps right behind it.
+
+### V3.1 plan: fewer score columns for the softmax
+
+The softmax loads 80 TMEM columns per tile and thread: 4 query terms x 16 heads of latent score and 16 of RoPE score,
+combined as g (S0 + S1 + S2 + S3) + c S_pe. Two changes cut that to 32:
+
+- 2 query terms instead of 4 (32 columns of latent score, and half the latent QK MMA work).
+- RoPE accumulated into the first term's columns. The two parts then need one unit: the RoPE query is written as 3
+  E4M3 terms in units of g / kpe_ratio times a power of two 2^e per head, and the RoPE MMA becomes
+  `kind::mxf8f6f4` (CuTe DSL `MmaMXF8F6F4Op`) with 2^e as its UE8M0 scale factor (1 on the cache side). Without
+  2^e, q_pe x kpe_ratio / g reaches 2688 x kpe_ratio (2^14 with the calibrated scales), far past E4M3's 448. The
+  RoPE precision stays as now (3 E4M3 terms; the scale is rounded up to a power of two).
+
+**X1, the query terms first.** v1 measured 2 terms at 0.0118 against the dequantized cache (3 terms 0.0014, outlier
+channels 2-4x worse), and v3 already adds E4M3 rounding of V and P (x1.024 at worst). Against the unquantized KV the
+format's own error dominates, so the question is whether 2 terms still fit the 3% rule there. Measured on the real
+kernel: v3.0a with 2, 3 and 4 terms (query_terms gains 2), error against the unquantized KV as a ratio to the CUDA
+BF16 mode, on the test shapes and the `accuracy.py` shapes, both global scales, and again with outlier channels in the
+query (each channel x exp(N(0, 1.5)), as in v1). Also the time of each.
+
+Predictions: without outliers, 2 terms at most x1.03 at worst (about +0.5% over 4 terms); with outliers, 2 terms
+past x1.03 and 3 terms within it. Time at H=16 B64 64K: 2 terms 0.37-0.39 ms (0.399 with 4), from the 48 columns
+loaded instead of 80 and half the latent MMA. Rule: V3.1 uses the fewest terms whose worst ratio, outliers
+included, is at most x1.03.
+
+### X1 result: 2 terms are accurate enough, but run slower
+
+Worst ratio to the BF16 mode against the unquantized KV over 8 shapes x 2 global scales:
+
+| query | 2 terms | 3 terms | 4 terms |
+|---|---|---|---|
+| random query | x1.020 | x1.015 | x1.017 |
+| outlier channels | x1.012 | x1.003 | x1.007 |
+| time H=16 B64 64K, ms | 0.433 | 0.395 | 0.397 |
+| time H=128 B16 64K, ms | 0.823 | 0.747 | 0.748 |
+
+2 terms add about +0.3% at worst, so by the rule V3.1 may use 2 terms. The prediction for outlier channels was
+wrong: with them the format's own error grows (the BF16 mode's error is 0.24-0.46 there, 0.08-0.17 without), and the
+query terms disappear under it. The time is the surprise: 2 terms are 9-10% slower than 4, 3 terms the same as 4,
+against a predicted 3-7% gain. V3.1 keeps 32 score columns only once this is understood: next, the stall samples of 2
+against 4 terms.
+
+### V3.1 predictions (written before the first run)
+
+V3.1 as built: RoPE accumulated into the first term's columns (`kind::mxf8f6f4`, query 2^e per head), with the term
+count a parameter, timed in one process against v3.0a with 4 and 2 terms (a copy of the previous code), v2.4 and
+Cake.
+
+- Accuracy: the same as v3.0a with the same terms, within 0.002 of X1's ratios, since the RoPE query keeps 3 E4M3
+  terms.
+- Time at H=16 B64 64K: 4 terms (64 columns loaded instead of 80) 0.38-0.39 ms against v3.0a's 0.397; 3 terms (48)
+  0.37-0.38. 2 terms: no prediction until the profile explains X1's slowdown.
+
+### V3.1 result: correct, but slower than v3.0a
+
+Accuracy as predicted: worst x1.022 / x1.024 / x1.024 for 2 / 3 / 4 terms, each within about 0.002 of v3.0a with
+the same terms. Time, one process, ms:
+
+| shape | v2.4 | v3.0a 4 terms | v3.0a 2 | V3.1 2 | V3.1 3 | V3.1 4 | Cake |
+|---|---|---|---|---|---|---|---|
+| H=16 B64 64K | 0.456 | 0.400 | 0.434 | 0.421 | 0.407 | 0.433 | 0.320 |
+| H=128 B16 64K | 0.853 | 0.750 | 0.824 | 0.790 | 0.763 | 0.811 | 0.299 |
+
+Every V3.1 build is slower than v3.0a with 4 terms, and V3.1 with 4 terms, which loads 64 columns instead of 80, is
+8% slower than v3.0a with 4 terms. The predictions (0.38-0.39 and 0.37-0.38 ms) fail. The softmax's work does not
+explain the order of these times.
+
+The 2- against 4-term profile of v3.0a points elsewhere. With 2 terms the softmax executes fewer instructions (81.4M
+against 85.4M) but takes 1.66 us per tile instead of 1.50; its hottest instructions are the loads of the tile maxima
+from shared memory and the compares that wait on them. The hardware's count of shared-load bank conflicts is 3.8x
+(12.75M against 3.31M) and the shared-load wavefronts +37%, while the per-instruction counts (ideal and excess
+wavefronts of each load) are identical in both builds. So the extra conflicts are not in any instruction's own
+address pattern; they come from loads colliding with other traffic. The only other change with 2 terms is that the
+query buffer is 8 KB smaller, so every buffer after it moves 8 KB down. V3.1 moves the buffers again (two RoPE
+scale-factor tiles in, the RoPE scale out).
+
+### Is it the shared-memory placement?
+
+Test: V3.1 with padding of 0-8 KB after the query buffer (1 KB steps; only the placement changes), for 2, 3 and 4
+terms as far as shared memory allows, H=16 B64 64K, plus the conflict count of the fastest and the slowest.
+
+Prediction: if the placement explains X1 and V3.1, the time at a fixed term count varies by 5% or more across the
+paddings, and the best placement for 2 and 3 terms is at least as fast as v3.0a with 4 terms (0.400 ms).
+
+Result: no. Padding of 0-8 KB moves V3.1 by at most 1% (2 terms 0.414-0.419 ms, 3 terms 0.404-0.405, 4 terms
+0.430 at 0 and 1 KB). The placement is not the cause; the prediction fails.
+
+What differs between the 2- and 4-term builds is in the softmax's stall reasons: MIO throttle 370 samples against
+14, all of it on the loads of the tile maxima (`LDS.128`, 686 samples against 307 for the same count) and the
+compares waiting on them. These are broadcast loads, 16 per thread and tile, issued right after the named barrier,
+and they queue behind the convert warps' shared-memory instructions in the same sub-partitions. How long they wait
+depends on how the two roles' instruction streams happen to line up, which the term count and the fold change. The
+exchange of tile maxima (16 warp reductions, a shared-memory round trip, 16 loads, 64 compares per thread) is the
+softmax's most expensive and least predictable step.
+
+### V3.1b hypothesis: the tile maximum only when a score grows
+
+With the lazy rescale, the exchange decides nothing on most tiles: a head's maximum moves only when a score passes it
+by 2^5. Each thread can test that on its own scores against the running maximum (the same in every thread), and one
+barrier with an OR reduction (`bar.red.or.pred` on the softmax's named barrier) tells the warpgroup whether any did.
+Only then the exchange runs, as now. On the other tiles there are no reductions, no shared-memory round trip and no
+second exp2 (the correction factor is 1).
+
+Predictions (H=16 B64 64K, one process against V3.1 and v3.0a): the softmax's work per tile falls from 1.50-1.66 us
+to 1.1 us or less, and the period is then set by the scale warps (about 1.39 us of work per tile now): 0.36-0.38 ms
+for 2, 3 and 4 terms, within 3% of each other. Accuracy unchanged (the same P, maxima and rescales).
+
+### V3.1b result: Cake's time at H=16
+
+Accuracy unchanged (the same errors as V3.1 to four digits). Time, one process, ms:
+
+| shape | v2.4 | v3.0a 4 terms | V3.1 3 terms | V3.1b 2 terms | V3.1b 3 terms | V3.1b 4 terms | Cake |
+|---|---|---|---|---|---|---|---|
+| H=16 B64 64K | 0.456 | 0.400 | 0.407 | 0.354 | **0.319** | 0.330 | 0.319 |
+| H=128 B16 64K | 0.851 | 0.748 | 0.763 | 0.649 | **0.574** | 0.596 | 0.304 |
+
+V3.1b with 3 terms runs as fast as Cake at H=16 B64 64K, -30% against v2.4 and -20% against v3.0a. The prediction
+(0.36-0.38 ms) was too cautious, and the term counts are 11% apart, not within 3%. The profile matches the rest of
+it: the softmax is now 43-59% busy and waits for S most of the remaining time, and the scale warps set the period
+(86-92% busy), with the MMA warp waiting for their tiles 38-49% of its samples. 2 terms are the slowest again (the
+scale warps 92% busy, more of it in dependency stalls), so v3 uses 3 terms.
+
+At H=128 the gap to Cake stays 1.9x: 8 CTAs per request each read the whole cache for 16 heads. That is V3.2.
