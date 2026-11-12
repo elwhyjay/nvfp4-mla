@@ -222,10 +222,11 @@ How to read these numbers:
   64K tokens and from 16 x 16K (up to 1.18x) and than the CUDA kernel in the 7 largest shapes (up to 2.3x).
 - **B200, 128 heads**: trtllm-gen FP8 is the fastest in 14 of the 16 shapes, 1.2-3.1x faster than the SM100 kernel.
   Against Cake the SM100 kernel is faster or equal (0.89-1.02x) at batch 1 with 1K-4K tokens, 4 x 1K and 16 x 1K,
-  1.1-1.5x slower in the other shapes up to batch 16 and 2.5-2.9x slower at batch 64: Cake's kernel for more than 48 heads runs all 128 heads of a request in
-  one cluster of two CTAs and reads the cache once per request, this kernel once per 32 heads (see
-  [SM100 kernel and FlashInfer Cake](#sm100-kernel-and-flashinfer-cake)). It is faster than the CUDA kernel in 12 of
-  the 16 shapes (up to 4.2x).
+  1.1-1.5x slower in the other shapes up to batch 16 and 2.5-2.9x slower at batch 64. Two causes: this kernel's
+  3-term query makes the tensor work per request 1.77x Cake's, and Cake's kernel for more than 48 heads runs all 128
+  heads of a request in one cluster of two CTAs and reads the cache once per request, this kernel once per 32 heads
+  (see [SM100 kernel and FlashInfer Cake](#sm100-kernel-and-flashinfer-cake)). It is faster than the CUDA kernel in
+  12 of the 16 shapes (up to 4.2x).
 - Cake's query is NVFP4, so its error against the BF16 cache is 1.4-1.7x higher (see [Accuracy](#accuracy)).
 - The CUDA kernel's FP8 mode does not help on B200 (1.5-1.7x slower than its default at 64 x 64K in an earlier run).
 
@@ -298,6 +299,7 @@ pytest tests                       # correctness; the first run builds the exten
 python benchmarks/roofline.py      # achievable read BW and BF16 mma.sync peak of this GPU
 python benchmarks/baselines.py     # sanity check: every baseline agrees with FlashInfer fa2
 python benchmarks/accuracy.py      # error against the unquantized KV, per precision path
+python benchmarks/tcgen05_peaks.py # SM100: tcgen05 MMA rates per instruction shape
 python benchmarks/bench.py         # full sweep; --batch / --s-kv / --heads / --providers to narrow it
                                    # (nvfp4-tc: the SM100 kernel, needs ".[sm100]")
 uv run --with matplotlib python benchmarks/plot.py   # redraw docs/img from benchmarks/results
@@ -376,9 +378,14 @@ token to keep V in range. Where they differ (Cake from FlashInfer 0.7.4rc1's sou
 | softmax | one warpgroup | two warpgroups on alternate tiles, each with its own output accumulator |
 | 128 heads | one CTA per 32 heads: the cache is read 4 times per request | all heads in one cluster of two CTAs (`cta_group::2`): read once |
 
-The last row is most of the remaining gap at 128 heads (2.5-2.9x at batch 64). At 16 heads the two are within 3% at
-64 x 64K; with short contexts this kernel's fixed cost per call is higher. The details, and what each difference
-cost or gained when tried here, are in the
+At 128 heads and batch 64 the gap is 2.5x, and it has two parts. The first is the query: 3 NVFP4 terms are 3x Cake's QK
+work (RoPE too), so the tensor work per request is 1.77x Cake's whatever the structure. At the MMA rates measured
+on B200 (`benchmarks/tcgen05_peaks.py`: FP4 8.9, FP8 4.5 PFLOPS) the tensor floor at 128 heads, batch 64 and 64K
+tokens is 0.35 ms with 3 terms, 0.29 with 2 and 0.20 with Cake's one. That part is the price of the accuracy (1.01-1.02x the
+BF16 mode's error against Cake's 1.4-1.7x). The second part, 1.4x, is how much of its floor each kernel reaches
+(26% here, Cake 36%): this kernel reads and converts the cache once per 32 heads, Cake once per request. At 16 heads
+the two are within 3% at 64 x 64K; with short contexts this kernel's fixed cost per call is higher. The details, and
+what each difference cost or gained when tried here, are in the
 [optimization log](docs/optimization-log.md#this-kernel-and-cake-where-the-structures-differ).
 
 ## Cache layout (flashinfer#4676)
@@ -394,8 +401,8 @@ Dequantization: `ckv = e2m1 * scale * ckv_scale`, `kpe = fp8 * kpe_scale`.
 ## Roadmap
 
 - SM100 kernel: the remaining gap to FlashInfer Cake. With 128 heads the cache is read once per 32 heads (Cake: once
-  per request, two CTAs in a cluster); at 16 heads the scale-layout warps set the period; each call runs three small
-  kernels around the decode (about 8 µs). See
+  per request, two CTAs in a cluster) and the 3-term query is 1.77x Cake's tensor work (2 terms: 1.46x); at 16 heads
+  the scale layouts set the period; each call runs three small kernels around the decode (about 8 µs). See
   [SM100 kernel and FlashInfer Cake](#sm100-kernel-and-flashinfer-cake).
 - Accuracy on real model KV: layer-wise attention output of DeepSeek-V2-Lite against BF16, this kernel and Cake.
 - Attention throughput at a fixed KV memory budget, where NVFP4 holds 1.64x the tokens of FP8.

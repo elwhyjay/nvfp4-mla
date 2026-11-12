@@ -2225,8 +2225,8 @@ has two attention programs; side by side with v3:
 
 What the differences are worth, on B200:
 
-- **Query terms** (3 against 1): the accuracy column above. The time is small here: QK is not on the critical path,
-  and 3 terms ran as fast as 4 (X1).
+- **Query terms** (3 against 1): the accuracy column above. At 16 heads the time is small (3 terms ran as fast as 4,
+  X1); at 128 heads it is the larger part of the gap (see "The tensor floor at 128 heads" below).
 - **V in tensor memory** (this kernel) against V in shared memory (Cake): it spares the shared-memory round trip (Cake's
   shared memory was 91% busy at 16 heads in its profile, this kernel's 68% in v2.4) at the price of a transposing load
   and a nibble shuffle. The conversion is no longer the limit (48-64% busy).
@@ -2238,4 +2238,119 @@ What the differences are worth, on B200:
   period at 16 heads (85-94% busy; the register split above bought 4%). Cake's conversion warps write them into tensor
   memory directly (`tcgen05.st`, lane = token), which would remove that role's shared-memory round trip.
 - **128 heads**: the cluster of two CTAs reads the cache once per request, this kernel once per 32 heads, 4x the
-  conversion and scale work per request. This is 2.5-2.9x at batch 64, the largest remaining gap.
+  conversion and scale work per request. With the query terms (below) this is the 2.5-2.9x at batch 64.
+
+### V3.3 hypothesis: the scale layouts in the convert warps, the QK scale factors straight into tensor memory
+
+At 16 heads the two scale-layout warps set the period. In the V3.1b profile they are 92.5% busy, of which 23% of their
+samples are "not selected" (the convert and softmax warps of the same sub-partitions issue instead) and 30% dependency
+stalls; their stores of the QK scale factors (`sfa_w[tk % 32, tk // 32, a, dx]`) step 4 words per lane, a 4-way bank
+conflict (2.9-way on average, 64% of their store wavefronts excess). Two changes, both as Cake does them:
+
+- The cache's QK scale factors (SFA) go to tensor memory directly with `tcgen05.st` from a thread that holds the
+  token: lane = token, 4 scales per column, word w of token m in column 4w + m / 32 (Cake's layout). Two SFA buffers
+  of 32 columns, so QK(j) reads one while tile j + 1's is written. The 8 conflicting stores per token, the SFA buffers
+  in shared memory and the MMA warp's `tcgen05.cp` per tile go.
+- A warp can only write the TMEM lanes of its own quadrant, and the scale warps sit in quadrants 2 and 3, so the work
+  moves to the 8 convert warps (two per quadrant; a thread takes one token, half of its 32 scales). They spend 42-45%
+  of their time waiting for PV to release V. Per tile: TMA(j + 1) landed -> scale layouts of j + 1 (after QK(j - 1)
+  released its SFA buffer and convert(j - 1) its derived buffer) -> QK(j + 1) may start -> convert(j). Warps 14-15
+  are left idle.
+
+Predictions (one process): H=16 B64 64K from 0.327 to 0.28-0.30 ms (4.9-5.3 TB/s, 67-72% of the achievable 7.3), the
+convert warps 85% busy or less, H=128 the same or faster, the error unchanged (the same values reach the MMAs).
+
+### The tensor floor at 128 heads
+
+The paragraphs above put the 128-head gap on the cache being read 4 times per request. That is incomplete: the V3.2
+profile at H=128 B16 already shows the tensor pipe as the most used one (41% of its issue-weighted capacity; the MMAs'
+FLOP are 11% of the FP4 and FP8 peaks), and the 3 query terms are 3x Cake's QK work, whatever the structure.
+
+`benchmarks/tcgen05_peaks.py` measures the MMA rates on B200: one thread per SM issues the shapes back to back,
+operands resident, no loads.
+
+| MMA (M = 128) | TFLOPS | of the peak |
+|---|---|---|
+| FP4 `mxf4nvf4`, N = 256 | 8926 | peak |
+| QK, 3 terms x 32 heads (N = 96) | 7641 | 86% |
+| QK, 2 terms (N = 64) | 5941 | 67% |
+| QK, 1 term (N = 32) | 3564 | 40% |
+| RoPE, block-scaled FP8 `mxf8f6f4`, N = 32 | 1781 | 40% of FP8 |
+| FP8 `f8f6f4`, N = 256 | 4466 | peak |
+| PV, N = 32, A (V) in tensor memory | 4368 | 98% |
+
+The FP8 peak is 4.5 PFLOPS here, not the 3.1 cuBLAS reached in a GEMM; FP4 is 2x it. Small N costs: an MMA with 32
+columns runs at 40%, except with A in tensor memory.
+
+Tensor work per request and tile (128 tokens x 128 heads) and the floor at H=128 B64 64K (32768 such tiles) at the
+peaks, whatever the structure:
+
+| query | FP4 (QK) | FP8 (RoPE, PV) | floor | measured |
+|---|---|---|---|---|
+| 3 terms (v3) | 50.3 MFLOP | 23.1 MFLOP | 0.354 ms | 1.384 ms (26%) |
+| 2 terms | 33.6 | 23.1 | 0.292 ms | |
+| 1 term, 1 RoPE term (Cake) | 16.8 | 18.9 | 0.200 ms | 0.549 ms (36%) |
+
+At the shapes this kernel issues (32 heads per CTA) the 3-term floor is 0.457 ms (the RoPE MMAs at N = 32 alone 0.116
+ms). The measured gap, 2.52x, is 1.77x of tensor work (the query terms: QK 3x, RoPE 3x, PV the same) times 1.42x of
+utilization (26% of the floor against Cake's 36%; reading and converting the cache once per 32 heads is in this part).
+In logarithms the query terms are about 60% of the gap. So no structure brings the 3-term query to Cake's time at
+batch 64 and 128 heads without reaching a higher share of the tensor peak than Cake does; it is the price of an error
+of 1.01x the BF16 mode against Cake's 1.4-1.7x. With 2 terms (X1: x1.02) the work is 1.46x Cake's.
+
+A kernel with the heads as M (as Cake's `32a47bbf` and FlashAttention 4: the query as the TMEM A operand, thread =
+head in the softmax, no reduction across threads, the two CTAs of a pair converting half the tokens each) would read
+the cache once per request. At Cake's utilization (36% of the floor) it would take 0.81 ms with 2 terms and 0.98 with
+3: 1.5-1.8x Cake.
+Such a kernel needs 2 terms as the 128-head default, and first an answer to why 2 terms ran slower than 3 here (X1,
+V3.1b; the scale warps' scheduling, not yet understood).
+
+### V3.3 result: slower; the convert warps become the limit
+
+Correct (the same error as V3.2), but slower everywhere. One process, ms:
+
+| shape | V3.2 | V3.3 | Cake |
+|---|---|---|---|
+| H=16 B64 64K | 0.328 | 0.363 | 0.319 |
+| H=16 B16 64K | 0.098 | 0.103 | 0.087 |
+| H=128 B16 64K | 0.381 | 0.427 | 0.303 |
+| H=128 B64 64K | 1.381 | 1.580 | 0.543 |
+
+The prediction (0.28-0.30 ms, convert 85% busy or less) fails. The convert warps are now 85% busy and wait for PV 4% of
+their samples (from 42%); the MMA warp waits for V 29%. Their 42% of waiting was not free time: the scale layouts of
+tile j + 1 now run before the conversion of tile j, so every tile's V comes later and the loop that sets the period
+gets longer. Writing the QK scale factors straight into tensor memory itself works (the tests pass with Cake's layout).
+
+### V3.3b hypothesis: only the QK scale factors in the convert warps
+
+Keep the split, move less. The convert warps write the cache's QK scale factors into tensor memory (a thread loads 4
+raw words of its token, 4 `tcgen05.st`; about 15 instructions per tile) and publish the stage for QK; the scale warps
+keep k, the shifted block-major bytes and 2^k, without the 8 conflicting SFA stores per token. QK then waits for the
+TMA and the convert warps' short step, not for the scale warps.
+
+Predictions (one process against V3.2): H=16 B64 64K 0.30-0.32 ms; the scale warps under 85% busy, the convert warps
+under 60%; H=128 the same as V3.2 or faster.
+
+### V3.3b result: no gain; both variants stay out of the code
+
+Correct (the same error). One process, ms:
+
+| shape | V3.2 | V3.3b | Cake |
+|---|---|---|---|
+| H=16 B64 64K | 0.328 | 0.333 | 0.319 |
+| H=16 B16 64K | 0.097 | 0.098 | 0.087 |
+| H=128 B16 64K | 0.380 | 0.387 | 0.299 |
+| H=128 B64 64K | 1.383 | 1.418 | 0.547 |
+
+1-3% slower at the long shapes, the same at the short ones; the prediction (0.30-0.32 ms) fails. In the profile the
+convert warps are 82% busy and the MMA warp waits for V 49% of its samples: the short step in front of the
+conversion still waits for the next tile's TMA and the release of tile j - 2, and every such wait delays V. The scale
+warps lost their conflicting stores but stay 92% busy, with more of it "not selected" (26%), since the convert warps
+now issue more in the same sub-partitions.
+
+What the two variants show: the convert warps have no slack. Their 42% of waiting in V3.2 is the single V buffer's
+hand-off with PV, the loop that sets the period, so anything placed on their path lengthens it. The cache's QK scale
+factors can go into tensor memory directly (the layout above works), but not from those warps. The code stays at V3.2;
+the next attempt at 16 heads should take work off the scale warps without putting it on the conversion's path (for
+example their 32 single-byte stores per token, which a transpose of 4 x 4 bytes across lanes would turn into 8 word
+stores).
