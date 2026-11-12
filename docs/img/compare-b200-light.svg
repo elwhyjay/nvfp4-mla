@@ -588,7 +588,7 @@ L 476.36 241.254
    </g>
   </g>
   <g id="text_61">
-   <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #898781" x="7.2" y="441.936" transform="rotate(-0 7.2 441.936)">B200, q_len 1, page size 64. GPU kernel time per call (CUPTI), L2 flushed. Lower is better.</text>
+   <text style="font-size: 8px; font-family: 'Helvetica Neue', 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #898781" x="7.2" y="441.936" transform="rotate(-0 7.2 441.936)">B200, q_len 1, page size 64. GPU kernel time per call (CUPTI), L2 flushed. Lower is better. Cake's query quantization runs once, outside its timed call.</text>
   </g>
  </g>
  <defs>

@@ -281,11 +281,12 @@ conversion; v3.2 runs 32 heads per CTA when the batch holds enough work. A short
 static view of the output rows) also halved the fixed cost per call. With 128 heads, v1a' and v1b are slower than v0
 because they handle 16 heads per CTA instead of 32 (tensor memory), so they read the cache twice as often. The first
 warp-specialized builds (v2-v2.2, 1.04-1.13 ms at 16 heads x 64 x 64K) and v3.0 are in the log only; the current code
-no longer builds them.
+no longer builds them. The figure's two v3 points are the current code with 16 heads per CTA and with its default
+grouping (32 heads from 32K tokens in the batch).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/sm100-versions-dark.svg">
-  <img alt="B200: latency of the SM100 tcgen05 kernel from v0 to v3.2 for three shapes, with FlashInfer Cake on the same shapes" src="docs/img/sm100-versions-light.svg">
+  <img alt="B200: latency of the SM100 tcgen05 kernel from v0 to v3 (16 and 32 heads per CTA) for three shapes, with FlashInfer Cake on the same shapes" src="docs/img/sm100-versions-light.svg">
 </picture>
 
 ## Reproduce

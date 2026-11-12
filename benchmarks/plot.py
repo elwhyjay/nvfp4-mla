@@ -33,7 +33,7 @@ COLOR = {"nvfp4": 0, "cake": 1, "nvfp4-fp8": 2, "nvfp4-tc": 3}  # categorical sl
 TC_VERSIONS = ["tc-v0", "tc-v1a", "tc-v1b", "tc-v2.3", "tc-v2.4", "tc-v3.1", "tc-v3.2"]
 TC_TICKS = {"tc-v0": "v0\nFP16 tile\nin smem", "tc-v1a": "v1a'\nFP4 QK\n(mxf4nvf4)", "tc-v1b": "v1b\nV into\nTMEM",
             "tc-v2.3": "v2.3\nwarp\nroles", "tc-v2.4": "v2.4\nTMA, 8\nconvert warps",
-            "tc-v3.1": "v3.1\nQMUL4 V,\nmax by vote", "tc-v3.2": "v3.2\n32 heads\nper CTA"}
+            "tc-v3.1": "v3\n16 heads\nper CTA", "tc-v3.2": "v3\n32 heads per\nCTA (from 32K\ntokens)"}
 TABLE_ONLY = ("nvfp4+fa2", "nvfp4-fp4q")  # in the README tables, not in the bar charts
 CONFIGS = [(16, 64, 65536), (16, 1, 65536), (128, 64, 65536), (128, 1, 65536)]
 
@@ -155,10 +155,11 @@ def sm100(t):
     ax.set_ylabel("latency (ms, log scale)", color=t["ink2"])
     title(ax, t, "B200: the tcgen05 kernel (CuTe DSL)")
     ax.legend(loc="center left", bbox_to_anchor=(0.0, 0.42), frameon=False, labelcolor=t["ink2"], fontsize=8.5)
-    fig.text(0.01, 0.01, "Lower is better. One process, median of 3 alternating rounds (CUPTI), L2 flushed; page size 64. "
-             "Labels: last latency (speedup over v0).\nv2-v2.2 are in the optimization log only: v2.3's load order "
-             "replaced theirs, so the current code no longer builds them.", color=t["muted"], fontsize=8)
-    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    fig.text(0.01, 0.01, "Lower is better. Versions in one process, median of 3 alternating rounds (CUPTI), L2 flushed; "
+             "page size 64.\nCake from the sweep (b200.csv). Labels: last latency (speedup over v0). v3: the current code "
+             "(QMUL4 conversion,\nRoPE in the latent score, tile maxima by vote, the shorter epilogue). v2-v2.2 and v3.0 "
+             "are in the optimization log only.", color=t["muted"], fontsize=8)
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
     return fig
 
 
@@ -182,8 +183,9 @@ def comparison(t, gpu):
         ax.set_xticks([])
         ax.spines["bottom"].set_visible(False)
         title(ax, t, cfg_label(h, b, s))
+    cake = " Cake's query quantization runs once, outside its timed call." if gpu == "B200" else ""
     fig.text(0.01, 0.01, f"{gpu}, q_len 1, page size 64. GPU kernel time per call (CUPTI), L2 flushed. "
-             "Lower is better.", color=t["muted"], fontsize=8)
+             f"Lower is better.{cake}", color=t["muted"], fontsize=8)
     fig.tight_layout(rect=(0, 0.03, 1, 1), h_pad=2.0)
     return fig
 
