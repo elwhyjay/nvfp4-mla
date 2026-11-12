@@ -1803,3 +1803,177 @@ What limits it now, and the next steps in order of expected gain:
 4. Not started, outside the kernel: attention throughput at a fixed KV memory budget (NVFP4 holds 1.64x the tokens
    of FP8), and the accuracy comparison with Cake on real model KV (DeepSeek-V2-Lite: layer-wise attention output
    against BF16), which random data cannot replace.
+
+## Part 4: DecodeV3 groundwork
+
+A review of v2 against FlashInfer Cake's source (the `d2829e4e` kernel, 16 heads) and the v2.4 profile proposes a
+new structure instead of more options on DecodeV2. Checked against the source and the profiles:
+
+- Cake converts V with `mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite` (PTX ISA 9.4, CUDA 13.4): 4 values per instruction,
+  scale included; one thread per token; per token a power of two 2^-k (k = 0-3 from its largest scale) keeps the
+  product inside E4M3 and is undone on P. The same transform warps write the token's QK scale factors straight into
+  TMEM (`tcgen05.st`, lane = token). V and P go through shared memory to the PV MMA, issued by its own warp; QK has
+  another warp, RoPE is accumulated into the latent score, and two softmax warpgroups take alternate tiles with an O
+  accumulator each.
+- Cake's shared memory is 91% busy at 16 heads (LSU 56%, tensor reads 35%); v2.4's is 68% (LSU 48%, 1811
+  wavefronts per tile, not the 34% the review assumed; tensor 20%). Of the LSU wavefronts attributed to
+  instructions, 43% are the two scale-layout warps', and 63% of those are bank-conflict excess (their 32-byte-stride
+  token reads).
+- The query with 2 terms is within 1% of BF16 against the unquantized KV (the v1 measurement above).
+
+Two measurements decide the order of the work.
+
+**Probe 1: QMUL4.** (a) Does CuTe DSL's inline assembly accept the PTX 9.4 instruction? If not, the toolchain comes
+first. (b) Is it one SASS instruction when the four scale lanes differ, or an emulation? Cake broadcasts one scale to
+all four lanes ("the native QMUL4 reads lane 0"). (c) Its throughput against the f16 path (`cvt` e2m1, `mul`, `cvt`
+e4m3), which is also the exact reference: e2m1 x e4m3 fits f16 exactly, so only the final rounding differs. If
+distinct lane scales are native, V can be converted per channel and token group straight into TMEM at about a
+third of the instructions, which would make "cheap conversion without the shared-memory round trip" the main path.
+
+**Probe 2: v2.4 with the conversion removed** (the `cvt` stub, H=16 B64 64K, now 1.78 us per tile). Prediction (from
+the review): 1.30-1.45 us per tile, because the softmax (about 1.4 us of work per tile) then sets the period. Rule:
+1.30 us or more, and the softmax at 90% or more of its samples busy in the stub's profile, means the softmax work
+(fewer score loads, two softmax warpgroups) comes before a cheaper conversion; 1.0 us or less means the conversion
+goes first.
+
+### Probe results
+
+**QMUL4** (a CUDA C++ probe and a CuTe DSL probe, B200):
+
+- CuTe DSL's inline assembly accepts it, on the CUDA 13.4 and the 13.3 image alike (the DSL brings its own
+  compiler), so no toolchain work is needed.
+- One SASS instruction, also with four different scales: `QMUL4.E4M3x4.E2M1x4.E4M3x4.SATFINITE R9, R2.N3210,
+  R5.B3210`, the scale operand selecting a byte per lane. Every lane matches the exact f16 path (4.2M lanes with a
+  broadcast scale, 4.2M with distinct scales; 0 differ).
+- Throughput in a loop of independent operations: 80.7 operations (of 4 values) per ns and SM against 26.4 for the
+  f16 path, 3.1x; the loop's own ALU work alone runs at 110, so 80.7 is a lower bound.
+
+So distinct scales per lane are native: a thread that holds 4 tokens' nibbles of one channel and those tokens'
+scales makes one 32-bit E4M3 word of V^T, 4 tokens per TMEM column, in one instruction. What remains around it is
+gathering the 4 tokens' nibbles of one channel (`ldmatrix` .trans gives bytes, i.e. 2 channels per token: about 7
+logic operations per 8 values), against 14 instructions per 8 values now.
+
+**v2.4 with the conversion removed** (`cvt` stub, same process, ms):
+
+| removed | H=16 B64 64K | per tile | H=128 B16 64K |
+|---|---|---|---|
+| nothing | 0.437 | 1.71 us | 0.846 |
+| conversion | 0.306 | 1.20 us | 0.579 |
+| load + conversion + PV + rescale + QK | 0.165 | 0.64 us | 0.319 |
+
+1.20 us per tile is below the predicted 1.30-1.45 us, but the stub's profile shows the softmax 96% busy (and the
+scale-layout warps 90%, mostly waiting for their own shared-memory loads), so by the rule's second condition the
+softmax sets the period once the conversion is free. Neither branch of the rule holds cleanly: a free conversion
+alone would give 0.306 ms (Cake: 0.320), and going below needs the softmax's work cut as well.
+
+### v3.0 hypothesis: V converted by QMUL4 straight into TMEM
+
+A new class, `DecodeV3`: v2.4's structure fixed (TMA, 8 convert warps, lazy rescale, E4M3 RoPE, V in halves) without
+DecodeV2's options, and one change in the data path:
+
+- V goes to TMEM as E4M3 (as `v8`), each 32-bit word (one channel, 4 tokens) made by one QMUL4 with the 4 tokens'
+  scales. `ldmatrix` .trans still gives bytes (one token, two channels), so the nibbles are regrouped first: a
+  delta swap of nibbles 1 and 2 in each half-word and one `prmt` put the even channel's 4 tokens in the low half and
+  the odd channel's in the high half. 7 instructions per 8 values instead of 14.
+- The range: per token a power of two 2^-k (k = 0-3 from its largest block scale, as Cake), applied to the block
+  scales the conversion reads (the QK scale factors stay unshifted) and undone on P. P x 2^k must stay below 448, so
+  the lazy rescale threshold drops from 2^8 to 2^5. The scale-layout warps compute k and the shifted scales; the
+  softmax reads 2^k per token from a two-slot buffer, which the scale warps overwrite only after P of the tile two
+  back is published.
+
+Predictions at H=16 B64 64K (v2.4: 0.437-0.455 ms, convert 80% busy) and H=128 B16 64K (0.846):
+
+- 0.31-0.34 ms and 0.58-0.66 ms: convert's work drops to about 45-55% of the period and the softmax (96% busy once
+  the conversion is free, 1.20 us per tile) sets it.
+- Error against the unquantized KV: at most 1% above the BF16 mode on the `accuracy.py` shapes (P is rounded to E4M3
+  as in `v8`, which cost 1-2%; the per-token shift keeps small values that `v8`'s fixed /8 lost).
+- Rule: v3 continues on this path if H=16 B64 64K is at or below 0.35 ms and the error rule (3%) holds.
+
+### v3.0 result: correct at once, but only 6% faster
+
+Correctness (6 shapes x 3 global scales; page sizes 16-64, 16-128 heads, 1-3 splits, lengths 1-5000; now `test_v3`
+in `tests/test_sm100.py`): against the dequantized cache 0.022-0.028 (V and P rounded to E4M3), against the
+unquantized KV 1.007-1.024x the BF16 mode (v2.4 on the same caches: 0.998-1.000x). That is within the 3% rule but
+above the predicted 1%. The ratio is the same for the three global scales (0.5, 1, calibrated), so the per-token
+shift keeps the values inside E4M3's range; what is left is E4M3's rounding of V (e2m1 x scale needs up to 6
+significant bits) and of P.
+
+Time, same process, ms:
+
+| shape | v2.4 | v3.0 | Cake |
+|---|---|---|---|
+| H=16 B64 64K | 0.461 | 0.435 | 0.327 |
+| H=128 B16 64K | 0.865 | 0.817 | 0.314 |
+| H=128 B64 64K | 3.376 | 3.180 | 0.549 |
+
+-6% at all three shapes against the predicted 0.31-0.34 ms and 0.58-0.66 ms, so the rule (0.35 ms or less at H=16
+B64 64K) fails. Per tile at H=16 (256 tiles per CTA): 1.70 us against v2.4's 1.80 us, while v2.4 without any
+conversion ran at 1.20 us. Halving the conversion's arithmetic took only a tenth of the gap.
+
+### Where v3.0's period goes: prediction
+
+Stubs of v3.0 in one process, next to v2.4's, and the stall samples per role of v3.0 and of v3.0 without the
+conversion (H=16 B64 64K, `benchmarks/ncu_waits.py`). Three candidates, each
+with what would show it:
+
+- The conversion, still: the v3 `cvt` stub falls to v2.4's (about 0.31 ms) and the convert warps are 85% or more
+  busy. The rest of its cost would then be `ldmatrix` and `tcgen05.st` (32 stores per thread and tile, as `v8`).
+- The scale-layout warps: 85% or more busy. They do more per token now (k, 8 shifted words), and the new wait for
+  P(j - 2) puts them on the softmax's path: their work on tile j starts when the softmax publishes P(j - 2) and must
+  end, with QK(j), before the softmax finishes tile j - 1. The softmax would then wait on "S ready" for 15% or more
+  of its samples.
+- The softmax (P x 2^k, one more barrier wait, the rescale at 2^5 instead of 2^8): 95% or more busy, with the
+  convert warps waiting for PV to release V.
+
+Expected: the second. The v2.4 profile without conversion had the scale warps 90% busy at 1.20 us per tile (mostly
+on their own shared-memory loads), and v3.0 gives them more work and a shorter slack.
+
+### Where v3.0's period goes: result
+
+Stubs, ms (same process; v2.4 in brackets): full 0.413 (0.438), without the load 0.279 (0.353), without the
+conversion 0.318 (0.306), without load and conversion 0.208 (0.234). Share of each role's stall samples (H=16 B64
+64K):
+
+| role | v3.0 | v3.0 without the conversion |
+|---|---|---|
+| convert (8 warps) | 48% busy, 39% waiting for PV to release V, 13% for a tile | (stub) |
+| softmax | 87% busy, 11% waiting for S | 92% busy, 6% waiting for S |
+| scale warps | 78% busy, 18% waiting for P(j - 2) | 61% busy, 32% waiting for P(j - 2) |
+| MMA | 40% busy, 54% waiting for the scale warps' tile | 54% busy, 38% waiting for the scale warps' tile |
+
+None of the three conditions holds as stated. The conversion is no longer the limit (48% busy, from about 80% in
+v2.4). The closest is the second: the scale warps are 78% busy and 18% waiting for P(j - 2), so 96% of their time is
+in a loop with the softmax (P(j - 2) -> scale layouts of j -> QK(j) -> S(j)), and the softmax waits for S 11% of its
+samples. The `load` stub, which takes the scale warps' shared-memory loads off that loop, gains 32% in v3.0 against
+19% in v2.4. The softmax is the other half of the period: 87% busy, 15% of its samples ready but not selected (the
+convert warps share its sub-partition).
+
+### v3.0a hypothesis: one 2^k slot per stage
+
+The wait for P(j - 2) only protects the 2^k slot that tile j reuses. With one slot per stage (4) instead of 2, tile j
+reuses tile j - 4's slot, and the scale warps already wait for the release of tile j - 2's stage, which comes after
+QK(j - 2), which comes after the softmax released S(j - 3), so after P(j - 4). The wait can go and the scale warps
+leave the softmax's path.
+
+Prediction (H=16 B64 64K): 0.36-0.39 ms (0.413 now; the softmax's own work, 87% of 1.61 us per tile, gives 0.36 as
+the floor); the softmax 93% or more busy and waiting for S 5% or less. H=128 B16 64K: 0.72-0.77 ms.
+
+### v3.0a result: -12%, and the softmax sets the period
+
+Correctness as v3.0 (the change only removes a wait). Time, same process, ms:
+
+| shape | v2.4 | v3.0a | Cake |
+|---|---|---|---|
+| H=16 B64 64K | 0.455 | 0.399 | 0.319 |
+| H=128 B16 64K | 0.855 | 0.752 | 0.301 |
+| H=128 B64 64K | 3.386 | 2.970 | 0.546 |
+
+-12% at all three shapes. H=16 is just above the predicted 0.36-0.39 ms, H=128 B16 inside 0.72-0.77. The softmax is
+95% busy (predicted 93% or more) and waits for S 3.5% of its samples (5% or less). Behind it: the scale warps 89%
+busy, the convert warps 48% busy and 45% waiting for PV to release V.
+
+The v3.0 rule (0.35 ms or less) still fails. It asked whether a cheap conversion alone lets the softmax set a period
+of 1.20 us, the period of v2.4 without conversion. The softmax does set the period now, but its work is 1.48 us per
+tile (95% of 1.56), not 1.15: the convert and scale warps share its sub-partitions (14% of its samples ready but not
+selected), and it multiplies P by 2^k. The next step is therefore the softmax's own work (V3.1: 2 query terms and
+RoPE in the latent accumulator, 32 TMEM columns loaded per tile instead of 80), with the scale warps right behind it.

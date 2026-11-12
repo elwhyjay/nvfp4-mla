@@ -58,3 +58,22 @@ def test_against_unquantized(heads, scales):
     e_cuda = rel_l2(nvfp4_mla.decode(*c.args()), ref)
     print(f"H={heads} scales={scales}: vs unquantized sm100 {e_tc:.4f}, CUDA bf16 mode {e_cuda:.4f}")
     assert e_tc <= 1.03 * e_cuda
+
+
+V3_CASES = [c for c in CASES if c[1] >= 16] + [([1, 2, 63, 64, 65, 127, 128, 129, 255, 300, 513], 16, 16, 1)]
+
+
+@pytest.mark.parametrize("kv_lens,page_size,heads,splits", V3_CASES)
+@pytest.mark.parametrize("scales", [(0.5, 2.0), CALIBRATED])
+def test_v3(kv_lens, page_size, heads, splits, scales):
+    """DecodeV3 rounds V and P to E4M3: against the dequantized cache only to that rounding, against the unquantized
+    KV within 3% of the CUDA kernel's BF16 mode."""
+    c = RandomCache(kv_lens, page_size, heads, *scales)
+    out = sm100.decode(*c.args(), num_splits=splits, version=4)
+    ref16 = c.reference_bf16()
+    e, e16 = rel_l2(out, c.reference()), rel_l2(out, ref16)
+    e_cuda = rel_l2(nvfp4_mla.decode(*c.args()), ref16)
+    print(f"{str(kv_lens)[:20]} ps={page_size} H={heads}: vs dequantized {e:.4f}, vs unquantized x{e16 / e_cuda:.3f}")
+    assert not out.isnan().any()
+    assert e < 0.04
+    assert e16 <= 1.03 * e_cuda

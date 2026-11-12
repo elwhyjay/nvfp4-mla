@@ -9,6 +9,7 @@ GB/s counts each format's own bytes per token: NVFP4 352, FP8 576, BF16 1152. Pr
   nvfp4-fp8[/N]   this kernel with FP8 (e4m3) QK and PV
   nvfp4-fp4q[/N]  FP8 PV, block-scaled FP4 QK (FP4 query; faster, less accurate)
   nvfp4-tc[/N[/F]] the SM100 tcgen05 kernel in CuTe DSL (nvfp4_mla.sm100); F: extra DecodeV2 options, e.g. v8
+  nvfp4-v3[/N]    its DecodeV3 (V converted by QMUL4)
   nvfp4+fa2       nvfp4_mla.dequantize to BF16, then FlashInfer fa2 ("dequantize, then a BF16 kernel")
   fa2, cutlass    FlashInfer BatchMLAPagedAttentionWrapper, BF16 KV
   cutile          the same wrapper's cuTile backend; cute-dsl-monolithic, cute-dsl-modular: its CuTe DSL backends
@@ -44,7 +45,9 @@ def ours(name, c, max_len):
 def tcgen05(name, c, max_len):
     from nvfp4_mla import sm100
 
-    _, splits, extra = (name.split("/") + ["0", ""])[:3]
+    kind, splits, extra = (name.split("/") + ["0", ""])[:3]
+    if kind == "nvfp4-v3":
+        return lambda: sm100.decode(*c.args(), max_kv_len=max_len, num_splits=int(splits), version=4)
     feat = sm100.default_feat(c.page_size) + "," + extra if extra else None
     return lambda: sm100.decode(*c.args(), max_kv_len=max_len, num_splits=int(splits), feat=feat)
 
@@ -67,7 +70,7 @@ def cake(c, max_len):
 def make(name, c, inp, max_len):
     if name.split("/")[0] in ("nvfp4", "nvfp4-fp8", "nvfp4-fp4q"):
         return ours(name, c, max_len)
-    if name.split("/")[0] == "nvfp4-tc":
+    if name.split("/")[0] in ("nvfp4-tc", "nvfp4-v3"):
         return tcgen05(name, c, max_len)
     if name == "cake":
         return cake(c, max_len)

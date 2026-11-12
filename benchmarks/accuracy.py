@@ -16,7 +16,7 @@ import bench
 from nvfp4_mla.testing import RandomCache, rel_l2
 
 sm100 = torch.cuda.get_device_capability()[0] == 10
-providers = ["nvfp4", "nvfp4-fp8"] + (["nvfp4-tc", "nvfp4-tc/0/v8", "cake"] if sm100 else ["nvfp4-fp4q"])
+providers = ["nvfp4", "nvfp4-fp8"] + (["nvfp4-tc", "nvfp4-tc/0/v8", "nvfp4-v3", "cake"] if sm100 else ["nvfp4-fp4q"])
 SCALES = {"scale 1": (1.0, 1.0), "calibrated": (2.0 ** -9, 2.0 ** -6)}
 print(f"{'shape':22s} {'scales':10s} " + "".join(f"{p:>22s}" for p in providers))
 for H, B, S in [(16, 4, 4096), (128, 4, 4096), (16, 16, 16384)]:
