@@ -5,7 +5,7 @@ I added this cache format and its quantize/append kernel to FlashInfer in
 [flashinfer#4676](https://github.com/flashinfer-ai/flashinfer/pull/4676); this repository is the decode side.
 The latent KV is stored as E2M1 with one E4M3 scale per 16 channels and the RoPE part as FP8, so one token is
 352 bytes (FP8: 576, BF16: 1152). By default the kernel dequantizes in registers and keeps Q, P and the MMA in BF16
-with FP32 accumulation; an FP8 mode (E4M3 Q, K, V, P and MMA) is up to 1.7x faster on compute-bound shapes.
+with FP32 accumulation; an FP8 mode (E4M3 Q, K, V, P and MMA) is up to 1.8x faster on compute-bound shapes.
 
 There are two kernels, both written from scratch: a CUDA kernel (`mma.sync`, `cp.async`, split-KV) for
 **SM120 (RTX PRO 6000)**, which also runs on SM100, and a warp-specialized `tcgen05` kernel in CuTe DSL for
@@ -13,7 +13,7 @@ There are two kernels, both written from scratch: a CUDA kernel (`mma.sync`, `cp
 
 Status: dense decode, one query token per request (see [Roadmap](#roadmap)). How both kernels were built, step by
 step with the hypothesis, the profile and the result of each change (including the ones that did not work): the CUDA
-kernel from a CUDA-core version to 85% of DRAM bandwidth and an FP8 mode for compute-bound shapes, and the SM100
+kernel from a CUDA-core version to 84-85% of DRAM bandwidth and an FP8 mode for compute-bound shapes, and the SM100
 kernel from a serial `tcgen05` version through warp specialization to V converted by `QMUL4`, within 3% of FlashInfer
 Cake at 16 heads, batch 64 and 64K tokens: [docs/optimization-log.md](docs/optimization-log.md).
 
@@ -93,7 +93,7 @@ out = nvfp4_mla.decode(
 | `precision` | Q, P and MMA | when to use it | extra error over `"bf16"` |
 |---|---|---|---|
 | `"bf16"` (default) | BF16 | 16 heads, small batches, and on B200 | |
-| `"fp8"` | E4M3 (Q quantized per row in the kernel; K and V rounded to E4M3) | 128 heads, batch 4 and up, SM120: 1.3-1.7x faster | 0-11% |
+| `"fp8"` | E4M3 (Q quantized per row in the kernel; K and V rounded to E4M3) | 128 heads, batch 4 and up, SM120: 1.3-1.8x faster from 16K tokens | 0-11% |
 | `"fp4-qk"` | as `"fp8"`, QK in block-scaled FP4 (FP4 query, as FlashInfer Cake) | 128 heads, large batch, SM120: about 3% faster than `"fp8"` | 25-55% |
 
 On SM100, `nvfp4_mla.sm100.decode` takes the same arguments (without `precision`) and returns the same output:
@@ -214,15 +214,15 @@ How to read these numbers:
 - **FlashInfer b12x** (SM12x dense MLA, FP8 KV): correct (cosine 0.9986-0.9988 against fa2), but in this setup
   slower than this kernel at 16 heads (1.2-2.5x) and, at 128 heads, up to 7.9x slower than XQA.
 - **B200, 16 heads**: FlashInfer Cake is the fastest in 11 of the 16 shapes. The SM100 kernel is within 3% of it at
-  64 x 64K (it reads 4.5 TB/s, 62% of the achievable 7.3 TB/s; Cake 63%), 1.16x slower at 16 x 64K and 1.2-1.3x at
-  16K-64K tokens with smaller batches. With short contexts it is 1.5-1.9x slower: a call costs 18-23 µs with a cold
-  L2, about 8 µs of it in three small kernels that split the query and merge the KV splits (Cake's query quantization
-  runs once outside its timed call, this kernel's query split inside). There the CUDA kernel is
-  the fastest of all (batch 1-4 with 1K tokens, batch 1 with 4K). The SM100 kernel is faster than trtllm-gen FP8 at
+  64 x 64K (it reads 4.5 TB/s, 62% of the achievable 7.3 TB/s; Cake 63%), 1.16-1.31x slower at 64K tokens with
+  batch 1-16 and 1.23-1.74x at 16K (the smaller the batch, the larger the gap). With 1K-4K tokens it is 1.5-1.9x
+  slower: a call costs 18-23 µs with a cold L2, about 8 µs of it in three small kernels that split the query and
+  merge the KV splits (Cake's query quantization runs once outside its timed call, this kernel's query split
+  inside). There the CUDA kernel is the fastest of all (batch 1-4 with 1K tokens, batch 1 with 4K). The SM100 kernel is faster than trtllm-gen FP8 at
   64K tokens and from 16 x 16K (up to 1.18x) and than the CUDA kernel in the 7 largest shapes (up to 2.3x).
 - **B200, 128 heads**: trtllm-gen FP8 is the fastest in 14 of the 16 shapes, 1.2-3.1x faster than the SM100 kernel.
-  Against Cake the SM100 kernel is faster or equal at batch 1 with 1K-4K tokens and at 16 x 1K, 1.1-1.5x slower up to
-  batch 16 and 2.5-2.9x slower at batch 64: Cake's kernel for more than 48 heads runs all 128 heads of a request in
+  Against Cake the SM100 kernel is faster or equal (0.89-1.02x) at batch 1 with 1K-4K tokens, 4 x 1K and 16 x 1K,
+  1.1-1.5x slower in the other shapes up to batch 16 and 2.5-2.9x slower at batch 64: Cake's kernel for more than 48 heads runs all 128 heads of a request in
   one cluster of two CTAs and reads the cache once per request, this kernel once per 32 heads (see
   [SM100 kernel and FlashInfer Cake](#sm100-kernel-and-flashinfer-cake)). It is faster than the CUDA kernel in 12 of
   the 16 shapes (up to 4.2x).
@@ -243,7 +243,8 @@ layouts (v11c). Each step, the hypothesis and the profile behind it, and the ste
   <img alt="Latency per kernel version, v1 to v5 on both GPUs and v6 to v11c (FP8 mode) at 128 heads on RTX PRO 6000" src="docs/img/versions-light.svg">
 </picture>
 
-The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof. At 128
+The same versions on a roofline (batch 64, 64K tokens). At 16 heads RTX PRO 6000 reaches 85% of the DRAM roof (v5
+in the version-history run; 84% in the sweep above, a separate run of the same kernel). At 128
 heads the FP8 mode reaches 45% of the E4M3 `mma.sync` roof on RTX PRO 6000; there no unit is saturated (issue slots
 39%, tensor pipe 49%): the kernel is bound by the latency of each warp's serial chain. On B200 the SM100 kernel
 (v3) sits above the CUDA kernel's `mma.sync` stages: 62% of the DRAM roof at 16 heads, next to Cake's 63%.

@@ -2197,10 +2197,10 @@ history on three shapes, ms:
 | H=128 B16 64K | 0.857 | 0.608 | 0.378 | 0.305 |
 | H=128 B64 64K | 3.387 | 2.387 | 1.383 | 0.549 |
 
-Against Cake over the 32-shape grid: at 16 heads 1.03x at 64 x 64K, 1.16-1.31x at 16K-64K tokens, 1.4-1.9x with
-short contexts (the three small kernels around the decode, about 8 us warm, are inside this kernel's timed call;
-Cake's query quantization is not); at 128 heads 0.89-0.96x (faster) at batch 1 with 1K-4K tokens and at 16 x 1K,
-1.1-1.5x up to batch 16, 2.5-2.9x at batch 64. trtllm-gen FP8 is 1.2-3.1x faster than v3 at 128 heads. Error against
+Against Cake over the 32-shape grid: at 16 heads 1.03x at 64 x 64K, 1.16-1.31x at 64K tokens with batch 1-16,
+1.23-1.74x at 16K (the smaller the batch, the larger), 1.5-1.9x at 1K-4K (the three small kernels around the decode,
+about 8 us warm, are inside this kernel's timed call; Cake's query quantization is not); at 128 heads 0.89-1.02x at
+batch 1 with 1K-4K tokens, 4 x 1K and 16 x 1K, 1.1-1.5x in the other shapes up to batch 16, 2.5-2.9x at batch 64. trtllm-gen FP8 is 1.2-3.1x faster than v3 at 128 heads. Error against
 the unquantized KV: 1.01-1.02x the BF16 mode (Cake 1.38-1.71x).
 
 ### This kernel and Cake: where the structures differ
